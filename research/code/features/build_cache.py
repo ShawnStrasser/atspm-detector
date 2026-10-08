@@ -9,7 +9,7 @@ Outputs (all under dc_work\\, see src/README.md for the schema):
     folds.csv, labels_dev.parquet, labels_test.parquet
     cache/events/DeviceId=<guid>/d{2,3,4}.parquet   -- filtered raw events
     cache/det_intervals.parquet                     -- detector ON intervals
-    cache/phase_cycles.parquet                      -- phase colour cycles
+    cache/phase_cycles.parquet                      -- phase color cycles
     cache/green_state.parquet                       -- per-signal green bitmask timeline
     cache/coord_state.parquet                       -- coordination pattern intervals
     cache/detector_meta.parquet                     -- per detector channel stats + health
@@ -150,7 +150,7 @@ def build_derived(con) -> None:
     """)
     log(f"det_intervals in {time.time()-t0:.0f}s")
 
-    # ---- phase colour cycles ---------------------------------------------------
+    # ---- phase color cycles ---------------------------------------------------
     t0 = time.time()
     con.execute(f"""
         COPY (

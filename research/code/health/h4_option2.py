@@ -9,7 +9,7 @@ function = the fold model that never saw the signal):
     pass1   the raw window
     pass2a  each detector's own actuations inside its bad periods removed (a stuck ON disappears; a spike's
             or rapid hour's extra ONs disappear; a silent period has nothing to remove)
-    pass2b  the union of the signal's bad periods cut out of the window for every channel (colour events too)
+    pass2b  the union of the signal's bad periods cut out of the window for every channel (color events too)
 Locked never read.
 
     python h4_option2.py run  -> %DC_WORK%/health4/option2_rows.parquet

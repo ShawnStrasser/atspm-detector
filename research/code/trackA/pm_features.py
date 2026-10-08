@@ -2,7 +2,7 @@
 
 Protected-permissive (FYA) left turns and right-turn lanes stay ~4 pt harder for the function head (notes 44, 45).
 FYA events 32 / 33 are NOT allowed as model inputs, so the permissive clue is rebuilt from allowed codes only
-(81 / 82 detector, 1 / 8 / 10 colour, 43 / 44 phase call), per window and per candidate phase; the detectors of a
+(81 / 82 detector, 1 / 8 / 10 color, 43 / 44 phase call), per window and per candidate phase; the detectors of a
 phase are those whose PREDICTED phase (frame pred_phase) it is -- never the print, the timing or a phase number.
 
 Per detector (on its predicted phase p):

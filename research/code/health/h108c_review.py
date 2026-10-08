@@ -1079,7 +1079,7 @@ def draw_det_panel(ax, c, kind, first):
             ls_.append(lab)
     if not first:
         hs.append(Line2D([], [], color=MUTED, lw=1.3))
-        ls_.append("same detectors and colours as the actuations panel")
+        ls_.append("same detectors and colors as the actuations panel")
     ex = c.cnt_extra if kind == "cnt" else c.occ_extra
     for e in ex:
         l_, = ax.plot(pd.to_datetime(e["tt"]), e["y"], color=e["col"], ls=e["ls"], lw=e["lw"], zorder=5)

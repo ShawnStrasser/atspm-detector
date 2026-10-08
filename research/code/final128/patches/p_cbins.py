@@ -4,7 +4,7 @@ s = open(p, encoding="utf-8").read()
 a = s.index("def colour_bins(P, T, phase):")
 b = s.index("# note 128: the six rolling medians")
 new = '''def colour_bins(P, T, phase):
-    """per detector x 5-min bin: vehicle starts by colour state of its predicted phase, fast starts (ON -> ON < 1 s),
+    """per detector x 5-min bin: vehicle starts by color state of its predicted phase, fast starts (ON -> ON < 1 s),
     chatter re-triggers, phase seconds per state (h117_events.one).  Returns (long DataFrame, {detector: n starts}).
     (note 128: every detector at once -- one count per bin and kind, the same numbers as the per-detector loop.)"""
     t, eid, par = P.t, P.eid, P.par
@@ -13,8 +13,8 @@ new = '''def colour_bins(P, T, phase):
     edges = np.minimum(np.arange(nb + 1) * BIN, T)
     g0 = P.g0
     tl = {}
-    # colour events in time order (ties: as the research file order after its (time, code, param) sort; a stable
-    # sort of the colour events alone gives them in the same order as sorting every event)
+    # color events in time order (ties: as the research file order after its (time, code, param) sort; a stable
+    # sort of the color events alone gives them in the same order as sorting every event)
     cm = np.isin(eid, (1, 8, 9, 10))
     tc, ec, pc = t[cm], eid[cm], par[cm]
     o = np.lexsort((pc, ec, tc))

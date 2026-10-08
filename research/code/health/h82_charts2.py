@@ -92,7 +92,7 @@ def bin_label(bin_s):
 
 
 def bars(ax, t0, t1, bin_s, series, shade=(), hline=None, ylabel=None, share=False):
-    """side-by-side bars per time bin; series = [(label, ON times, colour)]. share: % of its own total."""
+    """side-by-side bars per time bin; series = [(label, ON times, color)]. share: % of its own total."""
     for a, b, _ in shade:
         ax.axvspan(max(a, t0), min(b, t1), color=SHADE, lw=0, zorder=0)
     n = len(series)

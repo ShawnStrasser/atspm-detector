@@ -3,7 +3,7 @@
 Every function here is a production port of one research event pass (research/code/health*/ ...), computed on the
 window's prepared event arrays (`health_core.Prep`) and the classifier's own answers (predicted phase, function,
 lane span).  numpy + pandas only; no loop over events (loops are over detectors, phases or episodes).  The phase
-number is only a key to that phase's colour events and to "who are its phase mates" -- never a feature.
+number is only a key to that phase's color events and to "who are its phase mates" -- never a feature.
 
 Research source of each block (same arithmetic, same order):
   occ_bins / bins_ctx            h96_occ.one, h104_resolve.load_bins          (15-min bins: counts, % ON, traffic, congestion;
@@ -731,7 +731,7 @@ def _phase_timeline(tc, ec, Tlen, g0):
 
 
 def colour_bins(P, T, phase):
-    """per detector x 5-min bin: vehicle starts by colour state of its predicted phase, fast starts (ON -> ON < 1 s),
+    """per detector x 5-min bin: vehicle starts by color state of its predicted phase, fast starts (ON -> ON < 1 s),
     chatter re-triggers, phase seconds per state (h117_events.one).  Returns (long DataFrame, {detector: n starts}).
     (note 128: every detector at once -- one count per bin and kind, the same numbers as the per-detector loop.)"""
     t, eid, par = P.t, P.eid, P.par
@@ -740,8 +740,8 @@ def colour_bins(P, T, phase):
     edges = np.minimum(np.arange(nb + 1) * BIN, T)
     g0 = P.g0
     tl = {}
-    # colour events in time order (ties: as the research file order after its (time, code, param) sort; a stable
-    # sort of the colour events alone gives them in the same order as sorting every event)
+    # color events in time order (ties: as the research file order after its (time, code, param) sort; a stable
+    # sort of the color events alone gives them in the same order as sorting every event)
     cm = np.isin(eid, (1, 8, 9, 10))
     tc, ec, pc = t[cm], eid[cm], par[cm]
     o = np.lexsort((pc, ec, tc))
@@ -828,7 +828,7 @@ def _win_median(R, h=6):
 
 
 def _colour_medians(cb):
-    """the six rolling medians of the research SQL (m7 / m8: rates by colour state, raw and without chatter), from
+    """the six rolling medians of the research SQL (m7 / m8: rates by color state, raw and without chatter), from
     the float32 bins in the same float32 arithmetic as the SQL (rows: detector-major, every bin present)."""
     nd = len(np.unique(cb.detector.to_numpy()))
     nb = len(cb) // max(nd, 1)
@@ -905,7 +905,7 @@ def _fast_stats(cb):
 
 
 def colour_stats(CB, lanes):
-    """too-fast / too-many statistics per detector from the colour bins (h117_study.stats + h118c_fast.fast_stats;
+    """too-fast / too-many statistics per detector from the color bins (h117_study.stats + h118c_fast.fast_stats;
     note 128: the research DuckDB query ported to numpy with the same float32 / float64 arithmetic, so health opens no
     database connection).  lanes: detector -> model lane span.  Rows sorted by detector."""
     cols = ["detector", "q5_gy", "q5_all", "fo_all", "fem_all", "n_spk", "fo_c", "fem_c", "n_spk_c"]

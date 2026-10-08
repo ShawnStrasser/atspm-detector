@@ -16,7 +16,7 @@ implementation (file formats, conventions, people), general in the problem it so
    7-day pull of which ~3 days were available (late Sept-2026). Plus the controller timing database
    (per channel: call phase, call overlap, switch phase, additional call phases, delay/extend) and the
    hand-maintained detector config export. No polling; everything heavy on a local work disk.
-2. **Event filtering [G].** Keep only codes 81/82 (detector), 1, 7, 8, 9, 10, 11 (colour), 43/44
+2. **Event filtering [G].** Keep only codes 81/82 (detector), 1, 7, 8, 9, 10, 11 (color), 43/44
    (phase call), 131/150 (coordination), 173 (flash); drop `Parameter > 64` on 81/82 (dummy
    detectors); `SELECT DISTINCT` first (~2 % of detector rows are exact duplicates; ~+0.5 pt, note 01).
    Fault codes 83–88 were later removed from everything (user, 2026-09-28; notes 38, 48). Six codes

@@ -2,8 +2,8 @@
 
 Improvements over stage 01:
   * the pair features of the *predicted* phase now include the v2 families
-    (occupancy by colour, per-cycle first-ON latency, queue-release timing, discharge burst);
-  * explicit occupancy-by-colour ratios and ON-duration shape;
+    (occupancy by color, per-cycle first-ON latency, queue-release timing, discharge burst);
+  * explicit occupancy-by-color ratios and ON-duration shape;
   * **sibling features** -- every other detector that the phase model assigns to the same
     phase at the same signal.  An Advance detector actuates several seconds *before* the
     Presence detector of its own phase, and a Count detector carries only one lane's volume,

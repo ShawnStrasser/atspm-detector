@@ -125,7 +125,7 @@ def draw(path, title, panels, z0, z1, shade, sample):
                     ls_.append(lab)
             if not first:
                 hs.append(Line2D([], [], color=MUTED, lw=1.3))
-                ls_.append("same detectors and colours as the top panel")
+                ls_.append("same detectors and colors as the top panel")
             def mx(y):
                 y = np.asarray(y, float)
                 return np.nanmax(y) if np.isfinite(y).any() else 0

@@ -342,7 +342,7 @@ def compute_stats(v3: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         col = con.sql(SQL_COLOUR).df()
         red = con.sql(SQL_REDSECS).df()
         ong = con.sql(SQL_ONGREEN).df()
-        log(f"{per}: {tp.DeviceId.nunique()} signals, det {len(det)}, colour {len(col)}, on-green {len(ong)} "
+        log(f"{per}: {tp.DeviceId.nunique()} signals, det {len(det)}, color {len(col)}, on-green {len(ong)} "
             f"({time.time() - tw:.0f}s)")
         R = lambda x: x.rename(columns={"dev": "DeviceId", "det": "detector"})
         s = tp.merge(R(col), on=["DeviceId", "detector"], how="left").merge(R(ong), on=["DeviceId", "detector"], how="left")
@@ -831,7 +831,7 @@ def explain(rid: str, r, thr: float, look) -> dict:
                  expectation=f"a count zone gives short / pulse actuations: typical at most {_num(thr):.1f} s",
                  result="actuations too long: behaves like a presence zone")
     elif rid == "advance_red_arrivals":
-        e.update(compared_with=f"its own phase's colours during {_num(r.quiet_h):.0f} h of free running",
+        e.update(compared_with=f"its own phase's colors during {_num(r.quiet_h):.0f} h of free running",
                  this_value=f"{pct(_num(r.n_r_q) / max(_num(r.n_r_q) + _num(r.n_g_q), 1))} of actuations on red "
                             f"while red was {pct(r.red_share_q)} of the time (ratio {_num(r.red_arr_q):.2f})",
                  expectation=f"with the signal running free, an advance zone sees vehicles on red about as often as "
@@ -960,7 +960,7 @@ def validate(v3: pd.DataFrame, stats: pd.DataFrame, hl: pd.DataFrame, cal: dict,
     rules = cal["rules"]
     pres = rules["presence_holds_red"]
     # protected-permissive (FYA) phases: most left turns leave during the permissive interval, which the phase's own
-    # colour sees as red -> the presence "holds through red" and count "off in red" rules do not apply there
+    # color sees as red -> the presence "holds through red" and count "off in red" rules do not apply there
     pp = {} if pplt is None or pplt.empty else {(a, int(b)): h for a, b, h in zip(pplt.sid, pplt.p, pplt.how)}
     d["pplt"] = [pp.get((a, int(p))) if pd.notna(p) else None for a, p in zip(d.sid, d.p)]
     d["pulse_set"] = (d.short_frac.astype(float) >= PULSE_SHARE) & (d.n_on.fillna(0) >= MIN_ON)
@@ -1091,7 +1091,7 @@ def validate(v3: pd.DataFrame, stats: pd.DataFrame, hl: pd.DataFrame, cal: dict,
                 continue
             if rid in ("presence_holds_red", "count_off_in_red") and r.pplt:
                 info.append(f"{CHECK_PLAIN[rid]} not applied: protected-permissive left turn ({r.pplt}) - most "
-                            f"vehicles leave on the flashing yellow arrow, which the phase's own colour logs as red")
+                            f"vehicles leave on the flashing yellow arrow, which the phase's own color logs as red")
                 continue
             if rid in ("presence_holds_red", "count_off_in_red") and r.right_lane:
                 info.append(f"{CHECK_PLAIN[rid]} not applied: right-turn lane (print) - vehicles turn right on red, "

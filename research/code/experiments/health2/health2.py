@@ -174,7 +174,7 @@ MASK_PREDICATE = """NOT EXISTS (
 # ---------------------------------------------------------------------------
 _PREP_SQL = """
 -- Every allowed code is kept: the "is this signal logging at all?" test must see the
--- phase-colour and call events too, otherwise a coordinated signal sitting in a long
+-- phase-color and call events too, otherwise a coordinated signal sitting in a long
 -- phase-2 green looks like a communications outage.
 CREATE OR REPLACE TEMP TABLE _h2_ev AS
 SELECT DeviceId, Timestamp AS ts, EventId::SMALLINT AS EventId, Parameter::SMALLINT AS Parameter

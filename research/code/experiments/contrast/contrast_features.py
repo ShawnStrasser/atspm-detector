@@ -69,7 +69,7 @@ SPECS_BIN = {
     "durmed":   ("_medbn", "d_n", 25.0),
     "durq90":   ("_q90bn", "d_n", 25.0),
 }
-# per-cycle occupancy, clipped to the colour interval, averaged over the cycles of the
+# per-cycle occupancy, clipped to the color interval, averaged over the cycles of the
 # period -- what `atspm`'s split-failure query computes before time-bucketing
 SPECS_CYC = {
     "occred":   ("mr_sum", "c_ncyc", 10.0),

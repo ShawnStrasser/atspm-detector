@@ -64,7 +64,7 @@ def run(name, fn):
 
 rA, rB, rC = (predict(x, min_actuations=1) for x in (A, B, C))
 P = lambda d, **k: predict(d, min_actuations=1, **k)
-# batching: different windows, different lengths, plus a signal with no begin-green and one with only colour events
+# batching: different windows, different lengths, plus a signal with no begin-green and one with only color events
 def batch_mixed():
     nog = C[C.EventId != 1]; r_nog = P(nog)
     onlyc = load("n00")[lambda d: ~d.EventId.isin([81, 82])]

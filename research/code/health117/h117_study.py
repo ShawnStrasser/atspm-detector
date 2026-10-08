@@ -2,7 +2,7 @@
 
 Inputs: %DC_WORK%/s117/{det117,bins117}.parquet (h117_events) + health110/resolved110.parquet (type, lanes, v110
 status and findings).  Healthy for this family = no v110 finding or watch outside {rapid, volume, chatter} (leave-own-
-family-out), >= 50 vehicle ONs, colour known for its predicted phase.
+family-out), >= 50 vehicle ONs, color known for its predicted phase.
 
 Statistics per detector-window (vehicle ONs only; extension re-ONs never count):
   r_gy, r_r       ONs per hour of green+yellow / of red (red after the first 2 s)
@@ -20,7 +20,7 @@ New checks (limit = p99.8 of healthy per cell = fn x span x sample length, fallb
         OR green flow beyond what queue discharge can give: q5_gy > limit.
         A fast-ON share during green alone is no longer a fault (queue discharge every ~0.5 s is normal).
   VOL   'too many in 5 min' = q5_gy (green-time and lane normalised) for stop-bar types; Advance (sees arrivals
-        regardless of colour) keeps q5_all per lane.
+        regardless of color) keeps q5_all per lane.
   Severity as the package: suspect at the limit, bad at 2x.
 
     python h117_study.py            -> %DC_WORK%/s117/{stats117.parquet, base117.csv, lim117.csv, rates117.csv,
@@ -73,7 +73,7 @@ def stats():
         X["br_n"] = X.b_R
         X["gfrac"] = sgy / (sgy + X.s_R + X.s_Rg)
     # 5-min bins, aggregated in DuckDB (10 M rows): busiest green flow per lane, busiest 5 min per lane, and the
-    # fast ONs EXPECTED if the ONs of each colour state in each bin arrived at random at that bin's rate
+    # fast ONs EXPECTED if the ONs of each color state in each bin arrived at random at that bin's rate
     # (Poisson: share of intervals < 1 s = 1 - exp(-rate x 1 s)); observed / expected = fast excess.
     import duckdb
     con = duckdb.connect()
@@ -90,7 +90,7 @@ def stats():
                sum(CASE WHEN sR > 0 THEN nR * (1 - exp(-nR / sR)) ELSE 0 END) AS fe_r,
                sum(CASE WHEN sU > 0 THEN nU * (1 - exp(-least(nU / sU, 50))) ELSE nU END) AS fe_u
         FROM b GROUP BY ALL""").df()
-    # robust variant: each bin's rate per colour state capped at its centred 1-h median (+-6 bins), so a burst of
+    # robust variant: each bin's rate per color state capped at its centred 1-h median (+-6 bins), so a burst of
     # fault ONs cannot raise its own expectation; sustained heavy traffic keeps its rate
     Hh = con.execute(f"""
         WITH b AS (SELECT DeviceId, "window", detector, b, fGY, fR, fU, nG + nY AS nGY, nR, nU, sGY, sR,
@@ -171,7 +171,7 @@ def main():
     adv = X.fn.eq("Advance")
     sc = lambda v, l: np.where(np.isfinite(v) & np.isfinite(l) & (l > 0), v / l, np.nan)  # noqa: E731
     enough = X.n_on >= 50
-    # FAST (adopted) = fast ONs above what random arrivals at the robust local rate of each colour state give, in
+    # FAST (adopted) = fast ONs above what random arrivals at the robust local rate of each color state give, in
     # Poisson SDs (zf); variants kept for the note: ratio with bin rate (fx), ratio robust (fxm), red only (zf_r)
     X["x_fx"] = np.fmax(sc(X.fx_all, X.lim_fx_all), sc(X.fx_r, X.lim_fx_r))
     X["x_fxm"] = np.fmax(sc(X.fxm_all, X.lim_fxm_all), sc(X.fxm_r, X.lim_fxm_r))
@@ -186,7 +186,7 @@ def main():
     X["new_fast_x"] = np.fmax(np.nan_to_num(X.x_zf), X.x_spk)
     X["new_fast"] = enough & ((X.x_zf >= 1) | X.v_spk)
     # VOL = busiest 5 min per lane against max(healthy p99.8, saturation); green time for stop-bar types, all time
-    # for Advance (arrivals regardless of colour)
+    # for Advance (arrivals regardless of color)
     lim_g = np.fmax(X.lim_q5_gy, SAT)
     lim_a = np.fmax(X.lim_q5_all, SAT)
     X["lim_vol"] = np.where(adv, lim_a, lim_g)

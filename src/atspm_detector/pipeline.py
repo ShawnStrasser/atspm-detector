@@ -25,7 +25,7 @@ last event.  A start / end more than 30 min outside a signal's own data is treat
 Rows with a missing or unreadable value (or a Parameter outside 0..65535) are dropped and counted in one warning.
 
 Pipeline (every model runs on the CPU with onnxruntime; no lightgbm / torch / scipy / sklearn)
-  input     events 1, 7-11 (colour), 43 / 44 (calls), 81 / 82 (detector), 131 / 150 (coordination), 173 (flash); exact
+  input     events 1, 7-11 (color), 43 / 44 (calls), 81 / 82 (detector), 131 / 150 (coordination), 173 (flash); exact
             duplicates and detector channels outside 1..64 (0, dummies > 64) dropped; fault events 83-88 never read
   phase     pair ranker (LightGBM, 261 features) -> the network's pair phase head on the candidates the ranker gives
             >= .01, averaged 50 / 50 -> joint decoder (similarity + lead neighbours)
@@ -374,7 +374,7 @@ def build_chunk_tables(con) -> None:
     """Derived tables, all keyed by the integer signal key `dev`:
 
         onev_all   detector ON intervals (an 82 followed by an 81 on the channel; unpaired ONs dropped)
-        cyc_all    colour cycles from 1 / 8 / 10 with 7 (green termination) and 9 (end yellow) as fall-backs, so
+        cyc_all    color cycles from 1 / 8 / 10 with 7 (green termination) and 9 (end yellow) as fall-backs, so
                    controllers that log only 1 + 7 still get a usable green / red split
         gs_all     the green-state bitmask over time (which phases are green)
         coordiv    coordination state changes (131; pattern 1..253 = coordinated)
@@ -451,7 +451,7 @@ def detector_universe(con) -> pd.DataFrame:
 
 
 def signal_facts(con) -> pd.DataFrame:
-    """Per signal: span, candidate phases, whether colour-termination / call events exist."""
+    """Per signal: span, candidate phases, whether color-termination / call events exist."""
     return con.sql("""
         SELECT DeviceId,
                (epoch_ms(max(Timestamp) - min(Timestamp))/60000.0)::DOUBLE AS minutes_of_data,
@@ -984,7 +984,7 @@ def _assemble(univ, facts, gate, top, fn, post, model_note: str,
                 rs = rs or "short sample"
             if not (r.n_green_end or 0):
                 notes.append("reduced accuracy: no green-termination events (7/8/9/10)")
-                rs = rs or "no colour-state events"
+                rs = rs or "no color-state events"
             if not (r.n_calls or 0):
                 notes.append("reduced accuracy: no phase call events (43/44)")
                 rs = rs or "no 43/44 events"

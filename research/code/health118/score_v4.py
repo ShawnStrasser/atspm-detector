@@ -4,7 +4,7 @@ v4 = v110 rules (h110_resolve, every F-fix)
    + note-118a fixes G1-G4 (stuck every ON / extension-time note C1 / not-really-pulse note C2 / erratic counts as
      share outside the 15-min expected range / count-drop evidence)                       (h118_resolve.run)
    + note-117 traffic-aware checks replacing the old ones:
-       'too-fast actuations' = fast ONs beyond random arrivals at the robust local rate per colour state (zf) or
+       'too-fast actuations' = fast ONs beyond random arrivals at the robust local rate per color state (zf) or
        too many 5-min burst bins;  'too many for the traffic' = busiest 5-min green flow per lane vs
        max(healthy p99.8, 1800 veh/h/lane) (Advance: all time)                            (s117/stats117.parquet)
    + note-116 time-of-day check 'busy at night' (night 01-05 level vs busiest 4 h, per type, phase-mate excuse)

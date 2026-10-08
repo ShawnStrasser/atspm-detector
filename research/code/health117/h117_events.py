@@ -1,15 +1,15 @@
-"""Note 117: RED vs GREEN event pass - actuations, fast ONs and occupancy by the colour of the detector's own phase.
+"""Note 117: RED vs GREEN event pass - actuations, fast ONs and occupancy by the color of the detector's own phase.
 
 One pass over the w40 events of the 763 training signals (locked_v2 asserted absent), every note-79 window (4 x 30 min,
-2 x 3 h, 2 x 24 h).  Hi-res log only (81 / 82 de-duplicated, channels > 64 dropped; colour 1 / 8 / 9 / 10 of the phase)
+2 x 3 h, 2 x 24 h).  Hi-res log only (81 / 82 de-duplicated, channels > 64 dropped; color 1 / 8 / 9 / 10 of the phase)
 plus the classifier's own predicted phase (health4/inputs.parquet, matching window length) - the phase number is only a
-join key to that phase's colour events, never a feature.
+join key to that phase's color events, never a feature.
 
 Vehicle ONs = ONs that START a continuous ON (previous event on the channel is an OFF).  An ON logged again without an
 OFF (extension) is counted separately (n_inner) and never as a fast actuation (user, Oct 7 point 4).
 
-Colour state of the phase at each ON: G (begin green 1 -> begin yellow 8), Y (8 -> end yellow 9 / red clearance 10),
-Rg (first 2 s of red: late-yellow tails), R (rest of red, up to the next 1), U (unknown: no colour, before the first
+Color state of the phase at each ON: G (begin green 1 -> begin yellow 8), Y (8 -> end yellow 9 / red clearance 10),
+Rg (first 2 s of red: late-yellow tails), R (rest of red, up to the next 1), U (unknown: no color, before the first
 change, or over a comms gap > 120 s).  Occupancy is split exactly over the states with cumulative state-time curves.
 
   bins117.parquet   per detector-window x 5-min bin: ONs per state, fast ONs (ON->ON < 10 ticks) G+Y / R, chatter
@@ -120,7 +120,7 @@ def one(dev_dir):
         gi = np.diff(ut) > GAP_S
         g0, g1 = ut[:-1][gi], ut[1:][gi]
         phd = PH.get((w.split("_")[0], dev), {})
-        # ---- colour timelines per phase
+        # ---- color timelines per phase
         cm = np.isin(eid, (1, 8, 9, 10))
         tl = {}
         for p in np.unique(par[cm & (eid == 1)]):

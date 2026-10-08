@@ -755,7 +755,7 @@ def act_stats(ev: pd.DataFrame, start, end, min_on: int = 20, light: bool = Fals
     """Per-detector statistics of the individual actuations in [start, end) (note 40).
 
     ON duration, OFF gap (OFF -> next ON), ON -> ON interval; any interval that spans a comms
-    gap (> GAP_S with no event of any code) is dropped.  Colour state (1 = begin green,
+    gap (> GAP_S with no event of any code) is dropped.  Color state (1 = begin green,
     8 = begin yellow) is used only phase-anonymously: each detector's best-matching phase is
     the one whose green holds the most ON starts relative to its green time.
     `light=True` computes only what the packaged `rapid` rule needs (durations, intervals, bursts);
@@ -873,7 +873,7 @@ def _act_stats(ev, start, end, min_on: int = 20, light: bool = False):
         kk = np.minimum(k, len(g0) - 1)
         return (k < len(g0)) & (g0[kk] < b)
 
-    # colour: green intervals per phase, and all colour-change instants
+    # color: green intervals per phase, and all color-change instants
     cm = np.isin(eid, (1, 7, 8, 9, 10, 11))
     tc = np.sort(t[cm])
     greens = {}
@@ -956,7 +956,7 @@ def _act_stats(ev, start, end, min_on: int = 20, light: bool = False):
         r["toggle_frac"] = (k_ + nr) / n
         r["long_frac"] = float((df > 60).mean())
         r["long_time"] = float(df[(df > 120) & (df <= 900)].sum()) / max(cov_s, 1)
-        # ONs 0-0.25 s after a colour change (crosstalk / controller-locked), vs chance
+        # ONs 0-0.25 s after a color change (crosstalk / controller-locked), vs chance
         if len(tc) > 10:
             k = np.searchsorted(tc, x, "left") - 1
             dt = np.where(k >= 0, x - tc[np.maximum(k, 0)], np.inf)

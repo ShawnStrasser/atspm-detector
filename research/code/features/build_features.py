@@ -157,7 +157,7 @@ def load_chunk(con, devs: list[str]) -> None:
 
 
 def load_cycles(con, devs: list[str]) -> None:
-    """Full four-colour cycle table (`load_chunk` drops `redclr_end`)."""
+    """Full four-color cycle table (`load_chunk` drops `redclr_end`)."""
     dev_list = ",".join("'" + d + "'" for d in devs)
     con.execute(f"""CREATE OR REPLACE TEMP TABLE cyc4_all AS
         SELECT m.dev, c.Phase::SMALLINT AS p, c.cyc::INT AS cyc,

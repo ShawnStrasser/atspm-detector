@@ -11,7 +11,7 @@ ones it was TRAINED on (research `build_cache.py` -> `neural/ncache2.py`):
     coordinated   event 131 with a pattern of 1..253, until the next 131
     candidates    every phase with a Begin Green (event 1) in the sample   (= predict's `cand`)
 
-The colour cycles use events 1 / 8 / 10 / 11 only (no 7 / 9 fall-backs, unlike predict's `cyc_all`); that table
+The color cycles use events 1 / 8 / 10 / 11 only (no 7 / 9 fall-backs, unlike predict's `cyc_all`); that table
 (`cyc5`) is built once per call and shared with the expert function features.  A sample longer than `CHUNK_MS` is cut
 by `split_range` into pieces of at most 30 minutes, the window the network was trained on.  numpy, pandas and the
 caller's DuckDB connection only.
@@ -30,7 +30,7 @@ FROM onev_all o JOIN devmap m USING (dev)"""
 SQL_DET_CH = "SELECT DISTINCT m.DeviceId, o.det::INT AS ch FROM onev_all o JOIN devmap m USING (dev)"
 SQL_CAND = "SELECT m.DeviceId, c.p::INT AS p FROM cand c JOIN devmap m USING (dev) ORDER BY m.DeviceId, p"
 
-# colour cycles from events 1 / 8 / 10 / 11 (the network's and the expert features' definition), built once per call
+# color cycles from events 1 / 8 / 10 / 11 (the network's and the expert features' definition), built once per call
 SQL_CYC5_TABLE = """CREATE TEMP TABLE IF NOT EXISTS cyc5 AS
 WITH g AS (
   SELECT dev, Parameter::SMALLINT AS p, Timestamp AS t, EventId,

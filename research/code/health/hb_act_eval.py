@@ -37,7 +37,7 @@ FEATS = {"ioi_lt05": 1, "ioi_lt1": 1, "burst_frac": 1, "gap_lt03": 1, "long_time
 FAMILIES = {"fast: ON->ON < 0.5 / 1 s": ["ioi_lt05", "ioi_lt1"], "bursts (5+ ONs, gaps < 1 s)": ["burst_frac"],
             "re-trigger < 0.3 s by group": ["gap_lt03"], "long ONs 2-15 min": ["long_time"],
             "flow-occupancy (5 stats)": ["fo_corr", "fo_hi", "fo_lo", "sticky_bins", "fog_dev"],
-            "nearest-sibling histogram": ["nn_js_dur", "nn_js_ioi"], "ON locked to colour": ["lock_ratio"],
+            "nearest-sibling histogram": ["nn_js_dur", "nn_js_ioi"], "ON locked to color": ["lock_ratio"],
             "all 13": list(FEATS)}
 POS = ("wl_dq_health", "wl_lc_health", "wl_card_erratic")
 

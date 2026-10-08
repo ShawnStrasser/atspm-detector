@@ -16,7 +16,7 @@ Input: the 118c-check report (40 rows, 80 charts). Charts and sheet re-drawn fro
   No other row triggers the note.
 - Row 34 (08019 det 3): legend now explains points above the line without a dot (not counted: signal busy or
   phase mates ON too - the check's `quiet` / light-traffic conditions in score_v4c.occ_hi_c).
-- Mates cap raised 8 -> 12 (palette 12 colours; time-of-day charts 6 -> 12). Row 4 now shows det 54; the row 40
+- Mates cap raised 8 -> 12 (palette 12 colors; time-of-day charts 6 -> 12). Row 4 now shows det 54; the row 40
   day chart now shows all 11 mates (3 were hidden).
 
 ## Not changed (judgment / user)

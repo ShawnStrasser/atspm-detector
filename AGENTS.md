@@ -47,7 +47,7 @@ does, how to use it and how well it does; it is not a substitute for the rules b
   channel numbers in any form, including "nearby channel" adjacency (user, 2026-10-07). `atspm-detector-check`
   enforces this by randomly permuting both detector channel numbers and phase numbers: the answers
   must not change.
-* **Allowed event codes:** 81, 82 (detector), 1, 7, 8, 9, 10, 11 (colour state), 43, 44 (phase
+* **Allowed event codes:** 81, 82 (detector), 1, 7, 8, 9, 10, 11 (color state), 43, 44 (phase
   call), 131 / 150 (coordination), 83–88 (detector faults), 173 (flash). **Not allowed:**
   gap-out / max-out / force-off (4, 5, 6, 13), overlaps (61–66), FYA (32, 33), pedestrian events
   (21–23, 45, 89, 90), preemption. `Parameter > 64` on 81/82 are dummy detectors: drop them.
@@ -160,7 +160,7 @@ accuracy is 86.8 %, not 75.5 %, before any retraining. Corrected labels: `resear
   all lanes to save inputs.
 * **Presence**: ~20 ft zone at the stop bar; occupied through red; turns off late in green once the
   queue has cleared.
-* **Advance**: a count zone far upstream; random arrivals regardless of colour when free, platoons
+* **Advance**: a count zone far upstream; random arrivals regardless of color when free, platoons
   during green when coordinated. Queue spill-back over it happens only well into red. Set to pulse
   or normal.
 * **Other** (not classified, but must be recognised): ETA zones (on while a vehicle is 3–5 s out),

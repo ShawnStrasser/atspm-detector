@@ -5,7 +5,7 @@ Dec 2024 full), `hb_act_eval.py` (all tables below). Artefacts `%DC_WORK%/health
 ## What was built (the user's three ideas), per detector and window
 * Per actuation: ON duration, OFF gap, ON->ON interval (anything spanning a > 120 s comms gap dropped). Statistics:
   share of ON->ON < 0.5 s / < 1 s, bursts (>= 5 ONs, every interval < 1 s), re-trigger < 0.3 s, repeated identical
-  intervals / ON-OFF toggling (0.1-s clock, >= 4 in a row), ON time in 2-15 min ONs, ONs 0-0.25 s after a colour change
+  intervals / ON-OFF toggling (0.1-s clock, >= 4 in a row), ON time in 2-15 min ONs, ONs 0-0.25 s after a color change
   vs chance (crosstalk).
 * Flow-occupancy: in the uncongested branch occupancy = volume x mean ON, so the test is whether the mean ON per
   actuation holds: 5-min bins > 6x or < 1/6 of the detector's own median, Spearman(volume, occupancy), "sticky" bins
@@ -23,7 +23,7 @@ Positives pooled = dq / label-check health fail / card erratic (the sets with ac
 | bursts | 29.7 / 27.6 (+1.1..+3.3) | 43.1 / 41.9 (+0.4..+2.2) | 61.7 / 61.2 (-0.3..+1.3) | 95.9 / 95.9 |
 | re-trigger < 0.3 s by group; long ONs 2-15 min | within +-0.7 of loosened | same | same | same |
 | flow-occupancy (5 stats) | 28.5 / 31.3 (-4.2..-1.2) | 42.5 / 42.8 | 61.5 / 62.0 | 96.1 / 96.6 |
-| sibling histogram; colour lock | 27.0 / 27.8 (-1.7..0); 26.8 / 27.3 | worse | worse | worse |
+| sibling histogram; color lock | 27.0 / 27.8 (-1.7..0); 26.8 / 27.3 | worse | worse | worse |
 | all 13 at once | 32.6 / 36.2 (-5.7..-1.3) | 45.0 / 48.3 | 62.6 / 65.3 | 96.3 / 96.8 |
 Rhythm / toggling fired on ~0 detectors in any set. Flow-occupancy / sibling distance: heavy healthy tails.
 ## Kept: `rapid` rule in health_core (ioi_lt05, ioi_lt1, burst_frac / group limit; suspect at 1x, bad at 2x; >= 50 ONs)

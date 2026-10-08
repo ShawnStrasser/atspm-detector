@@ -1,6 +1,6 @@
 """Stage 08 step 1 -- **demand-contrast** raw counters.
 
-Idea (from an outside rule-based researcher): a detector's occupancy-by-colour behaviour
+Idea (from an outside rule-based researcher): a detector's occupancy-by-color behaviour
 *changes with demand*, and that change is what separates the functions.  A stop-bar
 Presence loop is occupied through red at 3 am and at 5 pm alike; an Advance loop is
 pulse-like off-peak but gets sat on in the peak, and only in the peak, once the queue

@@ -8,7 +8,7 @@ s = s[:a] + s[b:]                      # the SQL text goes (ported to numpy belo
 a = s.index("def colour_stats(CB, lanes, con=None):")
 b = s.index("# ============================================================================ time of day")
 new = open(os.path.join(os.environ.get("DC_WORK", os.path.expanduser("~/dc_work")), r"s128\patch\fast_np.py"), encoding="utf-8").read() + '''def colour_stats(CB, lanes):
-    """too-fast / too-many statistics per detector from the colour bins (h117_study.stats + h118c_fast.fast_stats;
+    """too-fast / too-many statistics per detector from the color bins (h117_study.stats + h118c_fast.fast_stats;
     note 128: the research DuckDB query ported to numpy with the same float32 / float64 arithmetic, so health opens no
     database connection).  lanes: detector -> model lane span.  Rows sorted by detector."""
     cols = ["detector", "q5_gy", "q5_all", "fo_all", "fem_all", "n_spk", "fo_c", "fem_c", "n_spk_c"]

@@ -7,7 +7,7 @@ only (zone ranges "160-320" and lists are counted, not scored).  Phase = officia
 (`function_labels_v3.phase_target`, phase type only); in production it would be the predicted
 phase.  Events: the staging cache (Sept 2026, 66 h), which matches the prints' vintage.
 
-Per advance/mid detector (phase-anonymous: only its own phase's colour state is used):
+Per advance/mid detector (phase-anonymous: only its own phase's color state is used):
   (a) travel time: ON cross-correlogram advance -> stop-bar partner (a Presence / Count /
       Yellow_Red zone on the same phase, same lane when both lane indices are known), advance
       ONs in green >= 8 s after green start with dur <= 2 s.  tau = smoothed peak lag.

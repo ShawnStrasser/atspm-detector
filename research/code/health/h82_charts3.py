@@ -127,7 +127,7 @@ def nights(z0, z1, lo, hi, label):
 
 
 def line_chart(ax, z0, z1, series, ylabel, shade=(), hline=None, sample=None, ylim=None):
-    """series = [(label, tt, y, colour, width)]; shade = [(a, b, label)]; sample = (t0, t1) dotted when inside."""
+    """series = [(label, tt, y, color, width)]; shade = [(a, b, label)]; sample = (t0, t1) dotted when inside."""
     for a, b, _ in shade:
         ax.axvspan(max(a, z0), min(b, z1), color=SHADE, lw=0, zorder=0)
     npts = max(len(s[1]) for s in series)

@@ -1,4 +1,4 @@
-"""direct check: numpy colour medians == DuckDB window medians on every capture"""
+"""direct check: numpy color medians == DuckDB window medians on every capture"""
 import sys, pickle, warnings, glob
 sys.path.insert(0, "../final_v7_next/src"); warnings.simplefilter("ignore")
 from detector_classifier import health_core as hc, health_v4_stats as hs

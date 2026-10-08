@@ -6,13 +6,13 @@ Healthy baseline = v4 status ok, no category / watch, predicted phase correct by
 Limits p99.8 (high side) or p0.2 (low side) per fn x span x sample length (fallback fn x length; cells >= 100),
 fitted on the OTHER half of the signals (2-fold by signal hash) so no detector sets its own limit.
 
-Candidate checks (metric on the predicted phase's colours; eligibility: >= 10 complete cycles, >= 50 vehicle ONs):
+Candidate checks (metric on the predicted phase's colors; eligibility: >= 10 complete cycles, >= 50 vehicle ONs):
   RR   Count / Yellow_Red: red ON rate share  r_r / (r_r + r_gy)              high side (counting in red)
   INV  Presence: ON at begin yellow minus ON at begin green (share of cycles)  high side (inverted queue pattern)
   E5   Count / YR / Presence: share of demand cycles whose first ON <= 5 s     low side  (no green-start response)
        into green (needs >= 10 demand cycles)
-  ADV  Advance: red ON rate share                                              both sides (colour-dependent arrivals)
-  DEP  all types: share of ONs in green+yellow minus green+yellow time share   low side  (no colour response)
+  ADV  Advance: red ON rate share                                              both sides (color-dependent arrivals)
+  DEP  all types: share of ONs in green+yellow minus green+yellow time share   low side  (no color response)
   OCC  Other / Mid / Bike: log ratio % ON red / % ON green                     both sides
 Same metric on the true phase (t_) and on a placebo phase (x_).
 

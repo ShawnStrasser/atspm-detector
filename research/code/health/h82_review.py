@@ -719,7 +719,7 @@ def write_xl(rows, rates):
     ws.row_dimensions[1].height = 34
     ws.append(["Data: Sat 26 - Mon 28 Sep 2026. Each row = one detector in one sample. 'Model' = what the "
                "classifier thinks the detector is (phase, function). 'Result' = what the package reports for it. "
-               "The chart shows the evidence; the other coloured lines are detectors on the same phase for comparison."])
+               "The chart shows the evidence; the other colored lines are detectors on the same phase for comparison."])
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=12)
     ws.row_dimensions[2].height = 30
     hdr = ["#", "Check", "Signal", "Det", "Model", "Sample", "Sensor", "What the check saw", "Result", "Chart",

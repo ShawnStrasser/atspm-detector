@@ -21,7 +21,7 @@ Rules may use anything (print, timing, FYA events): cleansing only, never model 
 2. **Fault events 83-88 never used.** Health = actuations only (stuck > 15 min, chatter > 30 % gaps < 0.3 s,
    saturation, card with BOTH outputs stuck/chattering); new status `unhealthy` (not trained, not a label verdict).
    Card "erratic" from faults alone is dropped. 118 former fails were fault-driven only.
-3. **Protected-permissive (FYA) phases.** Left turns leave on the flashing yellow, which the phase's own colour logs
+3. **Protected-permissive (FYA) phases.** Left turns leave on the flashing yellow, which the phase's own color logs
    as red. PPLT = FYA begin-permissive events (32, parameter = left-turn phase, `data/staging_other`, 208 devices;
    Dec pull too) >= 5, or the timing: a detector of phase 1/3/5/7 also calls 2/4/6/8 (e.g. 08040 dets 1, 13).
    343 phases / 178 signals / 775 labelled rows (259 phases by events, 84 by timing only). There presence holds-red
@@ -54,7 +54,7 @@ bike 34, mid 28, swap 1 (+ card 303, health 75, saturation 7: no_data / unhealth
 fail now passes), 2B143 d9 (new swap), 01070 d11 (control: still fails). Earlier answers: sheet 2. Chart data: `cabinet/spotcheck_chart_data/`.
 ## Open (not done now)
 * **Model side: permissive phases from hi-res alone.** On FYA phases a presence zone does not hold through "red"; the
-  model sees only 81/82 + colour states. It may need a phase-anonymous feature for "vehicles clear this detector
+  model sees only 81/82 + color states. It may need a phase-anonymous feature for "vehicles clear this detector
   while the phase is red but a partner phase is green" (FYA events are not allowed inputs). Research item.
 * Decision for the orchestrator: config-issue rows are kept as `pass` when another check passes (pulse-set presence is
   mostly not_checkable, so excluded from pass-only training); a pulse-set Presence behaves like a Count to the model.

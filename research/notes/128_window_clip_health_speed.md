@@ -26,7 +26,7 @@ clock window is kept (training used clock windows). Per signal, so a multi-signa
 - v4 layer: long pandas tables -> detector x bin matrices; pandas compensated groupby sums reproduced (`_ksum`, same
   order); the h117/h118c DuckDB query ported to numpy with DuckDB's float32 / float64 types; resolver, severity and
   outputs on arrays; lookups precomputed; integer-nanosecond clock maths.
-- Exactness: numpy medians = DuckDB window medians (792 columns); colour stats = old SQL (132 windows + 300 random);
+- Exactness: numpy medians = DuckDB window medians (792 columns); color stats = old SQL (132 windows + 300 random);
   Kahan / median replicas = pandas 2.3.3 and 3.0.6; ns conversion = pandas (9.1 M values).
 
 **3. Parity / checks**

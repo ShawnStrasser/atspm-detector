@@ -1,8 +1,8 @@
-"""Note 122: red vs green as a HEALTH signal - per-cycle event pass with three colour sources.
+"""Note 122: red vs green as a HEALTH signal - per-cycle event pass with three color sources.
 
 Same w40 windows / signals as note 117 (763 training signals, locked_v2 asserted absent).  Hi-res log only (81 / 82
-de-duplicated, channels > 64 dropped; colour 1 / 8 / 9 / 10).  For every detector-window the detector's vehicle ONs
-(ONs that start a continuous ON, h117 rule) are read against the colours of three phases:
+de-duplicated, channels > 64 dropped; color 1 / 8 / 9 / 10).  For every detector-window the detector's vehicle ONs
+(ONs that start a continuous ON, h117 rule) are read against the colors of three phases:
   pred   the classifier's predicted phase (production view; the phase number is only a join key)
   true   the official timing phase (labels v4q phase_target; evaluation only)
   plac   a placebo: a random OTHER phase with greens at the signal (seeded per detector-window)

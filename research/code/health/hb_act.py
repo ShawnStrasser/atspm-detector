@@ -1,7 +1,7 @@
 """Note 40: actuation-level (ON / OFF event) health statistics on the real Sept 2026 windows.
 
 Per detector and evaluation window (hb_data.EVAL_WIN['stg']): ON durations, OFF gaps, ON->ON
-intervals, bursts, repeated identical intervals (rhythm), ONs locked to colour changes,
+intervals, bursts, repeated identical intervals (rhythm), ONs locked to color changes,
 5-min flow-occupancy consistency (all ONs and green-starting ONs of the detector's
 best-matching phase), and the histogram distance to the nearest sibling detector.
 Hi-res log only (health_core.act_stats); training signals only (folds_v4 minus locked_v2).

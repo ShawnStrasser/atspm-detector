@@ -257,7 +257,7 @@ def _one_time_panel(ax, p, z0, z1, shade, sample, first):
                 ls_.append(lab)
         if not first:
             hs.append(Line2D([], [], color=V.MUTED, lw=1.3))
-            ls_.append("same detectors and colours as the top panel")
+            ls_.append("same detectors and colors as the top panel")
 
         def mx(y):
             y = np.asarray(y, float)

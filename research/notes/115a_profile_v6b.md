@@ -24,7 +24,7 @@ use the shares.
   +38..+150 MB, network arena +77..+104 MB peak. Network sessions with arena OFF: peak 478 -> 374 MB (bch 24 h),
   381 -> 304 MB (3 h), retained 316 -> 220 MB, no time change.
 ## Waste found
-* raw `ev` scanned by 16 statements; ON intervals derived twice from ev (+ a third LEAD pass just to list channels), colour
+* raw `ev` scanned by 16 statements; ON intervals derived twice from ev (+ a third LEAD pass just to list channels), color
   cycles three times (cyc_raw, streams SQL_CYC, expert cycw), calls / coord / cand twice.
 * onev x cand ASOF cyc materialised twice (j, j2); ON -> call-43 ASOF twice; long-ON release ASOF twice; SQL_CALL_REV
   cross-joins calls x detectors (0.26 s at bev 24 h, slowest statement).

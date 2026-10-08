@@ -42,7 +42,7 @@ Wheel 5.50 -> 5.65 MB, package files 65 -> 69, uncompressed 8.97 -> 9.42 MB. No 
 | 3 h | 0.89 -> 1.07 | 1.24 -> 1.43 | 270 -> 282 |
 | 24 h | 1.42 -> 1.76 | 1.81 -> 2.15 | 384 -> 387 |
 7 days, 1 thread (n08, 38 ch): 15.6 / 14.6 -> 17.2 / 16.5 s (cold / warm), peak 925 -> 843 MB. Made faster during the
-port (same answers): episodes listed from 5 min (a 1-min list built a 100 MB pairwise matrix), colour timeline
+port (same answers): episodes listed from 5 min (a 1-min list built a 100 MB pairwise matrix), color timeline
 vectorised, queue context per phase matrix. Health is now 0.24 s of a 3-h call (43 ch), 0.5 s at 24 h; the rest is
 pandas overhead spread thin. 3 h is now 2.3x the beta's 0.47 s (was 1.9x).
 **Charts** `health_chart(events, out, detector, path=)`: detector + phase mates, counts and % ON per 15 min, listed

@@ -51,7 +51,7 @@ rep('''def colour_stats(CB, lanes, con=None):''', '''def _win_median(R, h=6):
 
 
 def _colour_medians(cb):
-    """the six rolling medians of the research SQL (m7 / m8: rates by colour state, raw and without chatter), from
+    """the six rolling medians of the research SQL (m7 / m8: rates by color state, raw and without chatter), from
     the float32 bins in the same float32 arithmetic as the SQL (rows: detector-major, every bin present)."""
     nd = len(np.unique(cb.detector.to_numpy()))
     nb = len(cb) // max(nd, 1)

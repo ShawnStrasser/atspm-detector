@@ -2,7 +2,7 @@
 could NOT settle.  Narrow format ("det 41: P1 Yellow-Red"), one detector (or a same-role pair) per row, chart + print.
 
 Chart data are saved first (%DC_WORK%/s93/review_data/: the Sat 19 Sep 12:00-15:00 stg window, every detector on the
-row's phase + that phase's colour events), then drawn from the saved files only.
+row's phase + that phase's color events), then drawn from the saved files only.
 
     python r93_review.py data     -> %DC_WORK%/s93/review_data/*.parquet
     python r93_review.py write    -> review/yr_without_count_review.xlsx + review/yr_without_count_review_charts/

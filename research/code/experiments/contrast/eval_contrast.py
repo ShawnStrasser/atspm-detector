@@ -71,7 +71,7 @@ def exact_subset(cols):
 
 
 def occ_only(cols, prefix, names):
-    """colour-occupancy contrast columns of one flavour + that flavour's evidence context"""
+    """color-occupancy contrast columns of one flavour + that flavour's evidence context"""
     return [c for c in cols if c.startswith(prefix)
             and (c.split("_")[1] in names or c.startswith(prefix + "ctx_"))]
 

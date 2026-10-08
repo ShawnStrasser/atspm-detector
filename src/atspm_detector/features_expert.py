@@ -233,7 +233,7 @@ def prepare_tables(con, w0: float, w1: float, tgt: pd.DataFrame) -> None:
 
     onw    detector ON intervals with the ON inside [w0, w1), duration in double
            precision (whole milliseconds, exactly as the research cache stored it)
-    cycw   colour cycles of every phase: begin green (1), begin yellow (8), begin red
+    cycw   color cycles of every phase: begin green (1), begin yellow (8), begin red
            clearance (10); green ends at the first of yellow / red clearance / next
            green; only cycles that start inside the window and have a next green
     coordw the coordination state changes (event 131)

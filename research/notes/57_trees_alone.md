@@ -35,7 +35,7 @@ m5 +0.16 [-0.03,+0.34], **m30 -0.12 [-0.24,-0.01]** (R -0.11 [-0.23,+0.01]), h6 
 | decision rule: non-ATSPM classes pooled (no refit) | .8902 | .9030 | +0.01 [-0.02,+0.04] | - |
 | **drop pp_xcand+pp_pdiff+pp_v2+yr+ratio+top_prob (229 feat)** | .8897 | .9027 | -0.04 [-0.14,+0.06] | -0.16 / +0.11 |
 | same, single seed (s0 / s1 / s2) vs full 3-seed | .8890-.8889 | .9019-.9018 | -0.11..-0.12 | m30 -0.17..-0.31 |
-| + drop pp_core (colour shares; 213 feat) | .8852 | .8982 | -0.49 [-0.68,-0.30] | -0.67 / -0.54 |
+| + drop pp_core (color shares; 213 feat) | .8852 | .8982 | -0.49 [-0.68,-0.30] | -0.67 / -0.54 |
 Leave-one-group-out, seed 0, vs full seed 0 (E; R same within 0.02): lag (advance->stop-bar lag, 28) **-1.85 [-2.19,-1.54]** ·
 sibling (73) -0.44 [-0.61,-0.29] · expert A2 px (54) -0.16 [-0.24,-0.08], px SHUFFLED control -0.12 [-0.20,-0.04] (the px
 signal is real but ~0.15 pt) · condition-dependent coord/free (5 + ranks) -0.10 [-0.18,-0.02] · pp_core -0.04 · pp_xcand +0.04 ·
@@ -43,7 +43,7 @@ pp_pdiff +0.08 · pp_v2 +0.01 · yr +0.03 · ratios +0.04 · top_prob +0.08. Dec
 argmax -0.10 (full window -0.72 [-1.22,-0.24]).
 ## Verdict (bars: phase 0.3 pt at 30 min, function 1 pt; "real" = CI clear of 0)
 * Phase: keep the **joint decoder** (+1.5 pt at 30 min, +2.4 at 5 min: the only component far above the bar) and the call,
-  queue/release, duration and colour-share features. The other six groups cost nothing measurable alone; dropped together they
+  queue/release, duration and color-share features. The other six groups cost nothing measurable alone; dropped together they
   cost 0.12 pt at 30 min (real, under the bar). 3-seed bagging: +0.09-0.13 pt at 30 min (real, under the bar, 3x tree cost).
   **Simplest not beaten by the bar: 68-feature ranker, 1 seed, + decoder** (30 min .9677 E / .9705 R vs .9696 / .9723 for the
   261-feature 3-seed bag). Phase-call events are the trees' backbone: without them 30 min falls to .846 (portability risk for
