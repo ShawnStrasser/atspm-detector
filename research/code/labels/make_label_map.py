@@ -27,8 +27,8 @@ from pathlib import Path
 
 import pandas as pd
 
-CFG = Path(r"S:\Data_Analysis\Python\detector-classifier\data\statewide_2025-02-25"
-           r"\all_configs.csv")
+CFG = (Path(__file__).resolve().parents[3] / "data" / "statewide_2025-02-25"
+       / "all_configs.csv")
 OUT = Path(__file__).resolve().parent / "function_label_map.csv"
 
 # raw string (as it appears, verbatim) -> (standard class, confidence, note)

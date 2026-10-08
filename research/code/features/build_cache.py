@@ -286,24 +286,15 @@ def build_derived(con) -> None:
                    count(DISTINCT date_trunc('hour', t_on)) AS n_hours_active,
                    min(t_on) AS first_on, max(t_on) AS last_on
             FROM iv GROUP BY 1,2
-          ), flt AS (
-            SELECT DeviceId, Parameter::UTINYINT AS Detector,
-                   count(*) FILTER (EventId IN (84,85,86,87,88)) AS n_fault_events,
-                   count(*) FILTER (EventId = 83) AS n_restore_events
-            FROM ev WHERE EventId BETWEEN 83 AND 88 AND Parameter <= {MAX_DETECTOR_CHANNEL}
-            GROUP BY 1,2
           )
           SELECT a.*, sm.span_secs,
                  a.n_on / (sm.span_secs/3600.0) AS on_per_hour,
                  a.occ_secs / sm.span_secs AS occ_frac,
-                 coalesce(f.n_fault_events,0) AS n_fault_events,
-                 coalesce(f.n_restore_events,0) AS n_restore_events,
-                 (coalesce(f.n_fault_events,0) > 0
-                  OR a.dur_max > 900
+                 (a.dur_max > 900   -- note 88: fault events 83-88 no longer part of `unhealthy`
                   OR a.frac_dur_lt015 > 0.5
                   OR a.n_on < 20
                   OR a.n_hours_active < 6) AS unhealthy
-          FROM agg a JOIN sm USING (DeviceId) LEFT JOIN flt f USING (DeviceId, Detector)
+          FROM agg a JOIN sm USING (DeviceId)
           ORDER BY DeviceId, Detector
         ) TO '{(CACHE / 'detector_meta.parquet').as_posix()}' (FORMAT parquet, COMPRESSION zstd)
     """)

@@ -1,0 +1,142 @@
+{
+ "groups": {
+  "m30": {
+   "files": [
+    "setback_m30_q50_s0.txt"
+   ],
+   "L_fit": 43.84615545442124,
+   "n_train": 2877,
+   "signals": 127,
+   "onnx_files": [
+    "setback_m30_q50_s0.onnx"
+   ]
+  },
+  "h6": {
+   "files": [
+    "setback_h6_q50_s0.txt"
+   ],
+   "L_fit": 52.10526381172963,
+   "n_train": 1456,
+   "signals": 127,
+   "onnx_files": [
+    "setback_h6_q50_s0.onnx"
+   ]
+  },
+  "h24": {
+   "files": [
+    "setback_h24_q50_s0.txt"
+   ],
+   "L_fit": 47.90322728013154,
+   "n_train": 1459,
+   "signals": 127,
+   "onnx_files": [
+    "setback_h24_q50_s0.onnx"
+   ]
+  },
+  "full": {
+   "files": [
+    "setback_full_q50_s0.txt"
+   ],
+   "L_fit": 47.38461538461538,
+   "n_train": 732,
+   "signals": 127,
+   "onnx_files": [
+    "setback_full_q50_s0.onnx"
+   ]
+  }
+ },
+ "features": [
+  "green_mean",
+  "green_q90",
+  "red_mean",
+  "cycle_mean",
+  "green_share",
+  "n_cyc",
+  "on_ph",
+  "on_per_cyc",
+  "vol_vs_sb",
+  "cyc_on_share",
+  "dur_med",
+  "dur_q25",
+  "dur_q75",
+  "dur_q90",
+  "pulse_share",
+  "f_red",
+  "f_yel",
+  "f_g5",
+  "f_g10",
+  "f_glate",
+  "f_red_long",
+  "dur_mean_red",
+  "dur_mean_green",
+  "f_quiet",
+  "rel_med",
+  "rel_q25",
+  "rel_share",
+  "first_lag_med",
+  "first_lag_q25",
+  "hold_med",
+  "hold_share",
+  "adv_pulse",
+  "adv_dur",
+  "tau",
+  "same",
+  "p_same",
+  "n_in",
+  "pk_strength",
+  "v_self",
+  "tau_any",
+  "pk_any",
+  "p_same_any",
+  "n_cand",
+  "n_acc",
+  "tau_rank",
+  "v_phase_count",
+  "v_phase_pres",
+  "d_user",
+  "d_lfit",
+  "d_any_lfit",
+  "role_c",
+  "n_det_phase",
+  "ph_n_Advance",
+  "ph_n_Mid",
+  "ph_n_Presence",
+  "ph_n_Count",
+  "ph_n_Yellow_Red",
+  "ph_n_Other",
+  "p_mid"
+ ],
+ "params": {
+  "n_estimators": 300,
+  "learning_rate": 0.03,
+  "num_leaves": 15,
+  "min_child_samples": 10,
+  "subsample": 0.8,
+  "subsample_freq": 1,
+  "colsample_bytree": 0.8,
+  "n_jobs": 4,
+  "verbose": -1
+ },
+ "quantile": 0.5,
+ "group_rule_hours": {
+  "m30": [
+   0,
+   1.7320508
+  ],
+  "h6": [
+   1.7320508,
+   12.0
+  ],
+  "h24": [
+   12.0,
+   39.799497
+  ],
+  "full": [
+   39.799497,
+   1000000000.0
+  ]
+ },
+ "group_rule": "nearest training window length on a log scale (geometric means of 0.5 / 6 / 24 / 66 h)",
+ "labels": "note 95: sb7 features (Sept-2026 windows) on the 2026-only OOF function",
+ "note111": "ONE seed per length group (s0 = the note-95 seed-0 fit); note 109: tie (+0.3 [-0.3,+0.8] w50 pt)"
+}

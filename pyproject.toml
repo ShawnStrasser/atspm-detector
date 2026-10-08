@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atspm-detector"
+dynamic = ["version"]
+description = "Phase, function, lanes, setback, night speed and health of traffic-signal detectors from the controller's hi-res event log (CPU, onnxruntime)."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [
+    {name = "Shawn Strasser"}
+]
+keywords = ["traffic signal", "ATSPM", "detector", "high-resolution data", "NTCIP"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "duckdb>=1.0",
+    "onnxruntime>=1.21",
+]
+
+[project.optional-dependencies]
+charts = ["matplotlib>=3.7"]
+dev = [
+    "pytest>=7.0.0",
+    "build>=1.0",
+]
+
+[project.scripts]
+atspm-detector = "atspm_detector.pipeline:main"
+atspm-detector-check = "atspm_detector.check:cli"
+
+[project.urls]
+Homepage = "https://github.com/ShawnStrasser/atspm-detector"
+Documentation = "https://github.com/ShawnStrasser/atspm-detector#readme"
+Repository = "https://github.com/ShawnStrasser/atspm-detector"
+Issues = "https://github.com/ShawnStrasser/atspm-detector/issues"
+Changelog = "https://github.com/ShawnStrasser/atspm-detector/blob/main/CHANGELOG.md"
+"Embedding Guide" = "https://github.com/ShawnStrasser/atspm-detector/blob/main/docs/embedding.md"
+
+[tool.setuptools.dynamic]
+version = {attr = "atspm_detector.__version__"}
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+atspm_detector = ["weights/*.json", "weights/*.onnx", "weights/*/*.json", "weights/*/*.onnx", "data/*.parquet", "reference/*.parquet"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

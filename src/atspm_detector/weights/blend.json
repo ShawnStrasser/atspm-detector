@@ -1,0 +1,17 @@
+{
+ "weight_lightgbm": 0.5,
+ "where": "before",
+ "long_minutes": 120,
+ "long_max_chunks": 4,
+ "long_piece_grid": 32,
+ "runtime": "onnx",
+ "weights_file": "funcnet/manifest.json",
+ "chunk_minutes": 30,
+ "note": "weight_lightgbm = weight on the pair ranker (1 seed), 1 - weight on the network's pair phase head; 'before' = averaged as per-detector probabilities, then the joint decoder runs on the mixture. The network runs at every sample length (note 120: no fast switch, no cut-off). A sample is read in pieces of at most chunk_minutes; up to long_minutes every piece, above it long_max_chunks evenly spaced pieces of a long_piece_grid grid (note 33). Runtime: onnxruntime CPU (funcnet.py).",
+ "network": {
+  "arch": "the function network's pair phase head (siba w32, 3 members, weights/funcnet): per member a softmax over the kept candidates of the piece-mean pair logit, members averaged",
+  "candidate_filter": "kept = ranker p >= .01 (the same pairs the function network runs on)",
+  "note": "note 111 (design C of note 109): one network kind for both tasks; the separate phase TCN is gone"
+ },
+ "network_kind": "siba_phase_head"
+}

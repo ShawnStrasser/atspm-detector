@@ -38,7 +38,7 @@ for _p in (SW_FEAT, SW_MODELS, SW_PREDS):
 DEV_EVENTS_GLOB = (CACHE / "events" / "**" / "*.parquet").as_posix()
 SW_EVENTS_GLOB = (SW_EVENTS / "**" / "*.parquet").as_posix()
 
-REPO_DATA = Path(r"S:\Data_Analysis\Python\detector-classifier\data")
+REPO_DATA = Path(__file__).resolve().parents[4] / "data"
 STATEWIDE_CFG = REPO_DATA / "statewide_2025-02-25" / "all_configs.csv"
 TEST_CFG = REPO_DATA / "splits" / "test_config.csv"
 

@@ -1,0 +1,128 @@
+name: Unit Tests
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - '.github/workflows/unit-tests.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - '.github/workflows/unit-tests.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+        include:
+          - os: windows-latest
+            python-version: '3.13'
+          - os: macos-latest
+            python-version: '3.13'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install package with dev extras
+      run: |
+        python -m pip install --upgrade pip
+        pip install ".[dev]"
+
+    - name: Build package
+      run: python -m build
+
+    # The package's own check: stored answers on the bundled sample, phase-number and
+    # channel invariance, and no hidden dependencies (torch / lightgbm / scipy / sklearn blocked).
+    - name: Run the package check
+      run: atspm-detector-check
+
+    - name: Run tests
+      run: pytest tests/test_check.py tests/test_atspm_export.py --junitxml=pytest-results.xml
+
+    # End to end with the atspm package (not a dependency: installed here only; it pins pandas < 3 through ibis).
+    - name: atspm end to end
+      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+      run: |
+        pip install atspm
+        pytest tests/test_atspm_export.py -rs
+
+    # Installs the wheel just built into a fresh virtual environment and runs the CLI and the check there.
+    - name: Fresh-venv install of the built wheel
+      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13'
+      shell: bash
+      run: python tests/smoke_install.py --wheel dist/*.whl
+
+    - name: Upload pytest results
+      uses: actions/upload-artifact@v4
+      with:
+        name: pytest-results-${{ matrix.os }}-py${{ matrix.python-version }}
+        path: pytest-results.xml
+      if: ${{ always() }}
+
+  publish:
+    name: publish to PyPI
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release' && github.event.action == 'published'
+    environment:
+      name: pypi
+      url: https://pypi.org/p/atspm-detector
+    permissions:
+      id-token: write  # PyPI trusted publishing (OIDC)
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.13'
+
+    - name: Install build tools
+      run: |
+        python -m pip install --upgrade pip
+        pip install build
+
+    - name: Build package
+      run: python -m build
+
+    - name: Check release tag matches package version
+      env:
+        RELEASE_TAG: ${{ github.event.release.tag_name }}
+      run: |
+        pip install dist/*.whl --no-deps
+        PACKAGE_VERSION=$(cd /tmp && python -c "import importlib.metadata as m; print(m.version('atspm_detector'))")
+        SOURCE_VERSION=$(python -c "import ast, pathlib; t = ast.parse(pathlib.Path('src/atspm_detector/__init__.py').read_text()); print(next(n.value.value for n in t.body if isinstance(n, ast.Assign) and any(getattr(x, 'id', None) == '__version__' for x in n.targets)))")
+        echo "tag=${RELEASE_TAG} wheel=${PACKAGE_VERSION} __version__=${SOURCE_VERSION}"
+        # the release tag must be exactly v<version>, e.g. v1.0.0
+        if [ "${RELEASE_TAG}" != "v${PACKAGE_VERSION}" ] || [ "${PACKAGE_VERSION}" != "${SOURCE_VERSION}" ]; then
+          echo "::error::Release tag ${RELEASE_TAG} must be v${SOURCE_VERSION} (wheel ${PACKAGE_VERSION})"
+          exit 1
+        fi
+
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      # Uses the PYPI_TOKEN secret when present; leave the secret unset to
+      # use trusted publishing (OIDC) once it is configured on PyPI.
+      with:
+        password: ${{ secrets.PYPI_TOKEN }}

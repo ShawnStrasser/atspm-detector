@@ -1,0 +1,105 @@
+{
+ "classes": [
+  "Advance",
+  "Presence",
+  "Count",
+  "Yellow_Red",
+  "Mid",
+  "Bike",
+  "Other"
+ ],
+ "n_features": 46,
+ "feature_names": [
+  "lt_Advance",
+  "lt_Presence",
+  "lt_Count",
+  "lt_Yellow_Red",
+  "lt_Mid",
+  "lt_Bike",
+  "lt_Other",
+  "ln_Advance",
+  "ln_Presence",
+  "ln_Count",
+  "ln_Yellow_Red",
+  "ln_Mid",
+  "ln_Bike",
+  "ln_Other",
+  "log_minutes",
+  "ent_t",
+  "ent_n",
+  "margin_t",
+  "margin_n",
+  "agree",
+  "stack_n",
+  "pk_span",
+  "pk_track",
+  "n_span_peers",
+  "n_coloc_peers",
+  "nl_self",
+  "lane_min",
+  "n_lanes_phase",
+  "phase_n_lanes",
+  "phase_n_lanes_conf",
+  "lane_conf",
+  "n_ph",
+  "phm_A",
+  "phm_P",
+  "phm_C",
+  "phm_Y",
+  "rk_A",
+  "rk_P",
+  "rk_C",
+  "rk_Y",
+  "lm_n",
+  "lm_A",
+  "lm_P",
+  "lm_C",
+  "lm_Y",
+  "log1p_det_n_on"
+ ],
+ "files": {
+  "mean3": [
+   "stacker_mean3_s0.txt"
+  ]
+ },
+ "params": {
+  "objective": "multiclass",
+  "num_class": 7,
+  "learning_rate": 0.05,
+  "num_leaves": 7,
+  "max_depth": 3,
+  "min_data_in_leaf": 300,
+  "lambda_l2": 10.0,
+  "feature_fraction": 0.8,
+  "bagging_fraction": 0.8,
+  "bagging_freq": 1,
+  "verbose": -1
+ },
+ "num_boost_round": 150,
+ "variant": "mean3 only (note 120 removed the fast switch and its 'single' / 'nonet' variants); ONE seed; note 111 recipe without pk_unhealthy (note 114); 1-seed trees OOF inputs",
+ "net": "siba x100_w32 six-fold OOF (3-member mean)",
+ "labels": "v4q (note 95); trees = 2026-only OOF of seed 0 only (note 111)",
+ "trained_on": {
+  "rows": 176912,
+  "signals": 642,
+  "period": "Sept-2026"
+ },
+ "variants": {
+  "mean3": {
+   "files": [
+    "stacker_mean3_s0.onnx"
+   ],
+   "use_when": "always (the only stacker since note 120)",
+   "trained": "mean3 (note 111 design C): 1-seed trees OOF + x100_w32 3-member-mean siba OOF (filtered), ONE stacker seed; note 114: without pk_unhealthy",
+   "trained_on": {
+    "rows": 176912,
+    "signals": 642,
+    "period": "Sept-2026"
+   }
+  }
+ },
+ "onnx_files": [
+  "stacker_mean3_s0.onnx"
+ ],
+ "note114": "pk_unhealthy (stack-relative health flag) removed: health is not a classification input; hf_clus_n renamed stack_n (same values: hi-res stack size, pick.stack_sizes)"
+}

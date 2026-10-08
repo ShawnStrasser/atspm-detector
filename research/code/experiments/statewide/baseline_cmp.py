@@ -24,7 +24,7 @@ import rpath  # noqa: F401,E402  -- research/code/** and model/ on sys.path
 from common import FUNCTIONS  # noqa: E402
 from common6 import SW_PREDS, statewide_labels  # noqa: E402
 
-BASE = Path(r"S:\Data_Analysis\Python\detector-classifier\baseline\inference_results.parquet")
+BASE = Path(__file__).resolve().parents[4] / "baseline" / "inference_results.parquet"
 
 
 def main() -> None:

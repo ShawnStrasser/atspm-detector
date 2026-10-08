@@ -1,0 +1,58 @@
+{
+ "members": [
+  {
+   "tag": "x100_w32full",
+   "pair": "x100_w32full_pair.onnx",
+   "head": "x100_w32full_head.onnx",
+   "checkpoint": "x100_w32full_full.pt",
+   "seed": 0
+  },
+  {
+   "tag": "x100_w32full_s1",
+   "pair": "x100_w32full_s1_pair.onnx",
+   "head": "x100_w32full_s1_head.onnx",
+   "checkpoint": "x100_w32full_s1_full.pt",
+   "seed": 1
+  },
+  {
+   "tag": "x100_w32full_s2",
+   "pair": "x100_w32full_s2_pair.onnx",
+   "head": "x100_w32full_s2_head.onnx",
+   "checkpoint": "x100_w32full_s2_full.pt",
+   "seed": 2
+  }
+ ],
+ "averaging": "three full-data members (seeds 0 / 1 / 2, same recipe) averaged in probability space -> stacker 'mean3'; every member's two graphs must be present (note 120: one stacker, 'mean3')",
+ "pieces": "streams.split_range pieces (<= 30 min; 4 of a 32 grid above 120 min); mean log-prob over pieces",
+ "channels": [
+  "occ",
+  "onrate",
+  "g",
+  "y",
+  "rc",
+  "call",
+  "og",
+  "oc",
+  "coord",
+  "onE",
+  "offE",
+  "cOn",
+  "cOff",
+  "pg",
+  "pc"
+ ],
+ "raster_s": 1,
+ "classes": [
+  "Advance",
+  "Presence",
+  "Count",
+  "Yellow_Red",
+  "Mid",
+  "Bike",
+  "Other"
+ ],
+ "trained": "note 100c FULL x100_w32full / x100_w32full_s1 / x100_w32full_s2: plain siba, TCN width 32 (7 blocks), 2026-only (Sept-2026 rows of every non-locked training signal), labels v4q (tcn53/func_rows_v4q_2026.parquet), 40 epochs on the schedule replayed from the 18 w32 fold runs (s100/lr_w32_full.json), research tcn69_func (snap95)",
+ "candidate_filter": "ON by default: the pair graph runs only on (detector, candidate) pairs with ranker p >= .01; the head masks the others (logit -1e4)",
+ "note": "production network (3 full-data width-32 members, 2026-only), one pass for phase (pair logit) and function (head)",
+ "phase_head": "note 111: the pair graph's output s (pair phase logit) is the package's phase network: per member softmax over the kept candidates of the piece-mean logit, members averaged; blended 0.5 / 0.5 with the 1-seed ranker before the joint decoder (blend.json network_kind siba_phase_head)"
+}

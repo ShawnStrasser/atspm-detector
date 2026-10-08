@@ -14,11 +14,6 @@ __pycache__/
 .ipynb_checkpoints/
 .venv/
 
-# --- but the shipped model IS versioned, including its weights and bundled sample ---
-!model/
-!model/**
-model/**/__pycache__/
-
 # --- and so are the research charts ---
 !research/charts/
 !research/charts/**
@@ -28,3 +23,15 @@ research/notes/*.pdf
 
 # agency-specific download code: never committed
 research/code/download/
+
+# --- pip package (atspm-detector) ---
+# the package's bundled sample and reference answers ARE versioned
+# (the folder itself must be re-included: the generic data/ rule above ignores every folder named data)
+!src/atspm_detector/data/
+!src/atspm_detector/data/*.parquet
+!src/atspm_detector/reference/*.parquet
+# build output
+dist/
+build/
+*.egg-info/
+.pytest_cache/

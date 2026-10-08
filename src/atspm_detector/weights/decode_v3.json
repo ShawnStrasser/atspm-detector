@@ -1,0 +1,53 @@
+{
+ "features": [
+  "p0",
+  "logit0",
+  "p0_gap",
+  "p0_rank",
+  "n_cand",
+  "sig_sum_o",
+  "sig_claims_o",
+  "sig_max_o",
+  "sig_ndet",
+  "cand_green_share",
+  "call43_per_cycle",
+  "calls_unclaimed",
+  "green_share_per_claim",
+  "det_n_on",
+  "log_win_hours",
+  "sim_mean",
+  "sim_max",
+  "sim_top1",
+  "sim_wsum",
+  "sim_n",
+  "lag_mean",
+  "lag_max",
+  "lag_top1",
+  "lag_wsum",
+  "lag_n"
+ ],
+ "mode": "binary",
+ "temperature": 1.0,
+ "n_estimators": 355,
+ "params": {
+  "objective": "binary",
+  "learning_rate": 0.05,
+  "num_leaves": 31,
+  "min_child_samples": 60,
+  "feature_fraction": 0.8,
+  "bagging_fraction": 0.8,
+  "bagging_freq": 1,
+  "lambda_l2": 1.0,
+  "verbose": -1,
+  "bagging_seed": 0,
+  "feature_fraction_seed": 100,
+  "seed": 0
+ },
+ "trained_on": {
+  "labelled_pair_rows": 1837561,
+  "period": "Sept-2026 only"
+ },
+ "n_estimators_rule": "mean best iteration of the six note-113 fold fits (v6_lagt_s0) [276, 462, 354, 491, 344, 203]",
+ "first_stage_input": "ranker s0 0.5 / siba w32 x3 phase head 0.5 (net on ranker p >= .01)",
+ "note": "note 113: channel-adjacency aggregates (adj_*) replaced by LEAD neighbours (lag_*, similarity.build_lead_window) -- no channel number in any form"
+}

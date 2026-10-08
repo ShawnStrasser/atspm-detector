@@ -44,13 +44,13 @@ EV_CALL_ON = 43          # phase call registered
 EV_CALL_OFF = 44         # phase call dropped
 EV_DET_OFF = 81          # detector off  (Parameter = detector channel)
 EV_DET_ON = 82           # detector on
-EV_DET_FAULT = (83, 84, 85, 86, 87, 88)   # restored / other / watchdog / open / short / excessive-change
+EV_DET_FAULT = (83, 84, 85, 86, 87, 88)   # NEVER READ (note 88); restored / other / watchdog / open / short / excessive-change
 EV_COORD_PATTERN = 131   # Parameter = pattern (0 or 254 => free, 255 => flash)
 EV_COORD_YIELD = 150     # Parameter = coordinated phase
 EV_FLASH = 173
 
-ALLOWED_EVENTS = (1, 7, 8, 9, 10, 11, 43, 44, 81, 82,
-                  83, 84, 85, 86, 87, 88, 131, 150, 173)
+# note 88: detector fault events 83-88 are never read (user ban 2026-09-28); new caches leave them out
+ALLOWED_EVENTS = (1, 7, 8, 9, 10, 11, 43, 44, 81, 82, 131, 150, 173)
 
 MAX_DETECTOR_CHANNEL = 64   # Parameter > 64 on 81/82 are dummy detectors -> dropped
 
