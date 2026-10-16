@@ -26,7 +26,8 @@ Pipeline
         + log P(span size | function) - lam * L,
     subject to <= 1 single-lane Advance / Presence / Count / Yellow_Red per lane and every lane
     holding at least one single-lane "anchor" (a detector predicted A / P / C / YR).  Mid / Other
-    detectors join lanes (often spanning) but never create one.  Bike detectors get no lane.
+    detectors join lanes (often spanning) but never create one.  Bike detectors get no lane; a detector
+    decoded as another class whose final function is Bike is cut to one lane afterwards (bike_one_lane, note 148).
     Exhaustive over the anchors' partitions (<= 9 anchors), then coordinate ascent over every
     detector's lane set (any non-empty subset: spanning allowed).  L = argmax.
     Channel-order free (note 77): P(same) = mean of the pair model over BOTH orientations (a, b) and (b, a); the
@@ -483,12 +484,13 @@ class PairModel:
 
 
 def lanes(on: dict, predictions: pd.DataFrame, pm: "PairModel", t0: float, t1: float, fmat: dict | None = None,
-          probs_override: dict | None = None, decoder: "Decoder | None" = None):
+          probs_override: dict | None = None, decoder: "Decoder | None" = None, ctx: dict | None = None):
     """-> (phase table, detector table).  `on` = {(DeviceId, det): (ON times, hour)} (see
     function_stage); `predictions`: DeviceId, Detector, phase_use (predicted phase, a grouping
     key only), func_use (predicted 7-class function); [t0, t1) = the sample window in seconds; fmat =
     {(DeviceId, det): float32 vector of the function block (lane model D)}.  probs_override {DeviceId: {(a, b): p}} /
-    decoder: replace the pair model / the decoder (used only by the research parity harness)."""
+    decoder: replace the pair model / the decoder (used only by the research parity harness).  ctx: if a dict, filled
+    with {DeviceId: decode inputs} for bike_one_lane."""
     pr = predictions.copy()
     pr["DeviceId"] = pr.DeviceId.astype(str)
     hours = (t1 - t0) / 3600.0
@@ -510,6 +512,9 @@ def lanes(on: dict, predictions: pd.DataFrame, pm: "PairModel", t0: float, t1: f
         elif pairs:
             probs = pair_probs(on, dev, n_on, pm, pairs, func, grp, t0, t1, hours, fmat)
         ph_t, det_t = decode_groups(dev, g, n_on, hours, probs, decoder or pm.decoder, pm.min_on, keys)
+        if ctx is not None:
+            ctx[dev] = dict(g=g, n_on=n_on, hours=hours, probs=probs, decoder=decoder or pm.decoder,
+                            min_on=pm.min_on, keys=keys)
         ph_rows.append(ph_t)
         det_rows.append(det_t)
     ph = pd.concat(ph_rows, ignore_index=True) if ph_rows else pd.DataFrame()
@@ -584,3 +589,89 @@ def decode_groups(dev, g, n_on: dict, hours: float, probs: dict, decoder: "Decod
                          "n_lanes_spanned": 0, "lane_conf": np.nan, "lane_note": note})
     return (pd.DataFrame(ph_rows),
             pd.DataFrame(det_rows).sort_values("Detector").reset_index(drop=True))
+
+
+def _lane_set(s) -> tuple:
+    return tuple(int(x) for x in s.split(",")) if isinstance(s, str) and s else ()
+
+
+def bike_one_lane(dev, c: dict, ph_t: pd.DataFrame, det_t: pd.DataFrame, bikes):
+    """A detector whose FINAL function is Bike covers exactly one lane and never adds a lane to its phase (note 148:
+    there is never more than one bike lane).  The decode ran on the trees' function, so a zone that ends up Bike may
+    have been decoded as a spanning or lane-making detector.  `c` = ctx[dev] from lanes(); bikes = the final-Bike
+    detectors of the signal.
+      * a phase on which some lane's single-lane anchors are all bikes (the bike made that lane) is decoded again
+        without its bikes, from the same pair probabilities;
+      * each bike then gets ONE lane: the lane with the largest sum of the pair log-odds of "same lane" (+ beta, the
+        decoder's own placement rule) over the phase's non-bike detectors on it, chosen among the lanes the decode
+        gave it (all the phase's lanes when the phase was decoded again); ties -> the busier lane.  A phase whose
+        lane-decoded detectors are all bikes has one lane.
+    Other detectors and phases are untouched.  -> (phase table, detector table)."""
+    if not len(det_t) or not bikes:
+        return ph_t, det_t
+    det_t = det_t.copy()
+    ph_t = ph_t.copy()
+    bikes = {int(b) for b in bikes}
+    ls = {int(d): _lane_set(s) for d, s in zip(det_t.Detector, det_t.lanes)}
+    fn = {int(d): f for d, f in zip(det_t.Detector, det_t.function)}
+    phs = {int(d): p for d, p in zip(det_t.Detector, det_t.phase)}
+    hit = [b for b in bikes if ls.get(b)]
+    if not hit:
+        return ph_t, det_t
+    nl = {int(p): int(n) for p, n in zip(ph_t.phase, ph_t.n_lanes)} if len(ph_t) else {}
+    redo, only = set(), set()
+    for p in {int(phs[b]) for b in hit}:
+        mem = [d for d in ls if ls[d] and pd.notna(phs[d]) and int(phs[d]) == p]
+        if all(d in bikes for d in mem):
+            only.add(p)                                    # a phase of bike zones only: one lane
+            continue
+        anc = [d for d in mem if fn[d] in ANCHOR] or mem
+        for l in range(1, nl.get(p, 1) + 1):
+            single = [d for d in anc if ls[d] == (l,)]
+            if single and all(d in bikes for d in single):
+                redo.add(p)
+                break
+    if redo:
+        g2 = c["g"].copy()
+        dd = g2.Detector.astype(int)
+        ph2 = pd.to_numeric(g2.phase_use, errors="coerce")
+        g2["func_use"] = np.where(dd.isin(bikes) & ph2.isin(list(redo)), "Bike", g2.func_use.to_numpy(object))
+        p2, d2 = decode_groups(dev, g2, c["n_on"], c["hours"], c["probs"], c["decoder"], c["min_on"], c["keys"])
+        keep = d2[d2.lanes.ne("") & d2.phase.isin(list(redo))].set_index("Detector")
+        for col in ("lanes", "n_lanes_spanned", "lane_conf"):
+            m = det_t.Detector.isin(keep.index)
+            det_t.loc[m, col] = det_t.loc[m, "Detector"].map(keep[col]).to_numpy()
+        p2 = p2[p2.phase.isin(list(redo))]
+        ph_t = pd.concat([ph_t[~ph_t.phase.isin(list(redo))], p2], ignore_index=True).sort_values("phase") \
+            .reset_index(drop=True)
+        ls.update({int(d): _lane_set(s) for d, s in zip(keep.index, keep.lanes)})
+        nl = {int(p): int(n) for p, n in zip(ph_t.phase, ph_t.n_lanes)}
+    beta = float(getattr(c["decoder"], "beta", 0.0))
+    nconf = {int(p): float(v) for p, v in zip(ph_t.phase, ph_t.n_lanes_conf)} if len(ph_t) else {}
+    for b in sorted(hit):
+        p = int(phs[b])
+        cand = [1] if p in only else list(range(1, nl.get(p, 1) + 1)) if p in redo else list(ls[b])
+        mates = [d for d in ls if d not in bikes and ls[d] and pd.notna(phs[d]) and int(phs[d]) == p]
+        gain = []
+        for l in cand:
+            s = 0.0
+            for k in mates:
+                if l in ls[k]:
+                    q = c["probs"].get((b, k), c["probs"].get((k, b), np.nan))
+                    q = 0.5 if q is None or not np.isfinite(q) else min(max(float(q), 0.02), 0.98)
+                    s += np.log(q / (1 - q)) + beta
+            gain.append(s)
+        j = int(np.argmax(gain)) if gain else 0
+        lane = cand[j] if cand else 1
+        srt = sorted(gain, reverse=True)
+        sep = 1.0 / (1.0 + np.exp(-(srt[0] - srt[1]))) if len(srt) > 1 else 1.0
+        m = det_t.Detector.astype(int).eq(b)
+        if ls[b] != (lane,):
+            det_t.loc[m, "lane_conf"] = round(nconf.get(p, 1.0) * sep, 3)
+        det_t.loc[m, "lanes"] = str(lane)
+        det_t.loc[m, "n_lanes_spanned"] = 1
+    for p in only:
+        m = ph_t.phase.astype(int).eq(p)
+        ph_t.loc[m, "n_lanes"] = 1
+        ph_t.loc[m, "lane_volumes_per_hour"] = ph_t.loc[m, "lane_volumes_per_hour"].astype(str).str.split(",").str[0]
+    return ph_t, det_t

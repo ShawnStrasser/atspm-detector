@@ -521,9 +521,13 @@ def check_health_v4() -> str:
     from . import health_v4 as hv
     refs = hv._load_refs()
     assert str(refs.d.get("version", "")).startswith("health v4d"), "health references missing or wrong"
-    for v in ("v4", "v4c"):
-        assert set(refs.cell[v]) == {"chat_frac", "stuck_x", "n3_exc", "n_ep"}, f"limit tables {v} incomplete"
-    assert refs.tod_own["groups"] and refs.band_own["groups"], "time-of-day references missing"
+    assert set(refs.cell) == {"stuck_x", "n_ep"} and refs.g3 and refs.f118, "limit tables incomplete"
+    assert refs.tod_own["groups"], "time-of-day references missing"
+    lim = hv._load_limits()
+    assert str(lim.get("version", "")).startswith("health 1.1.0"), "health limits missing or wrong"
+    tabs_ok = all(v[0] <= v[1] for t in ("stuck_s", "silent_exp") for v in lim["h24"][t].values())
+    tabs_ok = tabs_ok and set(lim["h24"]) == {"stuck_s", "silent_exp", "busy_z"}
+    assert tabs_ok and len(lim["too_fast"]["per_1000"]) == 14, "health limits incomplete"
     ev = read_parquet(SAMPLE)
     out = predict(ev, min_actuations=1)
     assert out.health_status.isin(HEALTH).all()

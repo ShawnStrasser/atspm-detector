@@ -47,7 +47,9 @@ ids = list_signals(events, start=None, end=None)        # DeviceIds present, sor
 
 - Key rows by `(DeviceId, Detector)` plus your own run id and window. Store `__version__` with each run; answers can change between versions.
 - `health_*` columns are a separate output. They never change a phase or function answer.
-- `health_bad_periods` is JSON text: a list of `{start, end, what, recovered}` periods, or empty text when there are none.
+- `health_bad_periods` is JSON text: a list of `{start, end, what, recovered}` periods, or empty text when there are none. `what` is one of `stuck on`, `count zone held ON`, `silent`, `silent at night`, `counts dropped`, `busy at night`, `too-fast actuations`, `too many for the traffic`, `spiky counts` (1.1.0; `erratic counts`, `chattering`, `erratic time ON` and `unusual daily pattern` were removed). Periods are whole 5-minute, 10-minute (spiky counts), 15-minute or 1-hour bins from the sample start (counts dropped: from the start of the first clock hour after the drop to the sample end; busy at night: 01:00-05:00 of the flagged day), clipped to the sample end; consecutive bins are merged.
+- `health_signal_note` is one line per signal, or empty: many detectors had an unusual night (a signal-wide event), and/or several detectors were held ON together with the same start and end (one common failure).
+- The health limits are `[suspect, bad]` pairs in `weights/health/health_limits.json`; a single finding is bad from the second number on.
 
 ## atspm detector configuration
 

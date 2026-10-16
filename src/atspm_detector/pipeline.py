@@ -33,10 +33,10 @@ Pipeline (every model runs on the CPU with onnxruntime; no lightgbm / torch / sc
             probabilities, stack size, span / track / co-location, lanes, phase- and lane-mates) -> per-lane decode
             (lane confidence >= .9); samples under 30 min: no lanes, Count / Yellow_Red twin decode instead
   side      lanes (from 30 min), setback distance, night speed: computed from the log and the answers above
-  health    rule checks on the log (health_core.py, health_v4.py) against per-type
-            limits (function x lane span x sample length, fitted once on healthy training detectors), computed AFTER
-            classification and reported next to it; it never changes a phase or function answer (only the review
-            flag / reason).  Whole-day checks (busy at night, unusual daily pattern) run on samples with a full day
+  health    six rule checks on the log (health_core.py, health_v4.py, health_counts.py) against per-type limits
+            (function x lane span x sample length; weights/health), computed AFTER classification and reported next
+            to it; it never changes a phase or function answer (only the review flag / reason).  Busy at night needs
+            a full day; count drops, night misses and spiky counts need 3 h
 One path at every sample length: the network always runs.  A `profile` argument, CLI --profile or env
 DC_FAST_PROFILE is accepted for compatibility and ignored, with a FutureWarning.
 No channel->phase table is used; phase and channel numbers are grouping keys only.
@@ -50,12 +50,13 @@ phase_margin, p_advance, p_presence, p_count, p_yellow_red, p_other, p_mid, p_bi
 lane_conf, phase_n_lanes, phase_n_lanes_conf, distance_ft, setback_confidence, night_speed_mph, night_speed_vehicles,
 health_status, health_score, health_reason, health_bad_periods, health_watch, health_categories, health_config,
 health_signal_note, review_reason.
-Health columns: health_status ok / watch / suspect / bad / not_enough_data (bad = two independent findings, or one
-lasting 4 h or more of the day); health_score 0-1 (1 = healthy);
+Health columns: health_status ok / watch / suspect / bad / not_enough_data (bad = one finding past its bad limit, two
+independent findings, or one lasting 4 h or more of the day); health_score 0-1 (1 = healthy);
 health_reason one plain line ("det 15: P5 Presence (covers 2 lanes) - Stuck on: held ON 3 times, 2 h in total");
-health_bad_periods JSON list of {start, end, what}; health_categories "Stuck on (bad); Erratic counts (suspect)";
+health_bad_periods JSON list of {start, end, what}; health_categories "Stuck on (bad); Spiky counts (suspect)";
 health_config setup notes (extension time on a count zone, set to pulse but holds ON); health_watch information only;
-health_signal_note one line per signal when many of its detectors had an unusual day (a signal-wide event).
+health_signal_note one line per signal when many of its detectors had an unusual day (a signal-wide event) or
+several detectors were held ON together (one common failure).
 `return_phases=True` also returns the per-phase table (n_detectors, n_lanes, n_lanes_conf, lane volumes, night speed).
 `to_atspm_config(out)` (or --out-atspm) turns the output into the detector configuration of the atspm package.
 """
@@ -824,7 +825,8 @@ def post_outputs(con, w0: float, w1: float, b0: float, b1: float, univ: pd.DataF
             pconf = {int(k): float(v) for k, v in zip(g.Detector, g.phase_prob) if pd.notna(v)}
             func = {int(r.Detector): {c: float(getattr(r, pc)) for c, pc in zip(FUNC_CLASSES, PROB_COLS)}
                     for r in g.itertuples() if pd.notna(r.p_advance)}
-            span = {int(k): float(v) for k, v in zip(g.Detector, g.n_lanes_spanned) if pd.notna(v) and v > 0}
+            span = {int(k): (1.0 if f == "Bike" else float(v))       # a bike zone covers one lane (note 148)
+                    for k, v, f in zip(g.Detector, g.n_lanes_spanned, g.function_pred) if pd.notna(v) and v > 0}
             flab = {int(k): v for k, v in zip(g.Detector, g.function_pred) if isinstance(v, str)}
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")

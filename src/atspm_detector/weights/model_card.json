@@ -1,7 +1,7 @@
 {
  "name": "atspm_detector",
- "version": "1.0.0",
- "date": "2026-10-08",
+ "version": "1.1.0",
+ "date": "2026-10-14",
  "status": "first public release. Trained on the high-resolution logs of several hundred signals (phase from the official controller timing, function from configuration exports checked against cabinet prints); evaluated by six-fold signal-grouped cross-validation and once on 115 held-out signals",
  "what_it_does": "per detector from the hi-res controller log alone: phase, function (Advance / Presence / Count / Yellow_Red / Mid / Bike / Other), lanes, setback distance, night speed; detector health is a separate output computed after classification and never read by it",
  "phase_anonymous": "no phase number, channel number, channel order or channel difference is a model input; checked by the package check (phase renumbering, channel reversal / shift, random channel bijection + phase renumbering)",
@@ -10,7 +10,7 @@
   "function": "function229_s0 trees (229 features) + network function head (same pass) -> stacker mean3 (46 columns) -> per-lane ATSPM decode (lane confidence >= .9); < 30 min: twin decode",
   "lanes": "lane_pair_D_s0..s2 pair model + constrained decode (>= 30 min)",
   "setback": "P50 per length group (m30 / h6 / h24 / full) + P10 / P90 band (3 + 3 seeds) + same-lane pair HGB",
-  "health": "rule checks on the log (health_core.py, health_v4.py, health_v4_stats.py) against per-type limits fitted once on healthy training detectors (weights/health/health_v4_refs.json); computed after classification, never a model input",
+  "health": "six rule checks on the log (health_core.py, health_v4.py, health_v4_stats.py, health_counts.py) against per-type limits (weights/health/health_limits.json, health_v4_refs.json); computed after classification, never a model input",
   "night_speed": "deterministic, from the answers above"
  },
  "accuracy_oof_six_fold": {
@@ -70,8 +70,9 @@
   "setback/setback_q90_s2.onnx": "e1cafad855c7633a183917701f0906753ed5d1214e9275a4e7b479f15a09f936",
   "stacker/stacker.json": "ef6dfc7040dcc21b878e531436f3059b5d78c118df75c2b2179dd1bbaf56cd69",
   "stacker/stacker_mean3_s0.onnx": "0ec72a49401757a9bdc5b8963f5d0d7977f321808cbf7df9166a029eda280e23",
-  "health/health_v4_refs.json": "1b81330448cac748759447e023795ef4a43c6aadac2c7f56c5449a02e57eed01"
+  "health/health_v4_refs.json": "a6648408b772c1bc0c8b26158d5180b6e17004d8a69854f801ca6b3714f8a8e7",
+  "health/health_limits.json": "1eeada64ded5f577e4a750e5b19e1dfd0b61affe4209190b8d88bd640f1c05c7"
  },
- "health_reference": "health/health_v4_refs.json: per-type limit tables; night model and day band fitted on all training data",
- "health_severity": "bad = health score below .25 (e.g. one finding scored .75 or more), two independent findings, or a problem lasting 4 h or more of the day (busy at night 01-05 h, unusual daily pattern >= 4 h, silent >= 4 h, unexplained time ON in >= 16 15-min periods; 4-h rule adopted 2026-10-08); otherwise suspect"
+ "health_reference": "health/health_limits.json: the 1.1.0 limits as [suspect, bad] pairs per check x function x lane span (24-h samples and longer: the user-reviewed limits of notes 147-147m; a single finding is bad from the second number); shorter samples: the 1.0.1 limits; too-fast per 1,000 ONs at every length (2+ lanes: the 1-lane limit); health/health_v4_refs.json: the 1.0.1 per-type tables and night model (all training data)",
+ "health_severity": "checks: stuck on (incl. a Count zone held ON; held ON together with other detectors, same start and end = one common failure), counts fall (goes silent, or the count drops by hourly GEH with its occupancy: one finding), misses vehicles at night (GEH of the average night hour), busy at night (and busier than its phase mates), too-fast actuations / too many for the traffic, spiky counts (bursts in 10-min counts). One finding is suspect from its suspect limit and bad from its bad limit; bad also = findings of two families or two independent kinds of evidence, or a problem lasting 4 h or more of the day (busy at night 01-05 h, silent >= 4 h). A Count zone with extension held ON is suspect; too-fast actuations alone, spread evenly with traffic on a Presence / Other / Mid zone, are suspect. Bike zones: no counts-fall or night checks; count drops, night misses and spiky counts need 3 h of data"
 }

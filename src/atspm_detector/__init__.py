@@ -10,7 +10,7 @@ Check an install with `python -m atspm_detector.check` (or the `atspm-detector-c
 """
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from .atspm_export import atspm_coverage, to_atspm_config  # noqa: E402
 from .pipeline import (DEFAULT_MODEL_DIR, EXTRA_COLS, OUT_COLS, PHASE_COLS, PROB_COLS,  # noqa: E402

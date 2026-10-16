@@ -88,8 +88,9 @@ def _ptr(keys: np.ndarray, order) -> np.ndarray:
 
 
 def _ms(x, t0_ms: int, span: int) -> np.ndarray:
+    """milliseconds from the window start as int64 (int32 overflows past 24.8 days of span, 1.0.1)."""
     v = np.rint(np.asarray(x, dtype=np.float64) * 1000.0 - t0_ms)
-    return np.clip(v, -1000, span + 1000).astype(np.int32)
+    return np.clip(v, -1000, span + 1000).astype(np.int64)
 
 
 # an interval is fetched only if it reaches within this many seconds of a scored piece;
@@ -109,7 +110,7 @@ def _near(sql: str, windows, a: str, b: str, order: str) -> str:
 
 
 def build_streams(con, t0_ms: int, t1_ms: int, windows=None) -> dict:
-    """-> {DeviceId: interval bundle} (all int32 milliseconds from `t0_ms`):
+    """-> {DeviceId: interval bundle} (all int64 milliseconds from `t0_ms`; pointers int32):
 
         cand    [K]     candidate phases (every phase with a Begin Green)
         det_ch  [D]     detector channels with a completed actuation in the sample
@@ -146,10 +147,10 @@ def build_streams(con, t0_ms: int, t1_ms: int, windows=None) -> dict:
         d, ch = gd.get(dev), gch.get(dev)
         if ch is None or not len(ch):
             z.update(det_ch=np.zeros(0, np.int16), det_ptr=np.zeros(1, np.int32),
-                     det_on=np.zeros(0, np.int32), det_off=np.zeros(0, np.int32))
+                     det_on=np.zeros(0, np.int64), det_off=np.zeros(0, np.int64))
         elif d is None or not len(d):          # channels present, none reaching a piece
             z.update(det_ch=ch.astype(np.int16), det_ptr=np.zeros(len(ch) + 1, np.int32),
-                     det_on=np.zeros(0, np.int32), det_off=np.zeros(0, np.int32))
+                     det_on=np.zeros(0, np.int64), det_off=np.zeros(0, np.int64))
         else:
             z["det_ch"] = ch.astype(np.int16)
             z["det_ptr"] = _ptr(d.ch.astype(int).to_numpy(), list(ch))
@@ -186,8 +187,8 @@ def build_streams(con, t0_ms: int, t1_ms: int, windows=None) -> dict:
             m = b > a
             z["co_on"], z["co_off"] = a[m], b[m]
         else:
-            z["co_on"] = np.zeros(0, np.int32)
-            z["co_off"] = np.zeros(0, np.int32)
+            z["co_on"] = np.zeros(0, np.int64)
+            z["co_off"] = np.zeros(0, np.int64)
         out[dev] = z
     return out
 

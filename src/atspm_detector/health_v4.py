@@ -1,21 +1,35 @@
-"""Detector health v4 (research v4d, notes 104-121; adopted in note 124): per-detector status, score, plain reason,
-bad periods, health categories with severity, configuration notes and a signal-level note, from the hi-res log and
-the classifier's own answers (predicted phase, function, lane span).  numpy + pandas + DuckDB only.
+"""Detector health (1.1.0, notes 144, 147m, 150): per-detector status, score, plain reason, bad periods, health
+categories with severity, configuration notes and a signal-level note, from the hi-res log and the classifier's own
+answers (predicted phase, function, lane span).  numpy + pandas only.
 
     assess(prep, start, end, phase, fn_label, fn_prob, lanes, phase_conf) -> (per-detector DataFrame, signal note)
 
-Layers (each a port of the research scorer, same rules, same limits):
-  1  the rule checks of health_core (two passes: detectors pass 1 calls bad are nobody's yardstick in pass 2);
-  2  per-type statistics from the log (health_v4_stats) against limits fitted ONCE on the training population
-     (healthy detectors of the same type = function x lane span [x Count mode] x sample length; p99.5 / p99.8),
-     shipped in weights/health/health_v4_refs.json;
-  3  the resolver: queue / traffic / no-yardstick / borderline rules, the model-unsure rule (function probability
-     < .7: least strict limit over the plausible types), the time-of-day checks (24-h samples), and the severity rule
-     (two independent findings = bad; a problem lasting 4 h or more of the day = bad: busy at night, unusual daily
-     pattern for >= 4 h, silent >= 4 h, unexplained time ON in >= 16 15-min periods; a Count zone held ON in light
-     traffic = suspect even with extension).
-Checks that need a whole day (busy at night, unusual daily pattern) run only on samples that contain a full day;
-shorter samples get every other check with the limits of the nearest research sample length (30 min / 3 h / 24 h).
+Six checks set the status (the user-reviewed set, notes 140-147m):
+  1 Stuck on                 a continuous ON over the type's limit that is not a queue (Q1 / Q1b, note 135 lift) and
+                             not held ON with >= 3 others (suspect at most); held ON together with other detectors, all
+                             starting AND ending within 5 s = one common failure (bad, signal note); on a Count zone
+                             also 'held ON' through light traffic;
+  2 Counts fall              goes silent (expected actuations in the longest silent run) or the count drops (hourly GEH
+                             after the drop point, only when its own occupancy fell too) -- one finding, never two;
+  3 Misses vehicles at night GEH of the average night hour (21-05) against its yardstick; a night silence with < 100
+                             vehicles expected is suspect at most;
+  4 Busy at night            01-05 h level z against its type, and busier than its phase mates (whole day in the sample);
+  5 Too-fast actuations      ON-to-ON gaps < 0.8 s / lanes (Count, Presence, Yellow_Red) or 0.6 s / lanes (others) per
+                             1,000 ONs (2+ lanes: the 1-lane limit); Too many for the traffic = busiest 5 min veh/h/lane;
+  6 Spiky counts             bursts in 10-min counts (>= 3 x its own level of the surrounding 2 h AND GEH >= 5, beyond
+                             the phase mates' own rise); 2 a day suspect, 3 bad; < 200 vehicles a day never, < 500
+                             suspect at most unless a burst reaches GEH 10.
+Bike zones: no counts-fall or night checks.  Count drops, night misses and spiky counts need >= 3 h of data.
+Limits: weights/health/health_limits.json holds [suspect, bad] per check x type (function | lane span [| Count mode]):
+a single finding is suspect from the first number and BAD from the second.  24-h samples (and longer) use the
+user-reviewed limits; shorter samples the 1.0.1 limits (weights/health/health_v4_refs.json).  When the model is unsure
+of the function (top probability < .7) the least strict limit over the plausible functions applies.
+Score per finding: 0 below the suspect limit, .35 at it, .75 at the bad limit (linear), 1 at most.
+Severity: product of (1 - score) < .25 bad, < .70 suspect; findings of two families or two independent kinds of
+evidence = bad; busy at night or silent >= 4 h = bad (rule P); a Count zone with extension held ON = suspect (rule C);
+too-fast alone, spread evenly with traffic on a Presence / Other / Mid zone = suspect (rule F).
+Watch (information): borderline single finding, no healthy phase mate to compare with.
+Config notes: extension time on a count zone (C1), set to pulse but holds ON (C2).
 """
 from __future__ import annotations
 
@@ -27,71 +41,66 @@ import numpy as np
 import pandas as pd
 
 from . import health_core as hc
+from . import health_counts as hk
 from .common import timedelta as _td
 from . import health_v4_stats as hs
 
 FNS = hs.FNS
 C7 = ["Advance", "Presence", "Count", "Yellow_Red", "Mid", "Bike", "Other"]
-REF_FILE = Path(__file__).resolve().parent / "weights" / "health" / "health_v4_refs.json"
+WDIR = Path(__file__).resolve().parent / "weights" / "health"
+REF_FILE = WDIR / "health_v4_refs.json"
+LIM_FILE = WDIR / "health_limits.json"
 
-# ---- constants of the research scorer (h108 / h110 / h118 / score_v4c / score_v4d)
-BORDER, LOW_N = 0.42, 100
-STUCK_CLIP, STUCK_BAD = (300.0, 900.0), 3600.0
+# ---- constants of the research scorer (h108 / h110 / h118 / score_v4c / score_v4d / score_v4e)
+BORDER, STUCK_CLIP = 0.42, (300.0, 900.0)
 Q2_CORR, Q1_CORR = 0.80, 0.70
 D1_SHARE, D1_MIN_S = 0.70, 600.0
 F5_TOP, F5_PLAUS = 0.70, 0.15
 F4_COVER = 0.75
 TRAF_X = 0.5
+LIFT_CAP = 0.35                    # note 135: a hold the traffic does not explain is a suspect finding at most
+F_FNS = ("Presence", "Other", "Mid")   # note 135 rule F: only zones where extra fast ONs do not inflate counts
 NO_SHARED = ("Advance", "Count", "Yellow_Red")
 QUEUE_OK = {"Presence", "Other", "Mid"}
 C1_N, C1_SHARE = 20, 0.05
 C2_N60, C2_N5 = 1, 3
-G3_MIN_OFF, G3_MIN_SC = 2, 6
-SAT = 1800.0
-ZF_FLOOR, SPK_FLOOR, EXC_FLOOR = 3.0, 2.0, 0.02
-PROF_LEVEL = {"suspect": 0.50, "bad": 0.80}
 NIGHT_SIL = (21, 5)
-STAT = ("dropout", "rapid", "level", "choppy", "night_drop", "prof")
-FAMILY = {"chatter": "fast", "rapid": "fast", "dropout": "silent", "stuck": "stuck", "level": "level",
-          "night_drop": "level", "choppy": "shape", "volume": "shape", "prof": "shape", "occspk": "occ",
-          "shape24": "shape", "count_on": "stuck"}
-QUIET = {"dropout", "level", "night_drop"}
-SILENT_FAM = {"dropout", "level", "night_drop"}
-CATEGORIES = {
-    "stuck": "Stuck on", "dropout": "Goes silent", "level": "Count drops", "night_drop": "Misses vehicles at night",
-    "choppy": "Erratic counts", "rapid": "Too-fast actuations", "volume": "Too many for the traffic",
-    "chatter": "Chattering", "occspk": "Erratic time ON", "prof": "Busy at night", "shape24": "Unusual daily pattern",
-    "count_on": "Count zone held ON", "occ_hi": "ON longer than its kind",
-    "C1": "Extension time on a count zone", "C2": "Set to pulse but holds ON"}
-LANE_CATS = {"stuck", "choppy", "rapid", "volume", "chatter", "occspk", "prof", "shape24"}   # note 121
-ORDER = ["stuck", "count_on", "dropout", "night_drop", "level", "chatter", "rapid", "volume", "choppy", "occspk",
-         "prof", "shape24"]
+PERSIST_H = 4.0                    # note 121 rule P (user decision 2026-10-08)
+FAST_PER_H = 3                     # bad periods of too-fast actuations: hours with >= 3 too-fast gaps over the limit
+PAIRS_SHARE = 0.9                  # note 147e: >= 90 % of the short gaps are single pairs -> 'counts each vehicle twice'
+NO_COUNTS = ("Bike",)              # note 147e: bike zones have no counts-fall or night-miss check
+KEYS = ("stuck", "count_on", "dropout", "level", "night_drop", "prof", "rapid", "volume", "spiky")
+STAT = ("dropout", "rapid", "level", "night_drop", "prof", "spiky")
+FAMILY = {"rapid": "fast", "dropout": "silent", "stuck": "stuck", "level": "level", "night_drop": "level",
+          "volume": "shape", "prof": "shape", "count_on": "stuck", "spiky": "shape"}
+EVID = {"stuck": "stuck", "count_on": "stuck", "dropout": "quiet", "level": "quiet", "night_drop": "quiet",
+        "rapid": "fast", "volume": "fast", "prof": "prof", "spiky": "spiky"}
+CATEGORY = {"stuck": "Stuck on", "count_on": "Stuck on", "dropout": "Counts fall", "level": "Counts fall",
+            "night_drop": "Misses vehicles at night", "prof": "Busy at night", "rapid": "Too-fast actuations",
+            "volume": "Too many for the traffic", "spiky": "Spiky counts"}
+CONFIG = {"C1": "Extension time on a count zone", "C2": "Set to pulse but holds ON"}
+LANE_CATS = {"stuck", "rapid", "volume", "prof", "spiky"}
+GEH_COLS = ("geh_night", "geh_night_n", "geh_night_exp", "geh_drop", "drop_t", "own_before", "own_after", "exp_after",
+            "occ_own", "occ_mates", "spk_bursts", "spk_gmax", "spk_daily", "spk_lvl")
 OUT_COLS = ["detector", "health_status", "health_score", "health_reason", "health_bad_periods", "health_categories",
             "health_config", "health_watch"]
 
 
-# ============================================================================ references
+# ============================================================================ references and limits
 class Refs:
-    """the frozen population tables (weights/health/health_v4_refs.json); `tod` / `band` hold the 24-h references
-    used for the detector's own type (`*_own`) and for the plausible alternatives when the model is unsure (`*_alt`)."""
+    """the frozen 1.0.1 population tables (weights/health/health_v4_refs.json); `tod` holds the 24-h night models used
+    for the detector's own type (`tod_own`) and for the plausible alternatives when the model is unsure (`tod_alt`)."""
 
-    def __init__(self, d: dict, tod_own=None, tod_alt=None, band_own=None, band_alt=None):
+    def __init__(self, d: dict, tod_own=None, tod_alt=None, **_):
         self.d = d
-        self.cell = {v: {c: self._levels(t) for c, t in d["cell"][v].items()} for v in d["cell"]}
-        self.g3 = {v: self._levels(t) for v, t in d["g3"].items()}
-        self.f117 = {c: self._levels(t) for c, t in d["fast117"].items()}
-        self.f118 = {c: self._levels(t) for c, t in d["fast118c"].items()}
-        self._occ = {(r[0], r[1], int(r[2]), int(r[3])): r[4] for r in d["occ_lim"]}
+        self.cell = {c: self._levels(t) for c, t in d["cell"]["v4c"].items() if c in ("stuck_x", "n_ep")}
+        self.g3 = self._levels(d["g3"]["v4c"])
+        self.f118 = {c: self._levels(d["fast118c"][c]) for c in ("q5_gy", "q5_all")}
         self._occ_p = {(int(r[0]), int(r[1])): r[2] for r in d["occ_lim_pulse"]}
         self._tp = {int(r[0]): r[1] for r in d["count_t_pass"]}
-        self.share_med = {(r[0], r[1]): r[2] for r in d["share_med"]}
         self.qtype = {r[0]: r[1] for r in d["q_type"]}
-        self.tod_w = {(r[0], r[1], r[2], int(r[3])): r[4] for r in d["tod_w"]}
-        self.tod_wb = {(r[0], r[1], int(r[2])): r[3] for r in d["tod_wb"]}
         self.tod_own = tod_own or d["tod"]
         self.tod_alt = tod_alt or d["tod"]
-        self.band_own = band_own or d["band"]
-        self.band_alt = band_alt or d["band"]
 
     @staticmethod
     def _levels(t):
@@ -114,16 +123,6 @@ class Refs:
             lim[fill] = m[fill]
         return lim
 
-    def occ_lim(self, fn, cmode, bs, tl):
-        return np.array([self._occ.get((f, c, int(b), int(t)), np.nan) if (isinstance(f, str) and t == t) else np.nan
-                         for f, c, b, t in zip(fn, cmode, bs, tl)], float)
-
-    def occ_lim_pulse(self, bs, tl):
-        return np.array([self._occ_p.get((int(b), int(t)), np.nan) if t == t else np.nan for b, t in zip(bs, tl)], float)
-
-    def t_pass(self, bs):
-        return np.array([self._tp.get(int(b), np.nan) for b in bs], float)
-
 
 @lru_cache(maxsize=2)
 def _load_refs(path: str = str(REF_FILE)) -> Refs:
@@ -131,11 +130,18 @@ def _load_refs(path: str = str(REF_FILE)) -> Refs:
         return Refs(json.load(f))
 
 
-def score(x, lo, hi):
-    """0 below the limit, .35 at it, 1 at `hi` (research h108 score)."""
-    x, lo, hi = (np.asarray(v, float) for v in (x, lo, hi))
+@lru_cache(maxsize=2)
+def _load_limits(path: str = str(LIM_FILE)) -> dict:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def score(x, lo, bad):
+    """the finding's score: 0 below the suspect limit `lo`, .35 at it, .75 at the bad limit `bad` (linear), 1 at most.
+    One finding is bad from the bad limit on (severity: 1 - score < .25)."""
+    x, lo, bad = (np.asarray(v, float) for v in (x, lo, bad))
     with np.errstate(invalid="ignore"):
-        s = 0.35 + 0.65 * np.clip((x - lo) / np.maximum(hi - lo, 1e-9), 0, 1)
+        s = np.minimum(0.35 + 0.40 * np.maximum((x - lo) / np.maximum(bad - lo, 1e-9), 0), 1.0)
         return np.where(~np.isfinite(x) | ~np.isfinite(lo), np.nan, np.where(x < lo, 0.0, s))
 
 
@@ -156,448 +162,322 @@ def _alts(P):
             for t, row in zip(top, P)]
 
 
-# ============================================================================ the resolver (research h110 / h118 / v4 / v4c)
-def _alt_has(X) -> dict:
-    """{class: bool per row} -- the class is among the row's plausible alternatives and is not its own label."""
-    al = list(X.alt_set)
-    fn = X.fn.to_numpy(object)
-    return {fa: np.array([fa in a for a in al], bool) & (fn != fa) for fa in C7}
+def _cm(fa, dp):
+    """the Count mode a plausible function takes for the refs tables: '' unless Count; from the median ON."""
+    return "" if fa != "Count" else ("unknown" if dp != dp else ("pulse" if dp <= 0.25 else "normal"))
 
 
-def _limits(X, refs, v, ah=None):
-    """the per-type limits of the chatter / stuck / erratic-time-ON checks, loosened to the least strict plausible type
-    when the model is unsure.  Returns {column: array} (no column is written into X)."""
-    base = X[["fn", "span", "cmode", "wg"]]
-    lim = {col: refs.lookup(refs.cell[v][col], base) for col in ("chat_frac", "stuck_x", "n3_exc")}
-    low = (X.f_top < F5_TOP).to_numpy()
-    ah = ah if ah is not None else _alt_has(X)
-    for fa in C7:
-        m = low & ah[fa]
-        if not m.any():
-            continue
-        D = base[m].copy()
-        D["fn"] = fa
-        D["cmode"] = np.where(fa != "Count", "", np.where(X.loc[m, "dur_p50"].isna(), "unknown",
-                                                          np.where(X.loc[m, "dur_p50"] <= 0.25, "pulse", "normal")))
-        for col in ("chat_frac", "stuck_x", "n3_exc"):
-            la = refs.lookup(refs.cell[v][col], D)
-            cur = lim[col][m]
-            with np.errstate(invalid="ignore"):
-                looser = la > cur
-            lim[col][np.flatnonzero(m)[looser]] = la[looser]
-    return {f"lim_{col}": a for col, a in lim.items()}
+def _lk(levels, row):
+    """Refs.lookup for one row (a dict of key column -> text): the first finite value over the key levels."""
+    for keys, tab in levels:
+        v = tab.get(tuple(row[k] for k in keys))
+        if v is not None:
+            v = float(v)
+            if v == v:
+                return v
+    return np.nan
 
 
-def _kahan(vals):
-    """pandas groupby sum of one group (compensated, in order)."""
-    sm = cp = 0.0
-    for v in vals:
-        if v != v:
-            continue
-        y = v - cp
-        t = sm + y
-        cp = (t - sm) - y
-        if cp != cp:
-            cp = 0.0
-        sm = t
-    return sm
-
-
-def _stuck_stats(X, E, lim):
-    """per scored detector: its continuous ONs over the limit `lim` and how many of them are queues (Q1 / Q1b),
-    shared (held ON with >= 3 others) or counted, with the counted time (research h110 F3 / F4; note 128: numpy, the
-    groupby of the research reproduced -- counts, a compensated time sum, NaN rows for detectors without one)."""
-    cols = ["n_over", "n_ep", "tot_s", "n_q1", "n_q1b", "n_shared", "n_shared_unq"]
+def limits(X, refs, LJ):
+    """per-detector limits of every check for the sample's length class -> (suspect, bad) dicts of arrays.  24-h samples
+    (and longer): the [suspect, bad] tables of health_limits.json; shorter: the 1.0.1 tables (refs) by function x lane
+    span x Count mode x length class with the bad starts of LJ['short'].  Loosened to the least strict plausible
+    function when the model is unsure.  Plain dict lookups (a signal has a few dozen detectors: faster than arrays)."""
     n = len(X)
-    if not len(E):
-        return pd.DataFrame(np.nan, index=np.arange(n), columns=cols)
-    pos = {int(d): i for i, d in enumerate(X.detector.to_numpy())}
-    ri = np.array([pos.get(int(d), -1) for d in E.detector.to_numpy()], int)
-    L = np.where(ri >= 0, np.asarray(lim, float)[np.maximum(ri, 0)], np.nan)
-    num = lambda c: E[c].to_numpy(float)  # noqa: E731
-    dur = num("dur_s")
-    with np.errstate(invalid="ignore"):
-        keep = (ri >= 0) & (dur >= L)
-        q_ok = ((np.nan_to_num(num("n_hpeer_e"), nan=0.0) > 0) & (num("phx_h_e") >= 1.5) & (num("corr_h_e") >= Q1_CORR)
-                & (num("refx_e") >= 0.5) & (np.nan_to_num(num("light_e"), nan=1.0) == 0) & (num("trafx_e") >= TRAF_X))
-        q1 = q_ok & (dur < 3600)
-        q1b = q_ok & (dur >= 3600) & (num("cover_e") >= F4_COVER)
-        shared = num("co5") >= 3
-    count = ~q1 & ~q1b & ~shared
-    cdur = np.where(count, dur, 0.0)
-    sh_unq = shared & ~q1 & ~q1b
-    if not keep.any():
-        return pd.DataFrame(np.nan, index=np.arange(n), columns=cols)
-    r = ri[keep]
-    u = np.unique(r)
-    idx = [np.flatnonzero(r == k) for k in u]
-    cnt = lambda a: np.array([int(a[keep][ii].sum()) for ii in idx], np.int64)  # noqa: E731
-    S = pd.DataFrame({"n_over": np.array([len(ii) for ii in idx], np.int64), "n_ep": cnt(count),
-                      "tot_s": np.array([_kahan(cdur[keep][ii].tolist()) for ii in idx], float), "n_q1": cnt(q1),
-                      "n_q1b": cnt(q1b), "n_shared": cnt(shared), "n_shared_unq": cnt(sh_unq)}, index=u)
-    return S.reindex(np.arange(n))
+    cur, sh, h, tf = LJ["current"], LJ["short"], LJ["h24"], LJ["too_fast"]
+    h24 = bool(n) and X.wg.iat[0] == "h24"
+    rows = [dict(zip(("fn", "span", "cmode", "wg", "band"), r)) for r in
+            zip(*(X[c].astype(str).tolist() for c in ("fn", "span", "cmode", "wg", "band")))]
+    dp = X.dur_p50.to_numpy(float)
+    cm_alt = ["pulse" if d <= 0.25 else "normal" for d in dp]
+    alts = [(i, fa) for i, a in enumerate(X.alt_set) for fa in C7 if fa in a and fa != rows[i]["fn"]]
+
+    def key(f, i, cm=None):
+        return f"{f}|{rows[i]['span']}" + (f"|{cm}" if (cm and f == "Count") else "")
+
+    def pick(v, j):
+        v = v if j is None or v is None else v[j]
+        return np.nan if v is None else float(v)
+
+    def tab(t, j=None, split=False):
+        v = np.array([pick(t.get(key(r["fn"], i, ("normal" if r["cmode"] == "normal" else "pulse") if split else None)), j)
+                      for i, r in enumerate(rows)], float)
+        for i, fa in alts:
+            a = pick(t.get(key(fa, i, cm_alt[i] if split else None)), j)
+            if a == a and not a <= v[i]:
+                v[i] = a
+        return v
+
+    def ref(levels, cm_fn=False):
+        v = np.array([_lk(levels, r) for r in rows], float)
+        for i, fa in alts:
+            a = _lk(levels, dict(rows[i], fn=fa, **({"cmode": _cm(fa, dp[i])} if cm_fn else {})))
+            if a == a and (a > v[i] if cm_fn else not a <= v[i]):     # 1.0.1 stuck_x: a NaN own value stays
+                v[i] = a
+        return v
+    L, B = {}, {}
+    lne = ref(refs.cell["n_ep"])
+    L["n_ep"], B["n_ep"] = lne + 1, (lne + 1) * sh["n_holds_bad_x"]
+    L["rapid"] = tab(tf["per_1000"])
+    B["rapid"] = L["rapid"] * tf["bad_x"]
+    L["level"], B["level"] = np.full(n, LJ["count_drops_geh"][0]), np.full(n, LJ["count_drops_geh"][1])
+    L["night_drop"], B["night_drop"] = np.full(n, LJ["night_geh"][0]), np.full(n, LJ["night_geh"][1])
+    L["count_on"], B["count_on"] = np.full(n, LJ["count_held_on_min"][0]), np.full(n, LJ["count_held_on_min"][1])
+    if h24:
+        L["stuck"] = np.fmax(tab(h["stuck_s"], 0, True), LJ["hold_floor_s"])
+        B["stuck"] = np.fmax(tab(h["stuck_s"], 1, True), L["stuck"])
+        L["dropout"], B["dropout"] = tab(h["silent_exp"], 0), tab(h["silent_exp"], 1)
+        L["prof"] = np.array([pick(h["busy_z"].get(key(r["fn"], i)), None) for i, r in enumerate(rows)], float)
+        L["volume"] = np.full(n, LJ["too_many_h24_veh_h_lane"][0])
+        B["volume"] = np.full(n, LJ["too_many_h24_veh_h_lane"][1])
+    else:
+        L["stuck"] = np.clip(ref(refs.cell["stuck_x"], cm_fn=True), STUCK_CLIP[0], STUCK_CLIP[1])
+        a, b, c = sh["stuck_bad"]
+        B["stuck"] = np.fmax(a + b * L["stuck"], c * L["stuck"])
+        L["dropout"] = np.full(n, cur["silent_exp"])
+        B["dropout"] = L["dropout"] * sh["silent_bad_x"]
+        L["prof"] = np.full(n, cur["busy_z"])
+        lg, la = ref(refs.f118["q5_gy"]), ref(refs.f118["q5_all"])
+        L["volume"] = np.fmax(np.where(X.fn.eq("Advance").to_numpy(), la, lg), cur["too_many_veh_h_lane"])
+        B["volume"] = L["volume"] * sh["too_many_bad_x"]
+    return L, B
 
 
-def _night_frac_v(t0, b0, b1):
-    """share of the 5-min bins [b0, b1) (from t0) whose clock hour is night (21:00-05:00), one value per row
-    (clock hours in integer nanoseconds of the day)."""
-    out = np.zeros(len(b0))
-    if not len(b0):
-        return out
-    sod = int(pd.Timestamp(t0).value) % 86_400_000_000_000
-    for i, (a, b) in enumerate(zip(b0, b1)):
-        if not (np.isfinite(a) and np.isfinite(b)) or b <= a:
-            continue
-        hrs = ((sod + np.arange(int(a), int(b), dtype=np.int64) * 300_000_000_000) // 3_600_000_000_000) % 24
-        out[i] = float(np.mean((hrs >= NIGHT_SIL[0]) | (hrs < NIGHT_SIL[1])))
-    return out
-
-
+# ============================================================================ the checks
 def _f0(a):
     """Series.fillna(0) of a float column, as an array."""
     return np.nan_to_num(np.asarray(a, float), nan=0.0)
 
 
-def _resolve(X0, E0, refs, v):
-    """one research resolver pass, v = 'v4' (score_v4.run_v4) or 'v4c' (score_v4c.run_c).  Returns X with the
-    scores s8_*, status st8, rules8, watch8, cleared8, left8, score8, dq8, cfg.  (note 128: the new columns are built
-    as arrays and joined once; the arithmetic is the research's, step for step.)"""
-    X = X0.reset_index(drop=True)
+def _lifted(E, q_ok, dur):
+    """note 135: a hold >= 1 h the queue test excuses (Q1b) whose traffic did not hold the detector elsewhere in the
+    sample (>= 60 min of bins at least as busy, median % ON there < 50 %) is not excused -- unless a detector of
+    the traffic yardstick was itself held ON during the hold (ref_held_e: the hold's traffic is under-measured)."""
+    if "busy_min_e" not in E:
+        return np.zeros(len(E), bool)
+    bm, bo = E.busy_min_e.to_numpy(float), E.busy_occ_e.to_numpy(float)
+    rh = (E.ref_held_e.fillna(False).astype(bool).to_numpy() if "ref_held_e" in E else np.zeros(len(E), bool))
+    with np.errstate(invalid="ignore"):
+        return (q_ok & (dur >= 3600) & (E.cover_e.to_numpy(float) >= F4_COVER) & (bm >= hs.BUSY_MIN)
+                & (bo < hs.BUSY_OCC) & ~rh)
+
+
+def episode_flags(E):
+    """per continuous ON >= 300 s: queue < 1 h (q1), queue >= 1 h covered by queued mates (q1b), queue excuse lifted
+    by the traffic test (lifted), held ON with >= 3 others (shared; never on Advance / Count / Yellow_Red), held ON
+    together with other detectors that all start and end within 5 s of it (common: one shared failure, never excused),
+    counted."""
+    num = lambda c: E[c].to_numpy(float)  # noqa: E731
+    dur = num("dur_s")
+    common = E.common.to_numpy(bool) if "common" in E else np.zeros(len(E), bool)
+    with np.errstate(invalid="ignore"):
+        q_ok = ((np.nan_to_num(num("n_hpeer_e"), nan=0.0) > 0) & (num("phx_h_e") >= 1.5) & (num("corr_h_e") >= Q1_CORR)
+                & (num("refx_e") >= 0.5) & (np.nan_to_num(num("light_e"), nan=1.0) == 0) & (num("trafx_e") >= TRAF_X))
+        q1 = q_ok & (dur < 3600) & ~common
+        lifted = _lifted(E, q_ok, dur)
+        q1b = q_ok & (dur >= 3600) & (num("cover_e") >= F4_COVER) & ~lifted & ~common
+        co = np.where(E.fn.isin(NO_SHARED).to_numpy(), 0, num("co5"))
+        shared = (co >= 3) & ~common
+    return dict(dur=dur, q1=q1, q1b=q1b, lifted=q_ok & lifted, shared=shared, counted=~q1 & ~q1b & ~shared,
+                common=common)
+
+
+def _stuck(X, E, F, L, Lb, ln1, lnb):
+    """stuck on (h110 F3 / F4 + note 135, 147e): counted holds >= the limit L; score of their total time (bad from Lb),
+    number of them against ln1 = lim_n_ep + 1 (bad from lnb); a single recovered hold, shared-only holds and
+    lifted-only holds are suspect at most; queue-only holds are cleared; a common hold (held ON together with other
+    detectors, same start and end) at the limit is bad.  Returns (score, per-detector numbers)."""
     n = len(X)
-    E = E0.copy()
-    if len(E):
-        E.loc[E.fn.isin(NO_SHARED), "co5"] = 0
-    ah = _alt_has(X)
-    C = _limits(X, refs, v, ah)
-    base = X[["fn", "span", "cmode", "wg"]]
-    # stuck: episodes over the per-type limit; their number has its own limit
-    sl = np.clip(C["lim_stuck_x"], *STUCK_CLIP)
-    S0 = _stuck_stats(X, E, sl)
-    C["n_ep"] = S0.n_ep.fillna(0).to_numpy()
-    lim_n_ep = refs.lookup(refs.cell[v]["n_ep"], base)
-    low = X.alt_fns.ne("").to_numpy()
-    for fa in C7:
-        m = low & ah[fa]
-        if m.any():
-            la = refs.lookup(refs.cell[v]["n_ep"], base[m].assign(fn=fa))
-            lim_n_ep[m] = np.fmax(lim_n_ep[m], la)
-    C["lim_n_ep"] = lim_n_ep
-    # ---- scores (h108 scores -> h110 scores110 -> h118 scores118 -> v4 / v4c)
-    S = {}
-    for k in ("dropout", "level", "night_drop"):
-        S[k] = pd.to_numeric(X[f"s_{k}"], errors="coerce").to_numpy()
-    S["choppy"] = np.full(n, np.nan)
-    n50 = X.n_on.to_numpy(float) >= 50
-    lcf = C["lim_chat_frac"]
-    S["chatter"] = np.where(n50, score(X.chat_frac, lcf, 2 * lcf), np.nan)
-    S["rapid"] = np.full(n, np.nan)
-    S["volume"] = np.full(n, np.nan)
-    C["stuck_lim8"] = sl
-    S["stuck"] = score(X.stuck_x.fillna(0), sl, np.fmax(STUCK_BAD, 2 * sl))
-    n3ok = (X.n3_n >= 2).to_numpy()
-    n3_exc = X.n3_exc.to_numpy(float)
-    l3e = C["lim_n3_exc"]
-    S["occspk"] = np.where(n3ok, score(n3_exc, l3e, 4 * l3e), np.where(np.isfinite(n3_exc), 0.0, np.nan))
-    rep_s = X.rep_time_s.to_numpy(float)
-    with np.errstate(invalid="ignore"):
-        n3_dq = (S["occspk"] >= .35) & (rep_s / 60 >= 0.5 * n3_exc)
-    C["n3_dq"] = n3_dq
-    S["occspk"] = np.where(n3_dq, 0.0, S["occspk"])
-    S["prof"] = np.full(n, np.nan)
+    pos = {int(d): i for i, d in enumerate(X.detector.to_numpy())}
+    ri = np.array([pos.get(int(d), -1) for d in E.detector.to_numpy()], int) if len(E) else np.zeros(0, int)
+    ok = ri >= 0
+    Le = np.where(ok, np.asarray(L, float)[np.maximum(ri, 0)], np.inf)
+    keep = ok & (F["dur"] >= Le) if len(E) else np.zeros(0, bool)
+
+    def cnt(mask, w=None):
+        m = keep & mask
+        return np.bincount(ri[m], weights=None if w is None else w[m], minlength=n)[:n] if len(E) else np.zeros(n)
+    one = np.ones(len(E), bool)
+    n_over, n_ep = cnt(one), cnt(F["counted"])
+    tot = cnt(F["counted"], F["dur"]).astype(float)
+    n_q = cnt(F["q1"] | F["q1b"])
+    n_q1b = cnt(F["q1b"])
+    n_sh_unq = cnt(F["shared"] & ~F["q1"] & ~F["q1b"])
+    n_lift = cnt(F["counted"] & F["lifted"])
+    n_common = cnt(F["common"])
+    s_tot = score(tot, L, Lb)
+    s_n = score(n_ep, ln1, lnb)
+    s = np.fmax(s_tot, np.nan_to_num(s_n))
     cap = (pd.to_numeric(X.s_stuck, errors="coerce") == 0.35).to_numpy()
-    with np.errstate(invalid="ignore"):
-        S["stuck"] = np.where(cap & (S["stuck"] > .35), 0.35, S["stuck"])
-    # F2 level
-    ratio, llr = X.lv_ratio110.to_numpy(float), X.lv_llr110.to_numpy(float)
-    vv = -np.log(np.maximum(np.nan_to_num(ratio, nan=1.0), 1e-9))
-    s_lv = score(vv, -np.log(0.15), -np.log(0.05))
-    S["level"] = np.where(np.isfinite(ratio), np.where(llr <= 50, 0.0, s_lv), np.nan)
-    # F3 / F4 stuck (the same episodes and limits as above)
-    St = {c: S0[c].to_numpy() for c in S0.columns}
-    for c in S0.columns:
-        C[f"st_{c}"] = St[c]
-    tot = _f0(St["tot_s"])
-    s_tot = score(tot, sl, np.fmax(STUCK_BAD, 2 * sl))
-    s_n = score(_f0(St["n_ep"]), lim_n_ep + 1, 2 * (lim_n_ep + 1))
-    s_ = np.fmax(s_tot, np.nan_to_num(s_n))
-    single = _f0(St["n_ep"]) <= 1
-    s_ = np.where(cap & single & (s_ > .35), .35, s_)
-    q1_all = ((_f0(St["n_over"]) > 0) & (_f0(St["n_ep"]) == 0) & (_f0(St["n_shared_unq"]) == 0) &
-              (_f0(St["n_q1"]) + _f0(St["n_q1b"]) > 0))
-    C["q1_all"] = q1_all
-    shared_only = (_f0(St["n_ep"]) == 0) & (_f0(St["n_shared_unq"]) > 0)
-    stk = S["stuck"]
-    with np.errstate(invalid="ignore"):
-        s_ = np.where(shared_only, np.where(stk >= .35, .35, stk), s_)
-    s_ = np.where(q1_all, 0.0, s_)
-    S["stuck"] = s_
-    # G3 erratic counts
-    D3 = X[["fn", "span", "band", "wg"]]
-    L3 = refs.lookup(refs.g3[v], D3)
-    for fa in C7:
-        m = low & ah[fa]
-        if not m.any():
-            continue
-        la = refs.lookup(refs.g3[v], D3[m].assign(fn=fa))
-        with np.errstate(invalid="ignore"):
-            lo_ = la > L3[m]
-        ii = np.flatnonzero(m)[lo_]
-        L3[ii] = la[lo_]
-    if v == "v4c":
-        L3 = np.fmax(L3, EXC_FLOOR)
-    C["lim_exc"] = L3
-    ok3 = (X.exc_15.notna() & X.n_sc_15.ge(G3_MIN_SC) & X.ref110.ne("none")).to_numpy()
-    s3 = score(X.exc_15, L3, 2 * L3)
-    s3 = np.where(X.n_off_15.fillna(0) >= G3_MIN_OFF, s3, 0.0)
-    S["choppy"] = np.where(ok3, s3, np.nan)
-    with np.errstate(invalid="ignore"):
-        C["noyard_chop"] = (X.ref110.eq("none") & (X.exc_sig >= L3) & (X.n_off_sig.fillna(0) >= G3_MIN_OFF) &
-                            X.n_sc_sig.ge(G3_MIN_SC)).to_numpy()
-    S["level"] = np.where(X.g4_unscored.fillna(False).to_numpy(bool), np.nan, S["level"])
-    # ---- too fast / too many / busy at night
-    adv = X.fn.eq("Advance").to_numpy()
-    enough = X.n_on117.fillna(0).to_numpy() >= 50
-    with np.errstate(invalid="ignore", divide="ignore"):
-        if v == "v4":
-            lz = refs.lookup(refs.f117["zf"], X[["fn", "span", "wg"]])
-            lk = refs.lookup(refs.f117["n_spk"], X[["fn", "span", "wg"]])
-            lg = np.fmax(refs.lookup(refs.f117["q5_gy"], X[["fn", "span", "wg"]]), SAT)
-            la_ = np.fmax(refs.lookup(refs.f117["q5_all"], X[["fn", "span", "wg"]]), SAT)
-            sc_ = lambda a, b: np.where(np.isfinite(a) & np.isfinite(b) & (b > 0), a / b, np.nan)  # noqa: E731
-            x_zf = sc_(X.zf.to_numpy(float), lz)
-            nspk = X.n_spk.to_numpy(float)
-            x_spk = np.where(nspk > lk, nspk / np.fmax(lk, 1), 0)
-            fx = np.fmax(np.nan_to_num(x_zf), x_spk)
-            vol_x = np.where(adv, sc_(X.q5_all.to_numpy(float), la_), sc_(X.q5_gy.to_numpy(float), lg))
-            C["lim_zf_use"], C["lim_spk_use"], C["lim_vol_use"] = lz, lk, np.where(adv, la_, lg)
-            C["fo_use"], C["fem_use"], C["zf_use"], C["n_spk_use"] = X.fo_all, X.fem_all, X.zf, X.n_spk
-        else:
-            lz = _least_strict(refs.f118["zf_c"], X, ZF_FLOOR, ah)
-            lk = _least_strict(refs.f118["n_spk_c"], X, SPK_FLOOR, ah)
-            zfc = X.zf_c.to_numpy(float)
-            x_zf = np.where(np.isfinite(zfc), zfc / lz, np.nan)
-            nspk = X.n_spk_c.to_numpy(float)
-            x_spk = np.where(nspk > lk, nspk / lk, 0.0)
-            fx = np.where(X.n_on117.to_numpy(float) >= 50, np.fmax(np.nan_to_num(x_zf), x_spk), np.nan)
-            lg = _least_strict(refs.f118["q5_gy"], X, None, ah)
-            la_ = _least_strict(refs.f118["q5_all"], X, None, ah)
-            lv = np.where(adv, np.fmax(la_, SAT), np.fmax(lg, SAT))
-            q = np.where(adv, X.q5_all, X.q5_gy).astype(float)
-            vol_x = np.where(np.isfinite(q) & (lv > 0), q / lv, np.nan)
-            C["lim_zf_use"], C["lim_spk_use"], C["lim_vol_use"] = lz, lk, lv
-            C["fo_use"], C["fem_use"], C["zf_use"], C["n_spk_use"] = X.fo_c, X.fem_c, X.zf_c, X.n_spk_c
-    C["x_zf"], C["x_spk"], C["fast_x"], C["vol_x"] = x_zf, x_spk, fx, vol_x
-    S["rapid"] = np.where(enough & np.isfinite(fx), score(fx, 1.0, 2.0), np.nan)
-    S["volume"] = np.where(np.isfinite(vol_x), score(vol_x, 1.0, 2.0), np.nan)
-    lvc = X.tod_level.fillna("not scored")
-    pv = np.where(lvc.eq("not scored"), np.nan, lvc.map(PROF_LEVEL).fillna(0.0))
-    dro = _f0(S["dropout"])
-    S["prof"] = np.where((dro >= .35) & np.isfinite(pv), 0.0, pv)
-    occ_hi8 = X.occ_hi8.to_numpy()
-    changed_hi8 = False
-    if v == "v4c":
-        nf = _night_frac_v(X.t_start.iat[0] if n else None, X.drop_b0.astype(float).to_numpy(),
-                           X.drop_b1.astype(float).to_numpy())
-        silent = (dro >= .35) & (nf >= .8)
-        C["silent_night"] = silent
-        nd = np.asarray(S["night_drop"], float)
-        S["night_drop"] = np.where(silent, np.fmax(np.nan_to_num(nd), dro), nd)
-        S["dropout"] = np.where(silent, 0.0, S["dropout"])
-        run = X.bd_ev_h.to_numpy(float)
-        sh = np.where(X.bd_flag.fillna(False).astype(bool), score(run, 3.0, 7.0), 0.0)
-        down = X.bd_ev_dir.to_numpy(float) < 0
-        with np.errstate(invalid="ignore"):
-            other = (_f0(S["level"]) >= .35) | (_f0(S["night_drop"]) >= .35)
-            sh = np.where(down & other, 0.0, sh)
-            sh = np.where(~down & (np.nan_to_num(S["prof"]) >= .35), 0.0, sh)
-            dr = _f0(S["dropout"])
-            both = down & (dr >= .35) & (sh >= .35)
-            S["dropout"] = np.where(both & (sh >= dr), 0.0, np.where(both, np.fmax(dr, BORDER), S["dropout"]))
-            sh = np.where(both & (sh < dr), 0.0, sh)
-        S["shape24"] = np.where(X.bd_flag.notna().to_numpy(), sh, np.nan)
-        hm = X.hi_min_c.fillna(0).to_numpy(float)
-        S["count_on"] = np.where(X.count_on_ok, score(hm, 30.0, 240.0), np.nan)
-        m_hi = X.count_on_ok.to_numpy() & (hm >= 30)
-        if m_hi.any():
-            occ_hi8 = occ_hi8.copy()
-            occ_hi8[m_hi] = False
-            changed_hi8 = True
-    for k, a in S.items():
-        C[f"s8_{k}"] = np.asarray(a)
-    C["queue_pat8"] = ((X.elhi_occ > 0) & (X.elhi_occ > X.elhi_cnt)).to_numpy()
-    # ---- the rules (h110 resolve)
-    rows = []
-    cols = list(S)
-    Sv = np.column_stack([np.asarray(S[k], float) for k in cols]) if n else np.zeros((0, len(cols)))
-    L = {c: X[c].tolist() for c in ("status2", "status", "c_occ_like", "n_on", "share_x", "hours", "n_hmates",
-                                    "reason", "fn", "occ", "rep_time_s")}
-    qp, q1a, nyc, n3d = C["queue_pat8"].tolist(), q1_all.tolist(), C["noyard_chop"].tolist(), n3_dq.tolist()
-    sq1b, oh8 = pd.Series(St["n_q1b"]).tolist(), occ_hi8.tolist()
-    for i in range(n):
-        s = {k: Sv[i, j] for j, k in enumerate(cols) if np.isfinite(Sv[i, j])}
-        find = {k: val for k, val in s.items() if val >= .35}
-        notes, watch, fired = [], [], []
-        status, c_occ_like = L["status"][i], L["c_occ_like"][i]
-        if L["status2"][i] != status:
-            fired.append("R9")
-        for k in list(find):
-            rule = None
-            if k in ("choppy", "level", "occspk") and bool(qp[i]) and np.isfinite(c_occ_like) and \
-                    c_occ_like >= Q2_CORR:
-                rule = ("Q2", "clear")
-            elif k == "rapid" and L["n_on"][i] < LOW_N and np.isfinite(L["share_x"][i]) and L["share_x"][i] >= 0.1:
-                rule = ("R5", "watch")
-            elif k == "dropout" and L["hours"][i] < 1:
-                rule = ("R6", "watch")
-            if rule:
-                fired.append(rule[0])
-                (watch if rule[1] == "watch" else notes).append(k)
-                del find[k]
-        if bool(q1a[i]):
-            fired.append("Q1b" if (sq1b[i] or 0) > 0 else "Q1")
-            notes.append("stuck")
-        nh = L["n_hmates"][i]
-        if "R9" in fired and np.isfinite(nh) and nh == 0 and status in ("suspect", "bad"):
-            fired.append("Y")
-            watch.append("no_yardstick")
-        if bool(nyc[i]):
-            fired.append("Y1")
-            watch.append("no_yardstick_chop")
-        if len(find) == 1:
-            k, val = next(iter(find.items()))
-            if k in STAT and val < BORDER:
-                fired.append("R7")
-                watch.append(k)
-                del find[k]
-        if "last 0.2 s or less" in str(L["reason"][i]) and L["fn"][i] == "Presence":
-            fired.append("R8")
-            watch.append("short_on")
-        if bool(oh8[i]) and "occspk" not in find and "stuck" not in find and \
-                not (np.isfinite(c_occ_like) and c_occ_like >= .5):
-            fired.append("N1")
-            watch.append("occ_hi")
-        dq = []
-        occ, rts = L["occ"][i], L["rep_time_s"][i]
-        on_s = occ * L["hours"][i] * 3600 if np.isfinite(occ) else np.nan
-        if np.isfinite(rts) and rts >= D1_MIN_S and np.isfinite(on_s) and rts >= D1_SHARE * on_s:
-            dq.append("D1")
-        if bool(n3d[i]):
-            dq.append("D1n3")
-        hsc = float(np.prod([1 - val for k, val in s.items() if k in find or val < .35])) if s else np.nan
-        if np.isfinite(hsc) and hsc < .25:
-            st = "bad"
-        elif np.isfinite(hsc) and hsc < .70:
-            st = "suspect"
-        elif watch:
-            st = "watch"
-        elif L["n_on"][i] < 20:
-            st = "not_enough_data"
-        else:
-            st = "ok"
-        fams = {FAMILY[k] for k, val in find.items() if not (k in ("stuck", "dropout") and val == .35)}
-        if st == "suspect" and len(fams) >= 2:
-            st = "bad"
-        rows.append(dict(st8=st, rules8=",".join(fired), watch8=",".join(watch), cleared8=",".join(notes),
-                         left8=",".join(sorted(find)), score8=hsc, dq8=",".join(dq)))
-    Xo = X.assign(occ_hi8=occ_hi8) if changed_hi8 else X
-    R = pd.concat([Xo, pd.DataFrame(C, index=X.index), pd.DataFrame(rows, index=X.index)], axis=1)
-    R["cfg"] = ""
-    c1 = R.fn.eq("Count") & (R.dq8.str.contains("D1") | ((R.n_rep >= C1_N) & (R.n_rep >= C1_SHARE * R.n_on)))
-    R.loc[c1, "cfg"] = "C1"
-    c2 = R.fn.eq("Count") & R.cmode.eq("pulse") & ((R.n_ge60 >= C2_N60) | (R.n_ge5 >= C2_N5)) & ~R.cfg.str.contains("C1")
-    R.loc[c2, "cfg"] = (R.loc[c2, "cfg"] + ",C2").str.strip(",")
-    return R
+    s = np.where(cap & (n_ep <= 1) & (s > .35), .35, s)
+    q1_all = (n_over > 0) & (n_ep == 0) & (n_sh_unq == 0) & (n_q > 0)
+    shared_only = (n_ep == 0) & (n_sh_unq > 0)
+    s = np.where(shared_only, .35, s)
+    s = np.where(q1_all, 0.0, s)
+    lift_only = (n_ep > 0) & (n_ep == n_lift)
+    s = np.where(lift_only & (s > LIFT_CAP), LIFT_CAP, s)
+    s = np.where(n_common > 0, 1.0, s)
+    return s, dict(st_n_ep=n_ep, st_tot_s=tot, st_q1_all=q1_all, st_q1b=n_q1b, st_lift_only=lift_only,
+                   st_common=n_common)
 
 
-def _least_strict(levels, X, floor, ah=None):
-    D = X[["fn", "span", "wg"]]
-    lim = Refs.lookup(levels, D)
-    ah = ah if ah is not None else _alt_has(X)
-    for f in C7:
-        m = ah[f]
-        if not m.any():
-            continue
-        la = Refs.lookup(levels, D[m].assign(fn=f))
-        lim[m] = np.fmax(lim[m], la)
-    if floor is not None:
-        lim = np.fmax(lim, floor)
-    return lim
-
-
-_rows = hc.rows_of        # light row views (note 128)
-
-
-PERSIST_H = 4.0          # note 121 rule P, adopted 2026-10-08 (user decision): a finding lasting >= 4 h of the day
-
-
-def _has(R, k):
-    return np.array([k in str(x).split(",") for x in R.left8.fillna("")], bool)
-
-
-def persists(R):
-    """score_v4d.persists: busy at night (01-05 h by construction), unusual daily pattern run >= 4 h, silent >= 4 h,
-    unexplained time ON in >= 16 15-min periods."""
-    silent_h = (pd.to_numeric(R.drop_b1, errors="coerce") - pd.to_numeric(R.drop_b0, errors="coerce")) * 300 / 3600
-    bd_h = pd.to_numeric(R.bd_ev_h, errors="coerce") if "bd_ev_h" in R else pd.Series(np.nan, index=R.index)
-    n3 = pd.to_numeric(R.n3_n, errors="coerce") if "n3_n" in R else pd.Series(np.nan, index=R.index)
-    return (_has(R, "prof") | (_has(R, "shape24") & (bd_h >= PERSIST_H).to_numpy()) |
-            (_has(R, "dropout") & (silent_h >= PERSIST_H).to_numpy()) |
-            (_has(R, "occspk") & (n3 >= 4 * PERSIST_H).to_numpy()))
-
-
-def persisting_categories(r):
-    """the categories of one detector-row that lasted >= 4 h (shown as 'bad' when rule P made the detector bad)."""
-    left = str(r.left8).split(",")
-    out = set()
-    if "prof" in left:
-        out.add("prof")
-    if "shape24" in left and np.isfinite(_f(r, "bd_ev_h")) and _f(r, "bd_ev_h") >= PERSIST_H:
-        out.add("shape24")
-    if "dropout" in left and np.isfinite(_f(r, "drop_b1") - _f(r, "drop_b0")) and             (_f(r, "drop_b1") - _f(r, "drop_b0")) * 300 / 3600 >= PERSIST_H:
-        out.add("dropout")
-    if "occspk" in left and np.isfinite(_f(r, "n3_n")) and _f(r, "n3_n") >= 4 * PERSIST_H:
-        out.add("occspk")
+def _night_frac_v(t0, b0, b1):
+    """share of the 5-min bins [b0, b1) (from t0) whose clock hour is night (21:00-05:00), one value per row."""
+    out = np.zeros(len(b0))
+    b0, b1 = np.asarray(b0, float), np.asarray(b1, float)
+    ok = np.isfinite(b0) & np.isfinite(b1) & (b1 > b0)
+    if not ok.any():
+        return out
+    a, b = b0[ok].astype(np.int64), b1[ok].astype(np.int64)
+    sod = int(pd.Timestamp(t0).value) % 86_400_000_000_000
+    hrs = ((sod + np.arange(int(b.max()), dtype=np.int64) * 300_000_000_000) // 3_600_000_000_000) % 24
+    cn = np.r_[0, np.cumsum((hrs >= NIGHT_SIL[0]) | (hrs < NIGHT_SIL[1]))]
+    out[ok] = (cn[b] - cn[a]) / (b - a)
     return out
 
 
-def _f(r, c):
-    v = pd.to_numeric(getattr(r, c, np.nan), errors="coerce")
-    return float(v) if v is not None and np.isfinite(v) else np.nan
+def scores(X, E, F, L, B, LJ):
+    """the check scores (0 below the suspect limit, .35 at it, .75 at the bad limit, 1 at most; NaN = not checked) ->
+    {key: array} and the extra per-detector columns the text needs.  L / B: suspect / bad limits (limits())."""
+    S, C = {}, {}
+    S["stuck"], C0 = _stuck(X, E, F, L["stuck"], B["stuck"], L["n_ep"], B["n_ep"])
+    C.update(C0)
+    hm = _f0(X.hi_min_c)
+    S["count_on"] = np.where(X.count_on_ok.to_numpy(bool), score(hm, L["count_on"], B["count_on"]), np.nan)
+    dl = X.drop_lam.to_numpy(float)
+    sd = score(dl, L["dropout"], B["dropout"])
+    cap = ((pd.to_numeric(X.s_dropout, errors="coerce") == 0.35) & (X.drop_lam > 30.001)).to_numpy()
+    sd = np.where(cap & (sd > .35), .35, sd)
+    sd = np.where(X.drop_in_stuck.astype(str).eq("True").to_numpy(), 0.0, sd)
+    sd = np.where(X.n_on.to_numpy(float) > 0, sd, np.nan)
+    # count drops: hourly GEH after the drop point, only when the detector's own occupancy fell against its mates'
+    gok = X.geh_ok.fillna(False).astype(bool).to_numpy()
+    gd = X.geh_drop.to_numpy(float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rel = X.occ_own.to_numpy(float) / np.maximum(X.occ_mates.to_numpy(float), 1e-9)
+    conf = np.isfinite(rel) & (rel < LJ["occ_confirm"])
+    C["occ_rel"] = rel
+    S["level"] = np.where(gok, np.where(np.isfinite(gd) & conf, score(gd, L["level"], B["level"]), 0.0), np.nan)
+    # misses at night: GEH of the average night hour; a silence lying >= 80 % at night is judged here
+    nd = score(X.geh_night.to_numpy(float), L["night_drop"], B["night_drop"])
+    nf = _night_frac_v(X.t_start.iat[0] if len(X) else None, X.drop_b0.to_numpy(float), X.drop_b1.to_numpy(float))
+    silent = (np.nan_to_num(sd) >= .35) & (nf >= .8)
+    moved = silent & (np.nan_to_num(sd) > np.nan_to_num(nd) + 1e-9)
+    nd2 = np.where(moved, sd, nd)
+    low = moved & (np.nan_to_num(dl, nan=0.0) < LJ["night_silence_low_exp"])   # few vehicles expected: suspect at most
+    nd2 = np.where(low, np.minimum(nd2, 0.5), nd2)
+    C["silent_night"] = silent
+    S["dropout"] = np.where(silent, 0.0, sd)
+    S["night_drop"] = nd2
+    bike = X.fn.isin(NO_COUNTS).to_numpy()
+    for k in ("dropout", "level", "night_drop"):
+        S[k] = np.where(bike, np.nan, S[k])
+    pv = hs.busy_level(X.tod_z.to_numpy(float), X.tod_dph.to_numpy(float), X.tod_n_night.to_numpy(float), L["prof"],
+                       LJ["busy"])
+    S["prof"] = np.where(np.nan_to_num(S["dropout"]) >= .35, np.where(np.isfinite(pv), 0.0, pv), pv)
+    fr, nfast, N = X.fast_rate.to_numpy(float), X.n_fast.to_numpy(float), X.N.to_numpy(float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        x = np.where(nfast >= hs.TF_MIN_GAPS, fr / L["rapid"], 0.0)
+        S["rapid"] = np.where(N >= hs.TF_MIN_ON, score(x + 1e-9 * (x > 0), 1.0, B["rapid"] / L["rapid"]), np.nan)
+    q5 = np.where(X.fn.eq("Advance").to_numpy(), X.q5_all.to_numpy(float), X.q5_gy.to_numpy(float))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        S["volume"] = np.where(np.isfinite(q5), score(q5 / L["volume"], 1.0, B["volume"] / L["volume"]), np.nan)
+    lv = X.spk_lvl.to_numpy(float)
+    S["spiky"] = np.where(np.isfinite(lv), np.where(lv >= 2, 1.0, np.where(lv >= 1, 0.5, 0.0)), np.nan)
+    C["q5_use"] = q5
+    return S, C
 
 
-def severity_v4d(R):
-    """score_v4d rule A (two independent findings -> bad), P (a finding lasting >= 4 h of the day -> bad; note 121,
-    adopted 2026-10-08) and C (Count zone held ON by extension -> suspect)."""
-    st = R.st8.copy()
-    n_ev = []
-    for r in _rows(R):
-        ev = set()
-        for k in str(r.left8).split(","):
-            if not k:
-                continue
-            val = getattr(r, f"s8_{k}", np.nan)
-            if not (np.isfinite(val) and val >= .35):
-                continue
-            if k in ("stuck", "dropout") and val == .35:
-                continue
-            quiet = k in QUIET or (k == "shape24" and r.bd_ev_dir < 0)
-            ev.add("quiet" if quiet else k)
-        n_ev.append(len(ev))
-    R["n_ev"] = n_ev
-    rule = np.full(len(R), "", object)
-    a = st.eq("suspect").to_numpy() & (R.n_ev.to_numpy() >= 2)
+def status(X, S, C):
+    """the resolver (h110 / v4c rules on the six checks) and severity (score_v4d A / P / C, score_v4e F), vectorised.
+    Returns a dict of per-detector arrays: st, left (comma list of findings), watch, rule, score, n_ev."""
+    n = len(X)
+    K = list(KEYS)
+    V = np.column_stack([np.asarray(S[k], float) for k in K]) if n else np.zeros((0, len(K)))
+    j = {k: i for i, k in enumerate(K)}
+    fin = np.isfinite(V)
+    find = fin & (V >= .35)
+    watch = {w: np.zeros(n, bool) for w in ("no_yardstick", "dropout_short")}
+    c_like = X.c_occ_like.to_numpy(float)
+    with np.errstate(invalid="ignore"):
+        qp = X.queue_pat8.to_numpy(bool) & (c_like >= Q2_CORR)
+    find[:, j["level"]] &= ~qp                                       # Q2: a queue pattern explains a count drop
+    r6 = find[:, j["dropout"]] & (X.hours.to_numpy(float) < 1)       # R6: silence in a sample under 1 h -> watch
+    find[:, j["dropout"]] &= ~r6
+    watch["dropout_short"] = r6
+    both = find[:, j["dropout"]] & find[:, j["level"]]               # counts fall: one finding, the larger score
+    keep_d = V[:, j["dropout"]] >= V[:, j["level"]]
+    find[:, j["level"]] &= ~(both & keep_d)
+    find[:, j["dropout"]] &= ~(both & ~keep_d)
+    nh = X.n_hmates.to_numpy(float)
+    r9 = (X.status2.astype(str) != X.status.astype(str)).to_numpy()
+    watch["no_yardstick"] = r9 & (nh == 0) & X.status.isin(["suspect", "bad"]).to_numpy()
+    one = find.sum(1) == 1                                         # R7: one borderline statistical finding -> watch
+    stat_m = np.zeros(len(K), bool)
+    stat_m[[j[k] for k in STAT]] = True
+    r7 = one & (find & stat_m[None, :] & (V < BORDER)).any(1)
+    border = np.where(r7[:, None], find, False)
+    find &= ~r7[:, None]
+    Vf = np.where(find, V, 0.0)
+    hsc = np.prod(1 - Vf, 1)
+    any_fin = fin.any(1)
+    hsc = np.where(any_fin, hsc, np.nan)
+    has_w = r7 | r6 | watch["no_yardstick"]
+    n_on = X.n_on.to_numpy(float)
+    with np.errstate(invalid="ignore"):
+        st = np.where(hsc < .25, "bad", np.where(hsc < .70, "suspect",
+                      np.where(has_w, "watch", np.where(n_on < 20, "not_enough_data", "ok")))).astype(object)
+    cap35 = np.zeros_like(find)
+    for k in ("stuck", "dropout"):
+        cap35[:, j[k]] = V[:, j[k]] == .35
+    real = find & ~cap35
+    fam_keys = sorted(set(FAMILY.values()))
+    fam = np.column_stack([(real & np.array([FAMILY[k] == f for k in K])[None, :]).any(1) for f in fam_keys]) \
+        if n else np.zeros((0, len(fam_keys)), bool)
+    st = np.where((st == "suspect") & (fam.sum(1) >= 2), "bad", st).astype(object)
+    ev_keys = sorted(set(EVID.values()))
+    ev = np.column_stack([(real & np.array([EVID[k] == e for k in K])[None, :]).any(1) for e in ev_keys]) \
+        if n else np.zeros((0, len(ev_keys)), bool)
+    n_ev = ev.sum(1)
+    rule = np.full(n, "", object)
+    a = (st == "suspect") & (n_ev >= 2)
     st[a], rule[a] = "bad", "A"
-    p = st.eq("suspect").to_numpy() & ~a & persists(R)
+    silent_h = (X.drop_b1.to_numpy(float) - X.drop_b0.to_numpy(float)) * 300 / 3600
+    with np.errstate(invalid="ignore"):
+        pers = find[:, j["prof"]] | (find[:, j["dropout"]] & (silent_h >= PERSIST_H))
+    p = (st == "suspect") & ~a & pers
     st[p], rule[p] = "bad", "P"
-    c = (R.fn.eq("Count") & R.c1_pre.astype(bool) & (R.hi_min_c >= 30)).to_numpy() & st.isin(["ok", "watch"]).to_numpy()
+    c = (X.fn.eq("Count") & X.c1_pre.astype(bool) & (X.hi_min_c >= 30)).to_numpy() & np.isin(st, ["ok", "watch"])
     st[c], rule[c] = "suspect", "C"
-    R["st_v4d"], R["sev_rule"] = st.to_numpy(), rule
-    return R
+    with np.errstate(invalid="ignore"):
+        even = ((X.fe_n.to_numpy(float) >= hs.PHI_MIN_N) & (X.fe_phi.to_numpy(float) <= hs.PHI_MAX)
+                & X.fn.isin(F_FNS).to_numpy())
+    only_rapid = find[:, j["rapid"]] & (find.sum(1) == 1)
+    f = (st == "bad") & only_rapid & even
+    st[f], rule[f] = "suspect", "F"
+    left = [",".join(k for k in K if find[i, j[k]]) for i in range(n)]
+    bl = [",".join(k for k in K if border[i, j[k]]) for i in range(n)]
+    return dict(st=st, left=np.array(left, object), border=np.array(bl, object), rule=rule, score=hsc, n_ev=n_ev,
+                silent_h=silent_h, **{f"w_{k}": v for k, v in watch.items()})
+
+
+def config_notes(X):
+    """C1 extension time on a count zone (ONs logged again without an OFF, or most of its time ON in such holds);
+    C2 a Count zone in pulse mode that holds ON."""
+    occ, rts = X.occ.to_numpy(float), X.rep_time_s.to_numpy(float)
+    on_s = occ * X.hours.to_numpy(float) * 3600
+    with np.errstate(invalid="ignore"):
+        d1 = (rts >= D1_MIN_S) & (rts >= D1_SHARE * on_s)
+        nrep, non = X.n_rep.to_numpy(float), X.n_on.to_numpy(float)
+        c1 = X.fn.eq("Count").to_numpy() & (d1 | ((nrep >= C1_N) & (nrep >= C1_SHARE * non)))
+        c2 = (X.fn.eq("Count") & X.cmode.eq("pulse")).to_numpy() & (
+            (X.n_ge60.to_numpy(float) >= C2_N60) | (X.n_ge5.to_numpy(float) >= C2_N5)) & ~c1
+    return np.where(c1, "C1", np.where(c2, "C2", ""))
 
 
 # ============================================================================ main entry
 def _stage1(P, start, end, phase, fprob, lanes, pconf, stage1=None):
-    """package health_core rules, two passes (h96_health --twopass)."""
+    """stage-1 rules (health_core), two passes: detectors pass 1 calls bad are nobody's yardstick in pass 2."""
     f = stage1 or hc.health
     h1 = f(P, start, end, None, phase or None, fprob or None, lanes or None, pconf or None)
     if not len(h1):
@@ -617,14 +497,24 @@ def _stage1(P, start, end, phase, fprob, lanes, pconf, stage1=None):
     return x, st1
 
 
-def _left(X: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
-    """X.merge(df, on="detector", how="left") for a df with one row per detector: its columns looked up by detector
-    (reindex fills a missing detector exactly as the merge does) and joined in one concat."""
-    if df.detector.duplicated().any() or (set(X.columns) & set(df.columns)) - {"detector"}:
-        return X.merge(df, on="detector", how="left")
-    R = df.set_index("detector").reindex(X.detector.to_numpy())
-    R.index = X.index
-    return pd.concat([X, R], axis=1)
+def _left(X: pd.DataFrame, *dfs: pd.DataFrame) -> pd.DataFrame:
+    """X.merge(df, on="detector", how="left") for each df with one row per detector: its columns looked up by
+    detector (reindex fills a missing detector exactly as the merge does), all joined in one concat."""
+    parts, seen = [X], set(X.columns)
+    for df in dfs:
+        if df.detector.duplicated().any() or (seen & set(df.columns)) - {"detector"}:
+            return _left_seq(X, dfs)
+        R = df.set_index("detector").reindex(X.detector.to_numpy())
+        R.index = X.index
+        parts.append(R)
+        seen |= set(df.columns)
+    return pd.concat(parts, axis=1)
+
+
+def _left_seq(X, dfs):
+    for df in dfs:
+        X = X.merge(df, on="detector", how="left")
+    return X
 
 
 def _add(X: pd.DataFrame, cols: dict) -> pd.DataFrame:
@@ -638,12 +528,13 @@ def _day_type(ts) -> str:
 
 
 def assess(P, start, end, phase: dict, fn_label: dict, fn_prob: dict, lanes: dict, phase_conf: dict | None = None,
-           refs: Refs | None = None, stage1=None, keep_all: bool = False):
-    """Health v4 for one signal window.  P = health_core.Prep of the window (allowed events only, de-duplicated);
+           refs: Refs | None = None, stage1=None, keep_all: bool = False, limits_json: dict | None = None):
+    """Health for one signal window.  P = health_core.Prep of the window (allowed events only, de-duplicated);
     phase / fn_label / fn_prob / lanes / phase_conf: the classifier's answers per detector (raw predicted phase,
     final function label, class probabilities, lane span, phase probability).  Returns (table, signal note).
-    `keep_all` returns every internal column (research comparison)."""
+    `keep_all` also returns every internal column and the episode table (research comparison)."""
     refs = refs or _load_refs()
+    LJ = limits_json or _load_limits()
     start, end = pd.Timestamp(start), pd.Timestamp(end)
     T = (end - start).total_seconds()
     hours = T / 3600.0
@@ -656,11 +547,11 @@ def assess(P, start, end, phase: dict, fn_label: dict, fn_prob: dict, lanes: dic
     lanes = {int(k): float(v) for k, v in (lanes or {}).items() if v is not None and np.isfinite(v)}
     H, st1 = _stage1(P, start, end, phase, fn_prob, lanes, phase_conf, stage1)
     if not len(H):
-        return pd.DataFrame(columns=OUT_COLS), ""
+        return (pd.DataFrame(columns=OUT_COLS), "") if not keep_all else (pd.DataFrame(columns=OUT_COLS), "", None, None)
     H = H.rename(columns={"status": "status2", "status1": "status"})
     H["detector"] = H.detector.astype(int)
-    for c in ("s_dropout", "s_stuck", "s_level", "s_night_drop", "ep_dur", "drop_lam", "drop_b0", "drop_b1",
-              "chat_frac", "night_n", "night_exp", "reason"):
+    for c in ("s_dropout", "s_stuck", "s_night_drop", "ep_dur", "drop_lam", "drop_b0", "drop_b1", "night_ratio",
+              "night_n", "night_exp", "reason"):
         if c not in H:                                   # a check that did not run on this sample has no column
             H[c] = np.nan
     if "drop_in_stuck" not in H:
@@ -669,7 +560,8 @@ def assess(P, start, end, phase: dict, fn_label: dict, fn_prob: dict, lanes: dic
     X = H[H.detector.map(fn_label).isin(FNS)].copy().reset_index(drop=True)
     rest = H[~H.detector.isin(X.detector)].copy()
     if not len(X):
-        return _fallback(rest), ""
+        out = _fallback(rest)
+        return (out, "") if not keep_all else (out, "", None, None)
     Pm = np.array([[fn_prob.get(int(d), {}).get(c, np.nan) for c in C7] for d in X.detector], float)
     top = np.nanmax(np.where(np.isfinite(Pm), Pm, -1), 1)
     alts = _alts(Pm)
@@ -677,112 +569,80 @@ def assess(P, start, end, phase: dict, fn_label: dict, fn_prob: dict, lanes: dic
     dmap = {int(d): i for i, d in enumerate(O["dets"])}
     cols = {"fn": X.detector.map(fn_label), "phase": X.detector.map(phase).astype(float),
             "lanes": X.detector.map(lanes).astype(float)}
-    cols.update({f"p_{c}": Pm[:, j] for j, c in enumerate(C7)})
     cols.update(f_top=np.where(top >= 0, top, np.nan), alt_set=alts,
                 alt_fns=[",".join(c for c in C7 if c in a) for a in alts], hours=hours, wg=wg, t_start=start,
-                occ=[O["mocc"][dmap[d]] if d in dmap else np.nan for d in X.detector],
-                share_ref=[O["share_ref"][dmap[d]] if d in dmap else np.nan for d in X.detector])
+                occ=[O["mocc"][dmap[d]] if d in dmap else np.nan for d in X.detector])
     X = _add(X, cols)
     # ---- bins, context
     M = hs.bins_ctx(O, st1)
-    N3 = hs.n3_stats(M)
-    A = hs.act_stats(P)
-    X = _left(_left(X, N3), A)
+    per_bins = {"bs": bs, "hi": {}, "q5": {}, "fast": {}, "spiky": {}}
+    Q5, cstate = hs.q5_stats(P, T, phase, lanes, per_bins["q5"])
+    tf = LJ["too_fast"]
+    TF = hs.too_fast(P, fn_label, lanes, tf["gap_s_stopbar"], tf["gap_s_other"], per_bins["fast"])
+    X = _left(X, hs.act_stats(P), hs.act118(P, T), hs.slopes(M, m30), hs.like_corr(M, m30), Q5,
+              hs.fast_even(P, T, cstate), TF)
     span = pd.Series(np.where(X.lanes >= 2, "2+", "1"), index=X.index)
     rate = X.n_on / X.hours
-    share_med = pd.Series([refs.share_med.get((f, wg), np.nan) for f in X.fn], index=X.index)
     X = _add(X, {"span": span, "rate": rate, "band": hs.band_of(rate), "cmode": _cmode(X.fn, X.dur_p50),
-                 "type": X.fn + " " + span, "share_med": share_med, "share_x": X.share_ref / share_med,
+                 "type": X.fn + " " + span,
                  "stuck_x": np.fmax(pd.to_numeric(X.ep_dur, errors="coerce"), X.max_on_s)})
-    X = _left(_left(X, hs.slopes(M, m30)), hs.like_corr(M, m30))
     for c in ("elhi_cnt", "elhi_occ", "c_occ_like"):
         X[c] = pd.to_numeric(X[c], errors="coerce")
+    X["queue_pat8"] = ((X.elhi_occ > 0) & (X.elhi_occ > X.elhi_cnt)).to_numpy()
     hm = X.status.ne("bad").astype(int)
     ph = X.phase.fillna(-1)
     X["n_hmates"] = (hm.groupby(ph).transform("sum") - hm).where(X.phase.notna())
-    OH = hs.occ_hi(M, dict(zip(X.detector, X.cmode)), refs)
-    X = _left(X, OH)
-    X["occ_hi8"] = X.occ_hi8.fillna(False).astype(bool)
-    # ---- 5-min bins: yardstick, 15-min series, episodes
+    # ---- 5-min bins: hourly GEH (count drops, night misses) and 10-min bursts (spiky counts), from 3 h of data
     B5 = hc.events_to_bins(P, start, end, None)
-    bad1 = set(X.detector[X.status.eq("bad")])
-    SH, b15 = hs.shape110(B5, phase, bad1, fn_prob)
-    X = _left(X, SH)
-    bi = {d: i for i, d in enumerate(b15["dets"])}
-    nb15 = b15["x"].shape[1] if len(b15["dets"]) else 0
-    dow = ((int(start.value) + np.arange(nb15, dtype=np.int64) * 900_000_000_000) // hc.DAY_NS + 3) % 7
-    tday = np.where(dow >= 5, "h24_a", "h24_b").astype(object)          # = _day_type of each 15-min bin start
-    wcache = {}
-    lv, ev, dr = [], [], []
-    for r in _rows(X):
-        i = bi.get(int(r.detector))
-        if i is None:
-            lv.append((np.nan, 0.0, -1))
-            ev.append({})
-            dr.append({})
-            continue
-        x, S_, R_, ok = b15["x"][i], b15["S"][i], b15["R"][i], b15["ok"]
-        wk = (r.type, r.band)
-        if wk not in wcache:
-            wcache[wk] = np.array([refs.tod_w.get((r.type, r.band, dd, int(hh)), refs.tod_wb.get((r.band, dd, int(hh)), 1.0))
-                                   for dd, hh in zip(tday, b15["hour"])], float)
-        w = wcache[wk]
-        res = hs.level110(x, S_, ok, w)
-        lv.append(res)
-        e = dict(hs.erratic(x, R_, ok, "15"))
-        e.update({k.replace("_15", "_sig"): v for k, v in hs.erratic(x, S_, ok, "15").items()})
-        ev.append(e)
-        if np.isfinite(res[0]) and res[2] >= 0:
-            d = hs.drop_evidence(x, S_, ok, w, res[2])
-            d["drop_at"] = start + _td(minutes=15 * res[2])
-            dr.append(d)
-        else:
-            dr.append({})
-    cols = {"lv_ratio110": [a[0] for a in lv], "lv_llr110": [a[1] for a in lv], "lv_b110": [a[2] for a in lv]}
-    EV = pd.DataFrame(ev, index=X.index)
-    for c in ("n_off_15", "n_sc_15", "exc_15", "n_off_sig", "n_sc_sig", "exc_sig"):
-        cols[c] = EV[c] if c in EV else np.nan
-    DR = pd.DataFrame(dr, index=X.index)
-    for c in ("own_before", "own_after", "exp_after", "drop_at"):
-        cols[c] = DR[c] if c in DR else np.nan
-    g4 = DR.g4_unscored0.fillna(False).astype(bool) if "g4_unscored0" in DR else False
-    cols["g4_unscored0"] = g4
-    cols["g4_unscored"] = g4
-    X = _left(_add(X, cols), hs.act118(P, T))
+    X = _left(X, hs.occ_hi(M, dict(zip(X.detector, X.cmode)), refs, P, T, per_bins["hi"]))
+    if hours >= LJ["min_hours_counts"]:
+        SP, per_bins["spiky"] = hk.spiky(B5, phase, hours, LJ["spiky"])
+        X = _left(X, hk.hourly_geh(B5, phase), SP)
+    else:
+        X = _add(X, {c: np.nan for c in GEH_COLS})
+        X["geh_ok"] = False
     # ---- episodes (continuous ONs >= 5 min) with the queue / traffic test
-    # continuous ONs >= 300 s (the research listed >= 60 s and kept >= 300 s: the same rows, and on_episodes' own
-    # pairwise 'held ON together' matrix then spans only these ONs, not every ON of a minute or more)
     ep = hc.on_episodes(P, start, end, min_s=300.0)
     E = ep[ep.dur_s >= 300].copy().reset_index(drop=True)
     E["ts"] = (E.t0 - start).dt.total_seconds()
     E["tf"] = (E.t1 - start).dt.total_seconds()
     E["co5"] = hs.episode_overlap(E)
+    TW = hk.twin_matrix(B5)
+    E["n_ov_any"], E["common"] = hk.common_holds(E.ts.to_numpy(float), E.tf.to_numpy(float), E.detector.to_numpy(int),
+                                                 LJ["common_hold_s"], twin=TW)
     E = E.join(hs.episodes_ctx(E, M, dict(zip(X.detector, X.phase)), refs.qtype, dict(zip(X.detector, X.type))))
     E["fn"] = E.detector.map(dict(zip(X.detector, X.fn)))
-    E["co5_orig"] = E.co5
-    # ---- red / green: too fast, too many
-    CB, nstart = hs.colour_bins(P, T, phase)
-    CS = hs.colour_stats(CB, lanes)
-    X = _left(X, CS)
-    X = _add(X, {"n_on117": X.detector.map(nstart).astype(float)})
-    # ---- time of day (a whole day in the sample)
-    X, sig_note, day_info = _time_of_day(X, O, start, end, refs)
-    # ---- v4 pass (only to find phase mates with a finding for the 'goes silent' yardstick), then v4c
-    cand = X[(pd.to_numeric(X.drop_lam, errors="coerce") >= 30) & (X.n_on > 0)].detector.tolist()
-    X["tod_level"] = X.tod_level_v4
+    # ---- limits, time of day (a whole day in the sample)
+    L, Bl = limits(X, refs, LJ)
+    X, sig_note, day_info = _time_of_day(X, O, start, end, refs, L["prof"], LJ["busy"])
+    # ---- Count zone held ON / extension; the queue excuse is never for a counting zone
+    cfg = config_notes(X)
+    c1 = cfg == "C1"
+    sure_count = np.array([(not a) or a <= {"Count"} for a in alts])
+    X["count_on_ok"] = X.fn.eq("Count").to_numpy() & sure_count & ~c1
+    X["c1_pre"] = c1
+    noq = X.fn.isin(NO_SHARED).to_numpy() & np.array([not (a & QUEUE_OK) for a in alts])
+    if len(E):
+        E["noq"] = E.detector.map(dict(zip(X.detector, noq))).fillna(False).astype(bool)
+        E.loc[E.noq, "n_hpeer_e"] = 0
+        qc = E.cover_e.fillna(0) >= F4_COVER
+        E.loc[qc, "phx_h_e"] = np.fmax(E.loc[qc, "phx_h_e"].fillna(0), 1.5)
+    F = episode_flags(E)
+    F["twin"] = TW
+    # ---- goes silent: a pre-pass finds phase mates with a finding of their own; they leave the yardstick
+    for c in ("drop_lam", "drop_b0", "drop_b1"):
+        X[c] = pd.to_numeric(X[c], errors="coerce")
+    cand = X[(X.drop_lam >= 30) & (X.n_on > 0)].detector.tolist()
     if cand:
-        R4 = _resolve(X, E, refs, "v4")
-        flagged = {int(d): bool(set(x for x in str(l).split(",") if x) - SILENT_FAM)
-                   for d, l in zip(R4.detector, R4.left8)}
+        S0, C0 = scores(X, E, F, L, Bl, LJ)
+        R0 = status(X, S0, C0)
+        quietk = {"dropout", "level", "night_drop"}
+        flagged = {int(d): bool(set(x for x in l.split(",") if x) - quietk) for d, l in zip(X.detector, R0["left"])}
         DC = hs.dropout_clean(B5, cand, dict(zip(X.detector, X.phase)), flagged)
     else:
         DC = {}
-    X["drop_lam"] = pd.to_numeric(X.drop_lam, errors="coerce")
-    X["drop_b0"] = pd.to_numeric(X.drop_b0, errors="coerce")
-    X["drop_b1"] = pd.to_numeric(X.drop_b1, errors="coerce")
     cols = {c: X.detector.map({d: v[c] for d, v in DC.items()}).astype(float)
             for c in ("drop_lam_chk", "drop_lam_c", "drop_b0_c", "drop_b1_c", "n_dropped")}
-    cols["dropped"] = X.detector.map({d: v["dropped"] for d, v in DC.items()})
     X = _add(X, cols)
     m = (X.n_dropped.fillna(0) > 0) & (X.drop_lam_chk > 0)
     X.loc[m, "drop_lam"] = X.loc[m, "drop_lam"] * X.loc[m, "drop_lam_c"] / X.loc[m, "drop_lam_chk"]
@@ -793,27 +653,24 @@ def assess(P, start, end, phase: dict, fn_label: dict, fn_prob: dict, lanes: dic
                    [np.nan if not np.isfinite(v) else (0.0 if v < 30 else .35 + .65 * min((v - 30) / 70, 1))
                     for v in X.drop_lam.astype(float)])
     X["s_dropout"] = np.where(m, new, sd)
-    X["tod_level"] = X.tod_level_c
-    c1 = X.fn.eq("Count") & ((X.n_rep >= C1_N) & (X.n_rep >= C1_SHARE * X.n_on) |
-                             ((X.rep_time_s >= D1_MIN_S) & (X.rep_time_s >= D1_SHARE * X.occ * X.hours * 3600)))
-    sure_count = np.array([(not a) or a <= {"Count"} for a in alts])
-    X["count_on_ok"] = X.fn.eq("Count").to_numpy() & sure_count & ~c1.fillna(False).to_numpy()
-    X["c1_pre"] = c1.fillna(False).to_numpy()
-    noq = X.fn.isin(NO_SHARED).to_numpy() & np.array([not (a & QUEUE_OK) for a in alts])
-    E4 = E.copy()
-    if len(E4):
-        E4["noq"] = E4.detector.map(dict(zip(X.detector, noq))).fillna(False).astype(bool)
-        E4.loc[E4.noq, "n_hpeer_e"] = 0
-        qc = E4.cover_e.fillna(0) >= F4_COVER
-        E4.loc[qc, "phx_h_e"] = np.fmax(E4.loc[qc, "phx_h_e"].fillna(0), 1.5)
-    R = _resolve(X, E4, refs, "v4c")
-    R = severity_v4d(R)
-    out = _outputs(R, E4, start, end, day_info)
+    # ---- the checks, status, severity, outputs
+    S, C = scores(X, E, F, L, Bl, LJ)
+    R = status(X, S, C)
+    X = _add(X, {**{f"s8_{k}": np.asarray(v, float) for k, v in S.items()},
+                 **{f"lim_{k}": np.asarray(v, float) for k, v in L.items()},
+                 **{f"bad_{k}": np.asarray(v, float) for k, v in Bl.items()}, **C,
+                 "health_st": R["st"], "left": R["left"], "border": R["border"], "sev_rule": R["rule"],
+                 "score": R["score"], "n_ev": R["n_ev"], "silent_h": R["silent_h"], "w_no_yardstick": R["w_no_yardstick"],
+                 "w_dropout_short": R["w_dropout_short"],
+                 "cfg": cfg})
+    out = _outputs(X, E, F, start, end, per_bins)
+    held = _common_note(X, E, F)
+    sig_note = "; ".join(x for x in (sig_note, held) if x)
     if len(rest):
         out = pd.concat([out, _fallback(rest)], ignore_index=True)
     out = out.sort_values("detector").reset_index(drop=True)
     if keep_all:
-        return out, sig_note, R, E4
+        return out, sig_note, X, E
     return out, sig_note
 
 
@@ -832,19 +689,15 @@ def _full_days(start, end):
     return out
 
 
-def _time_of_day(X, O, start, end, refs):
-    cols_bd = ["bd_flag", "bd_ev_from", "bd_ev_h", "bd_ev_dir", "bd_ev_h0", "bd_ev_h1", "bd_ev_obs", "bd_ev_exp"]
-    cols = {"tod_level_v4": "not scored", "tod_level_c": "not scored"}
-    cols.update({c: np.nan for c in cols_bd})
-    cols["bd_flag"] = pd.Series([np.nan] * len(X), dtype=object, index=X.index)
-    cols["tod_day"] = pd.NaT
-    X = _add(X, cols)
+def _time_of_day(X, O, start, end, refs, zlim, busy=None):
+    """busy at night per whole day of the sample (the day with the strongest finding is kept); signal note when many
+    detectors had an unusual night (a signal-wide event)."""
+    num = ("tod_z", "tod_dph", "tod_n_night", "tod_r", "tod_mate_r")
+    n = len(X)
+    V = {c: np.full(n, np.nan) for c in num}
+    tod_day = [pd.NaT] * n
     note, info = "", {}
-    if X.wg.iloc[0] != "h24" or O["bs"] != 900:
-        return X, note, info
-    days = _full_days(start, end)
-    if not days:
-        return X, note, info
+    days = _full_days(start, end) if (n and X.wg.iloc[0] == "h24" and O["bs"] == 900) else []
     dmap = {int(d): i for i, d in enumerate(O["dets"])}
     idx = np.array([dmap.get(int(d), -1) for d in X.detector])
     best = {}
@@ -853,8 +706,8 @@ def _time_of_day(X, O, start, end, refs):
         j0 = int(round((d0 - start).total_seconds() / 900))
         if j0 < 0 or j0 + 96 > O["nb"]:
             continue
-        n15 = np.full((len(X), 96), np.nan)
-        o15 = np.full((len(X), 96), np.nan)
+        n15 = np.full((n, 96), np.nan)
+        o15 = np.full((n, 96), np.nan)
         hv = idx >= 0
         n15[hv] = O["n"][idx[hv], j0:j0 + 96]
         o15[hv] = O["occ"][idx[hv], j0:j0 + 96]
@@ -864,41 +717,25 @@ def _time_of_day(X, O, start, end, refs):
         N, Od = hs.day_profile(n15, o15)
         tot = np.nansum(N, 1)
         ok = np.isfinite(N).all(1) & np.isfinite(Od).all(1) & (tot >= hs.MIN_N)
-        dty = _day_type(d0 + _td(hours=12))
-        fn = X.fn.to_numpy(object)
-        span = X.span.to_numpy(object)
-        ph = X.phase.to_numpy(float)
-        alts = list(X.alt_set)
-        nd = hs.night_day(N, Od, fn, span, ph, ok, refs.tod_own, refs.tod_alt, alts)
-        nd_v4 = hs.night_day(N, Od, fn, span, ph, ok, refs.tod_own, refs.tod_alt, [set()] * len(X))
-        F, bnd = hs.band_day(N, Od, fn, span, X.lanes.to_numpy(float), ph, ok, dty, refs.band_own, refs.band_alt, alts)
-        odd = ok & (F.bd_run_ok.to_numpy() | nd.tod_odd.to_numpy())
+        nd = hs.night_day(N, Od, X.fn.to_numpy(object), X.span.to_numpy(object), X.phase.to_numpy(float), ok,
+                          refs.tod_own, refs.tod_alt, list(X.alt_set))
+        odd = ok & nd.tod_odd.to_numpy()
         if odd.sum() >= hs.SIG_MIN and odd.sum() >= hs.SIG_SHARE * ok.sum():
             sig.append((d0, int(odd.sum()), int(ok.sum())))
-        rank = {"bad": 3, "suspect": 2, "ok": 1, "not scored": 0}
-        for i in range(len(X)):
-            key = (rank[nd.tod_level.iat[i]], int(bool(F.bd_flag.iat[i])) * F.bd_ev_h.iat[i])
-            if i not in best or key > best[i][0]:
-                best[i] = (key, d0, nd.iloc[i], nd_v4.tod_level.iat[i], F.iloc[i],
-                           {k: v[i] for k, v in bnd.items()}, N[i], Od[i], ok[i])
-    n = len(X)
-    num = ("tod_z", "tod_dph", "tod_n_night", "tod_r", "tod_mate_r", "bd_ev_h", "bd_ev_dir", "bd_ev_h0", "bd_ev_h1",
-           "bd_ev_obs", "bd_ev_exp")
-    V = {c: [np.nan] * n for c in num}
-    V.update({"tod_level_c": ["not scored"] * n, "tod_level_v4": ["not scored"] * n, "bd_flag": [np.nan] * n,
-              "bd_ev_from": [np.nan] * n, "tod_day": [pd.NaT] * n})
-    for i, (key, d0, ndr, lv4, Fr, bnd, N_i, O_i, ok_i) in best.items():
-        V["tod_level_c"][i], V["tod_level_v4"][i], V["tod_day"][i] = ndr.tod_level, lv4, d0
-        for c in ("tod_z", "tod_dph", "tod_n_night", "tod_r", "tod_mate_r"):
+        lvl = hs.busy_level(nd.tod_z, nd.tod_dph, nd.tod_n_night, zlim, busy)
+        key = np.where(np.isfinite(lvl), lvl, -1.0)
+        for i in range(n):
+            if i not in best or key[i] > best[i][0]:
+                best[i] = (key[i], d0, nd.iloc[i])
+                info[int(X.detector.iat[i])] = dict(day=d0)
+    for i, (_, d0, ndr) in best.items():
+        for c in num:
             V[c][i] = float(ndr[c])
-        for c in cols_bd:
-            V[c][i] = Fr[c] if c in ("bd_flag", "bd_ev_from") else float(Fr[c])
-        info[int(X.detector.iat[i])] = dict(day=d0, N=N_i, O=O_i, ok=ok_i, **bnd)
-    for c, v in V.items():                         # whole columns (pandas 3 refuses a string into a float cell)
-        X[c] = pd.Series(v, index=X.index, dtype=float if c in num else ("datetime64[ns]" if c == "tod_day" else object))
+        tod_day[i] = d0
+    X = _add(X, {**V, "tod_day": pd.Series(tod_day, index=X.index, dtype="datetime64[ns]")})
     if sig:
-        d0, k, n = max(sig, key=lambda s: s[1] / max(s[2], 1))
-        note = (f"{k} of {n} detectors at this signal had an unusual day on {d0:%a %d %b}: "
+        d0, k, m = max(sig, key=lambda s: s[1] / max(s[2], 1))
+        note = (f"{k} of {m} detectors at this signal had an unusual night on {d0:%a %d %b}: "
                 "a signal-wide event or an input change, not one bad detector")
     return X, note, info
 
@@ -929,59 +766,59 @@ def _label(r):
     return f"det {int(r.detector)}: {p}{str(r.fn).replace('Yellow_Red', 'Yellow-red')}"
 
 
-def _evidence(k, r, eps, start):
-    """one short line per category with the numbers the check used."""
+def _evidence(k, r, eps):
+    """one short line per finding with the numbers the check used."""
     if k == "stuck":
         e = eps.get(int(r.detector), [])
         cnt = [x for x in e if x["label"] != "queue"]
         tot = sum(x["dur_s"] for x in cnt)
+        nq = [x for x in cnt if x["label"] == "not_queue"]
+        why = ""
+        if nq and len(nq) == len(cnt):            # note 135: excused as a queue before, the traffic does not explain it
+            why = (f"; not a queue: at the same traffic it was ON {100 * min(x['busy_occ'] for x in nq):.0f} % "
+                   "of the time")
+        tog = [x for x in cnt if x["label"] == "together"]
+        if tog:                                   # note 147e: one common failure with other detectors
+            mates = ", ".join(str(m) for m in sorted({m for x in tog for m in x["mates"]}))
+            when = (f"{_dur(tog[0]['dur_s'])} from {tog[0]['t0']:%a %H:%M}" if len(tog) == 1 else
+                    f"{len(tog)} times from {tog[0]['t0']:%a %H:%M}, {_dur(sum(x['dur_s'] for x in tog))} in total")
+            return f"held ON {when} together with det {mates} (same start and end: a common failure)"
         if len(cnt) > 1:
-            return f"held ON {len(cnt)} times, {_dur(tot)} in total"
+            return f"held ON {len(cnt)} times, {_dur(tot)} in total" + why
         if cnt:
-            return f"held ON {_dur(tot)} from {cnt[0]['t0']:%a %H:%M}"
+            return f"held ON {_dur(tot)} from {cnt[0]['t0']:%a %H:%M}" + why
         return f"held ON up to {_dur(r.stuck_x)}"
-    if k == "dropout":
+    if k == "count_on":
+        mx = r.hi_occ_max if np.isfinite(r.hi_occ_max) else np.nan
+        return f"count zone ON up to {100 * mx:.0f} % in light traffic for {r.hi_min_c:.0f} min"
+    if k == "dropout" or (k == "night_drop" and bool(r.silent_night)):
         a = r.t_start + _td(seconds=300 * float(r.drop_b0))
         b = r.t_start + _td(seconds=300 * float(r.drop_b1))
         return f"no actuations {_hm(a)}-{_hm(b)}; ~{float(r.drop_lam):,.0f} expected"
     if k == "night_drop":
-        if bool(getattr(r, "silent_night", False)):
-            a = r.t_start + _td(seconds=300 * float(r.drop_b0))
-            b = r.t_start + _td(seconds=300 * float(r.drop_b1))
-            return f"no actuations {_hm(a)}-{_hm(b)}; ~{float(r.drop_lam):,.0f} expected"
-        nn, ne = pd.to_numeric(getattr(r, "night_n", np.nan), errors="coerce"), \
-            pd.to_numeric(getattr(r, "night_exp", np.nan), errors="coerce")
-        return f"night {nn:,.0f} actuations vs ~{ne:,.0f} expected" if np.isfinite(ne) else "fewer actuations at night"
+        nn, ne = float(r.geh_night_n), float(r.geh_night_exp)
+        return (f"night {nn:,.0f} actuations vs ~{ne:,.0f} expected (GEH {r.geh_night:.1f})" if np.isfinite(ne)
+                else "fewer actuations at night")
     if k == "level":
-        t = f" at {pd.Timestamp(r.drop_at):%a %H:%M}" if pd.notna(r.drop_at) else ""
-        return f"counts dropped{t}: {r.own_before:.0f} to {r.own_after:.0f} per 15 min; ~{r.exp_after:.0f} expected"
-    if k == "choppy":
-        return (f"{int(r.n_off_15)} of {int(r.n_sc_15)} 15-min periods outside the expected range; "
-                f"{100 * r.exc_15:.0f} % of counts (limit {100 * r.lim_exc:.0f} %)")
+        t = f" from {pd.Timestamp(r.drop_t):%a %H:%M}" if pd.notna(r.drop_t) else ""
+        return (f"counts dropped{t}: {r.own_after:.0f} per hour where its phase mates' traffic gives ~{r.exp_after:.0f} "
+                f"(GEH {r.geh_drop:.1f}); its occupancy fell too")
     if k == "rapid":
-        if r.x_spk >= np.nan_to_num(r.x_zf):
-            return f"{int(r.n_spk_use)} bursts of back-to-back ONs; normal at most {int(r.lim_spk_use)}"
-        normal = r.fem_use + r.lim_zf_use * (r.fem_use + 1) ** 0.5
-        return f"{r.fo_use:,.0f} back-to-back vehicle ONs; normal up to {normal:,.0f}"
+        txt = (f"{int(r.n_fast):,} of {int(r.N):,} ONs follow the previous ON within {r.gap_lim:.2g} s "
+               f"({r.fast_rate:.0f} per 1,000; limit {r.lim_rapid:.0f})")
+        if np.isfinite(r.pair_share) and r.pair_share >= PAIRS_SHARE:   # note 147e: short gaps come in pairs
+            txt += "; counts each vehicle twice"
+        if r.sev_rule == "F":                     # note 135 rule F: an even excess
+            txt += ", spread evenly with traffic - flickers as vehicles pass, check zone setup"
+        return txt
+    if k == "spiky":
+        return (f"{r.spk_bursts:.0f} bursts{' a day' if r.hours > 24.5 else ''} in 10-min counts at 3 x its usual "
+                f"level or more (largest GEH {r.spk_gmax:.0f}); ~{r.spk_daily:,.0f} vehicles a day")
     if k == "volume":
-        q = r.q5_all if r.fn == "Advance" else r.q5_gy
-        return f"busiest 5 min {q:,.0f} veh/h/lane vs limit {r.lim_vol_use:,.0f}"
-    if k == "chatter":
-        return f"{100 * r.chat_frac:.1f} % of ONs turn on again within 0.3 s (limit {100 * r.lim_chat_frac:.1f} %)"
-    if k == "occspk":
-        return f"{r.n3_exc:.0f} min of time ON its counts do not explain (limit {r.lim_n3_exc:.0f})"
+        return f"busiest 5 min {r.q5_use:,.0f} veh/h/lane vs limit {r.lim_volume:,.0f}"
     if k == "prof":
         return (f"night level {100 * r.tod_r ** 2:.0f} % of its busiest hours; phase mates "
                 + (f"{100 * r.tod_mate_r ** 2:.0f} %" if np.isfinite(r.tod_mate_r) else "none"))
-    if k == "shape24":
-        a, b = int(r.bd_ev_h0), int(r.bd_ev_h1) + 1
-        who = "its phase mates" if r.bd_ev_from == "mates" else "its type"
-        return f"{r.bd_ev_obs:,.0f} actuations {a:02d}-{b:02d} h; {who} ~{r.bd_ev_exp:,.0f}"
-    if k == "count_on":
-        mx = r.hi_occ_max if np.isfinite(r.hi_occ_max) else np.nan
-        return f"ON up to {100 * mx:.0f} % in light traffic for {r.hi_min_c:.0f} min"
-    if k == "occ_hi":
-        return "ON longer than similar zones for 30 min or more"
     if k == "C1":
         return f"{int(r.n_rep):,} of {int(r.n_on):,} ONs logged again without an OFF"
     if k == "C2":
@@ -990,106 +827,171 @@ def _evidence(k, r, eps, start):
     return ""
 
 
-def _stuck_eps(R, E, start):
-    """every continuous ON over the type limit, labelled counted / queue / shared (h118 stuck_list)."""
+def _stuck_eps(X, E, F):
+    """every continuous ON over the detector's stuck-on limit, labelled counted / queue / shared / not_queue."""
     out = {}
     if not len(E):
         return out
-    Ex = E.merge(R[["detector", "stuck_lim8"]], on="detector", how="inner")
-    Ex = Ex[Ex.dur_s >= Ex.stuck_lim8]
-    if not len(Ex):
+    lim = dict(zip(X.detector.astype(int), X.lim_stuck))
+    Le = E.detector.astype(int).map(lim).to_numpy(float)
+    with np.errstate(invalid="ignore"):
+        m = F["dur"] >= Le
+    if not m.any():
         return out
-    q_ok = (Ex.n_hpeer_e.fillna(0) > 0) & (Ex.phx_h_e >= 1.5) & (Ex.corr_h_e >= Q1_CORR) & (Ex.refx_e >= 0.5) & \
-        (Ex.light_e.fillna(1) == 0) & (Ex.trafx_e >= TRAF_X)
-    q1 = q_ok & (Ex.dur_s < 3600)
-    q1b = q_ok & (Ex.dur_s >= 3600) & (Ex.cover_e >= F4_COVER)
-    co = np.where(Ex.fn.isin(NO_SHARED), 0, Ex.co5)
-    sh = (co >= 3) & ~q1 & ~q1b
-    lab = np.where(q1 | q1b, "queue", np.where(sh, "shared", "counted"))
-    for r, l in zip(Ex.sort_values("t0").itertuples(), lab[np.argsort(Ex.t0.to_numpy(), kind="stable")]):
-        out.setdefault(int(r.detector), []).append(dict(t0=r.t0, t1=r.t1, dur_s=float(r.dur_s), label=l,
-                                                        open_end=bool(r.open_end)))
+    q = F["q1"] | F["q1b"]
+    sh = F["shared"] & ~q
+    lab = np.where(F["common"], "together",
+                   np.where(q, "queue", np.where(sh, "shared", np.where(F["lifted"], "not_queue", "counted"))))
+    s_, f_, c_ = E.ts.to_numpy(float), E.tf.to_numpy(float), E.detector.to_numpy(int)
+    bo = E.busy_occ_e.to_numpy(float) if "busy_occ_e" in E else np.full(len(E), np.nan)
+    ii = np.flatnonzero(m)
+    ii = ii[np.argsort(E.t0.to_numpy()[ii], kind="stable")]
+    t0, t1, det = E.t0.tolist(), E.t1.tolist(), E.detector.astype(int).tolist()
+    for i in ii:
+        out.setdefault(det[i], []).append(dict(t0=t0[i], t1=t1[i], dur_s=float(F["dur"][i]), label=lab[i],
+                                               busy_occ=float(bo[i]),
+                                               mates=hk.common_mates(s_, f_, c_, i, F.get("twin")) if F["common"][i] else []))
     return out
 
 
-def _outputs(R, E, start, end, day_info):
-    eps = _stuck_eps(R, E, start)
+def _common_note(X, E, F):
+    """signal note for holds shared by several detectors with the same start and end (a common failure)."""
+    if not len(E) or not F["common"].any():
+        return ""
+    lim = dict(zip(X.detector.astype(int), X.lim_stuck))
+    Le = E.detector.astype(int).map(lim).to_numpy(float)
+    with np.errstate(invalid="ignore"):
+        ii = np.flatnonzero(F["common"] & (F["dur"] >= Le))
+    if not len(ii):
+        return ""
+    s_, f_, c_ = E.ts.to_numpy(float), E.tf.to_numpy(float), E.detector.to_numpy(int)
+    groups = {}
+    for i in ii[np.argsort(s_[ii], kind="stable")]:
+        g = tuple(sorted(set(hk.common_mates(s_, f_, c_, i, F.get("twin"))) | {int(c_[i])}))
+        t = groups.setdefault(g, [i, set()])
+        t[1].add(round(s_[i] / 60))                            # one event per start minute
+    parts = []
+    for g, (i, ev) in sorted(groups.items(), key=lambda x: s_[x[1][0]]):
+        k = len(ev)
+        parts.append(f"{len(g)} detectors (det {', '.join(map(str, g))}) held ON together "
+                     + (f"from {E.t0.iat[i]:%a %H:%M} for {_dur(F['dur'][i])}" if k == 1 else
+                        f"{k} times from {E.t0.iat[i]:%a %H:%M}")
+                     + " (same start and end): one common failure, check the cabinet first")
+    return "; ".join(parts)
+
+
+def _runs_to_periods(mask, t0, bin_s, end, what):
+    """consecutive flagged bins (bin k = [t0 + k * bin_s, t0 + (k + 1) * bin_s), clipped to the window end) -> one
+    period each."""
+    m = np.asarray(mask, bool)
+    if not m.any():
+        return []
+    d = np.diff(np.r_[0, m.astype(np.int8), 0])
+    a, b = np.flatnonzero(d == 1), np.flatnonzero(d == -1)
+    out = []
+    for i, j in zip(a, b):
+        s0 = t0 + _td(seconds=float(i) * bin_s)
+        s1 = min(t0 + _td(seconds=float(j) * bin_s), end)
+        out.append(dict(start=str(s0), end=str(s1), what=what, recovered=None))
+    return out
+
+
+def _periods(r, keys, eps, per_bins, start, end):
+    """the bad periods of a flagged detector: where each check saw the problem."""
+    d = int(r.detector)
+    out = []
+    if "stuck" in keys:
+        out += [dict(start=str(x["t0"]), end=str(x["t1"]), what="stuck on", recovered=None)
+                for x in eps.get(d, []) if x["label"] != "queue"]
+    if "count_on" in keys and d in per_bins["hi"]:
+        out += _runs_to_periods(per_bins["hi"][d], start, int(per_bins["bs"]), end, "count zone held ON")
+    for k, what in (("dropout", "silent"), ("night_drop", "silent at night")):
+        if k in keys and np.isfinite(r.drop_b0) and np.isfinite(r.drop_b1) and (k == "dropout" or bool(r.silent_night)):
+            out.append(dict(start=str(r.t_start + _td(seconds=300 * float(r.drop_b0))),
+                            end=str(r.t_start + _td(seconds=300 * float(r.drop_b1))), what=what, recovered=None))
+    if "level" in keys and pd.notna(r.drop_t):
+        out.append(dict(start=str(pd.Timestamp(r.drop_t)), end=str(end), what="counts dropped", recovered=None))
+    if "rapid" in keys and d in per_bins["fast"]:
+        hf, ha = per_bins["fast"][d]
+        nh = int(max(ha.max() if len(ha) else 0, hf.max() if len(hf) else 0)) + 1
+        cf, ca = np.bincount(hf, minlength=nh), np.bincount(ha, minlength=nh)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            hit = (cf >= FAST_PER_H) & (1000.0 * cf / np.maximum(ca, 1) >= r.lim_rapid)
+        out += _runs_to_periods(hit, start, 3600, end, "too-fast actuations")
+    if "volume" in keys and per_bins["q5"].get("det") is not None:
+        i = np.flatnonzero(per_bins["q5"]["det"] == d)
+        if len(i) and np.isfinite(r.lim_volume):
+            q = per_bins["q5"]["q5_all" if r.fn == "Advance" else "q5_gy"][i[0]]
+            with np.errstate(invalid="ignore"):
+                out += _runs_to_periods(q > r.lim_volume, start, 300, end, "too many for the traffic")
+    if "prof" in keys and pd.notna(r.tod_day):
+        a = pd.Timestamp(r.tod_day) + _td(hours=hs.NIGHT_TOD[0])
+        out.append(dict(start=str(a), end=str(a + _td(hours=hs.NIGHT_TOD[1] - hs.NIGHT_TOD[0])), what="busy at night",
+                        recovered=None))
+    if "spiky" in keys and d in per_bins["spiky"]:
+        bm = _td(minutes=10)
+        out += [dict(start=str(start + a * bm), end=str(min(start + b * bm, end)), what="spiky counts", recovered=None)
+                for a, b in per_bins["spiky"][d]]
+    return sorted(out, key=lambda x: x["start"])
+
+
+def _outputs(X, E, F, start, end, per_bins):
+    eps = _stuck_eps(X, E, F)
     rows = []
-    for r in _rows(R):
-        st = r.st_v4d
-        cats = [k for k in str(r.left8).split(",") if k and k in CATEGORIES]
-        cats = sorted(cats, key=lambda k: (-(getattr(r, f"s8_{k}", 0) or 0), ORDER.index(k) if k in ORDER else 99))
-        watch = [w for w in str(r.watch8).split(",") if w]
-        cfg = [c for c in str(r.cfg).split(",") if c in CATEGORIES]
-        if r.sev_rule == "C":
-            cats = cats + ["count_on"] if "count_on" not in cats else cats
-        pers = persisting_categories(r) if r.sev_rule == "P" else set()
-        lane = _lanes_txt(r)
-        lab = _label(r) + (f" ({lane})" if lane and set(cats) & LANE_CATS else "")
-        parts, catl = [], []
-        for k in cats:
-            v = getattr(r, f"s8_{k}", np.nan)
-            sev = "bad" if (np.isfinite(v) and v >= 0.75) else "suspect"
-            if r.sev_rule == "C" and k == "count_on":
+    for r in hc.rows_of(X):
+        st = r.health_st
+        keys = [k for k in str(r.left).split(",") if k]
+        if r.sev_rule == "C" and "count_on" not in keys:
+            keys.append("count_on")
+        sc = {k: (getattr(r, f"s8_{k}") if np.isfinite(getattr(r, f"s8_{k}")) else 0.0) for k in keys}
+        # one category per check: its severity is its worst finding's
+        cats = {}
+        for k in keys:
+            c = CATEGORY[k]
+            sev = "bad" if sc[k] >= 0.75 else "suspect"
+            if (r.sev_rule == "C" and k == "count_on") or (r.sev_rule == "F" and k == "rapid"):
                 sev = "suspect"
-            elif r.sev_rule == "P" and k in pers:
+            elif r.sev_rule == "P" and (k == "prof" or (k == "dropout" and r.silent_h >= PERSIST_H)):
                 sev = "bad"
-            catl.append(f"{CATEGORIES[k]} ({sev})")
-            parts.append(f"{CATEGORIES[k]}: {_evidence(k, r, eps, start)}")
-        if "occ_hi" in watch:
-            catl.append(f"{CATEGORIES['occ_hi']} (watch)")
+            v = cats.setdefault(c, {"sev": sev, "s": sc[k], "keys": []})
+            v["keys"].append(k)
+            if sev == "bad":
+                v["sev"] = "bad"
+            v["s"] = max(v["s"], sc[k])
+        order = sorted(cats, key=lambda c: (-cats[c]["s"], KEYS.index(cats[c]["keys"][0])))
+        lane = _lanes_txt(r)
+        lab = _label(r) + (f" ({lane})" if lane and set(keys) & LANE_CATS else "")
+        catl = [f"{c} ({cats[c]['sev']})" for c in order]
+        parts = [f"{c}: " + "; ".join(_evidence(k, r, eps) for k in cats[c]["keys"]) for c in order]
         wtxt = []
-        for w in watch:
-            if w == "occ_hi":
-                wtxt.append("ON longer than similar zones")
-            elif w in ("no_yardstick", "no_yardstick_chop"):
-                wtxt.append("no healthy phase mate to compare with")
-            elif w == "short_on":
-                wtxt.append("many ONs last 0.2 s or less for a presence zone")
-            elif w in CATEGORIES:
-                wtxt.append(f"borderline {CATEGORIES[w].lower()}")
+        if r.w_no_yardstick:
+            wtxt.append("no healthy phase mate to compare with")
+        for k in [x for x in str(r.border).split(",") if x] + (["dropout"] if r.w_dropout_short else []):
+            wtxt.append(f"borderline {CATEGORY[k].lower()}")
+        wtxt = list(dict.fromkeys(wtxt))
         if st in ("suspect", "bad"):
             reason = f"{lab} - " + "; ".join(parts) if parts else f"{lab} - {st}"
         elif st == "watch":
-            reason = f"{lab} - watch: " + "; ".join(dict.fromkeys(wtxt)) if wtxt else f"{lab} - watch"
+            reason = f"{lab} - watch: " + "; ".join(wtxt) if wtxt else f"{lab} - watch"
         elif st == "not_enough_data":
             reason = f"{lab} - too few actuations to judge"
         else:
             reason = f"{lab} - nothing unusual"
-        conf = "; ".join(f"{CATEGORIES[c]}: {_evidence(c, r, eps, start)}" for c in cfg)
-        per = []
-        if "stuck" in cats or st in ("suspect", "bad"):
-            for x in eps.get(int(r.detector), []):
-                if x["label"] != "queue" and "stuck" in cats:
-                    per.append(dict(start=str(x["t0"]), end=str(x["t1"]), what="stuck on", recovered=None))
-        for k, what in (("dropout", "silent"), ("night_drop", "silent at night")):
-            if k in cats and np.isfinite(r.drop_b0) and np.isfinite(r.drop_b1) and \
-                    (k == "dropout" or bool(getattr(r, "silent_night", False))):
-                per.append(dict(start=str(r.t_start + _td(seconds=300 * float(r.drop_b0))),
-                                end=str(r.t_start + _td(seconds=300 * float(r.drop_b1))), what=what,
-                                recovered=None))
-        if "level" in cats and pd.notna(r.drop_at):
-            per.append(dict(start=str(r.drop_at), end=str(end), what="counts dropped", recovered=None))
-        if "shape24" in cats and pd.notna(r.tod_day):
-            a = pd.Timestamp(r.tod_day) + _td(hours=int(r.bd_ev_h0))
-            per.append(dict(start=str(a), end=str(a + _td(hours=int(r.bd_ev_h1) - int(r.bd_ev_h0) + 1)),
-                            what="unusual daily pattern", recovered=None))
-        per = sorted(per, key=lambda x: x["start"])
+        conf = f"{CONFIG[r.cfg]}: {_evidence(r.cfg, r, eps)}" if r.cfg else ""
+        per = _periods(r, keys, eps, per_bins, start, end) if st in ("suspect", "bad") else []
         rows.append(dict(detector=int(r.detector), health_status=st,
-                         health_score=float(r.score8) if np.isfinite(r.score8) else np.nan,
+                         health_score=float(r.score) if np.isfinite(r.score) else np.nan,
                          health_reason=reason, health_bad_periods=per, health_categories="; ".join(catl),
-                         health_config=conf, health_watch="; ".join(dict.fromkeys(wtxt))))
+                         health_config=conf, health_watch="; ".join(wtxt)))
     return pd.DataFrame(rows, columns=OUT_COLS)
 
 
 def _fallback(H):
-    """detectors without a known predicted function: the rule checks of health_core as they are."""
-    out = pd.DataFrame({"detector": H.detector.astype(int), "health_status": H.status2 if "status2" in H else H.status,
-                        "health_score": H.health_score,
-                        "health_reason": [f"det {int(d)}: " + str(x).split("; note: ")[0] for d, x in
-                                          zip(H.detector, H.reason.fillna(""))],
-                        "health_bad_periods": [[dict(start=str(p["start"]), end=str(p["end"]), what=p["what"],
-                                                     recovered=p.get("recovered")) for p in (L or [])]
-                                               if isinstance(L, list) else [] for L in H.bad_periods],
-                        "health_categories": "", "health_config": "", "health_watch": ""})
-    return out
+    """detectors without a known predicted function: the stage-1 rule checks as they are."""
+    return pd.DataFrame({"detector": H.detector.astype(int), "health_status": H.status2 if "status2" in H else H.status,
+                         "health_score": H.health_score,
+                         "health_reason": [f"det {int(d)}: " + str(x) for d, x in zip(H.detector, H.reason.fillna(""))],
+                         "health_bad_periods": [[dict(start=str(p["start"]), end=str(p["end"]), what=p["what"],
+                                                      recovered=p.get("recovered")) for p in (L or [])]
+                                                if isinstance(L, list) else [] for L in H.bad_periods],
+                         "health_categories": "", "health_config": "", "health_watch": ""})

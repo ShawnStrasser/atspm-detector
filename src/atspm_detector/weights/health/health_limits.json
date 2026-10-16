@@ -1,0 +1,237 @@
+{
+ "version": "health 1.1.0 (notes 147m, 150)",
+ "rule": "Every pair is [suspect limit, bad limit]; a single finding is suspect at the first number and BAD from the second.  24-h samples (and longer): the user-reviewed Proposed limits (notes 147-147m) per function | lane span [| Count mode].  When the model is unsure of the function (top probability < .7) the least strict of the plausible functions applies.  Shorter samples: the 1.0.1 limits (health_v4_refs.json) with the bad starts in 'short'.",
+ "h24": {
+  "stuck_s": {
+   "Advance|1": [
+    606.819377627,
+    1800.0
+   ],
+   "Advance|2+": [
+    710.635480449,
+    1800.0
+   ],
+   "Presence|1": [
+    606.819377048,
+    3600.0
+   ],
+   "Presence|2+": [
+    924.222127102,
+    3600.0
+   ],
+   "Count|1|pulse": [
+    342.090105353,
+    1200.0
+   ],
+   "Count|1|normal": [
+    2159.337067371,
+    2159.469950268
+   ],
+   "Count|2+|pulse": [
+    342.090105353,
+    1200.0
+   ],
+   "Count|2+|normal": [
+    749.462875665,
+    1458.628300179
+   ],
+   "Yellow_Red|1": [
+    328.333559032,
+    1200.0
+   ],
+   "Yellow_Red|2+": [
+    710.635480449,
+    1200.0
+   ],
+   "Mid|1": [
+    606.819377048,
+    2100.0
+   ],
+   "Mid|2+": [
+    710.635480161,
+    2100.0
+   ],
+   "Bike|1": [
+    328.333559032,
+    600.0
+   ],
+   "Bike|2+": [
+    328.333559032,
+    600.0
+   ],
+   "Other|1": [
+    881.624355227,
+    3600.0
+   ],
+   "Other|2+": [
+    924.222127102,
+    3600.0
+   ]
+  },
+  "silent_exp": {
+   "Advance|1": [
+    23.589250055,
+    756.704318903
+   ],
+   "Advance|2+": [
+    11.653101112,
+    77.503311673
+   ],
+   "Presence|1": [
+    24.836852771,
+    147.222879645
+   ],
+   "Presence|2+": [
+    25.44293518,
+    25.444501514
+   ],
+   "Count|1": [
+    22.851456978,
+    177.198200529
+   ],
+   "Count|2+": [
+    16.181775084,
+    51.908471294
+   ],
+   "Yellow_Red|1": [
+    24.489525225,
+    42.513393988
+   ],
+   "Yellow_Red|2+": [
+    17.803387272,
+    42.012776556
+   ],
+   "Mid|1": [
+    18.609944848,
+    18.61109069
+   ],
+   "Mid|2+": [
+    6.688239183,
+    1253.69109513
+   ],
+   "Bike|1": [
+    19.143709744,
+    19.144888434
+   ],
+   "Bike|2+": [
+    19.143709744,
+    19.144888434
+   ],
+   "Other|1": [
+    54.589934263,
+    150.19586738
+   ],
+   "Other|2+": [
+    124.399294409,
+    585.728912925
+   ]
+  },
+  "busy_z": {
+   "Advance|1": 2.900778577,
+   "Advance|2+": 2.394314778,
+   "Presence|1": 3.711525417,
+   "Presence|2+": 3.667360721,
+   "Count|1": 2.900778577,
+   "Count|2+": 2.900778577,
+   "Yellow_Red|1": 2.900778577,
+   "Yellow_Red|2+": 2.686465366,
+   "Mid|1": 3.161702698,
+   "Mid|2+": 2.791566081,
+   "Bike|1": 3.674402063,
+   "Bike|2+": 3.674402063,
+   "Other|1": 3.724573474,
+   "Other|2+": 2.686465366
+  }
+ },
+ "hold_floor_s": 300.0,
+ "common_hold_s": 5.0,
+ "count_held_on_min": [
+  30.0,
+  159.23076923076923
+ ],
+ "count_drops_geh": [
+  10.0,
+  13.076923076923077
+ ],
+ "night_geh": [
+  8.0,
+  10.461538461538462
+ ],
+ "occ_confirm": 0.8,
+ "night_silence_low_exp": 100.0,
+ "min_hours_counts": 3.0,
+ "too_many_h24_veh_h_lane": [
+  2100.0,
+  2358.4615384615386
+ ],
+ "busy": {
+  "mates_delta": 0.3,
+  "z_x": 0.5833333333333334,
+  "min_night": 20
+ },
+ "spiky": {
+  "bin_min": 10,
+  "window_bins": 6,
+  "ratio": 3.0,
+  "geh": 5.0,
+  "mates_min": 10.0,
+  "suspect": 2,
+  "bad": 3,
+  "daily_none": 200.0,
+  "daily_low": 500.0,
+  "geh_big": 10.0
+ },
+ "too_fast": {
+  "gap_s_stopbar": 0.8,
+  "gap_s_other": 0.6,
+  "stopbar": [
+   "Count",
+   "Presence",
+   "Yellow_Red"
+  ],
+  "min_ons": 50,
+  "min_gaps": 3,
+  "per_1000": {
+   "Advance|1": 188.1303618616211,
+   "Advance|2+": 188.1303618616211,
+   "Presence|1": 196.97746920883776,
+   "Presence|2+": 196.97746920883776,
+   "Count|1": 158.6942935224567,
+   "Count|2+": 158.6942935224567,
+   "Yellow_Red|1": 191.8147153598292,
+   "Yellow_Red|2+": 191.8147153598292,
+   "Mid|1": 170.27296207664892,
+   "Mid|2+": 170.27296207664892,
+   "Bike|1": 207.61904761904648,
+   "Bike|2+": 207.61904761904648,
+   "Other|1": 190.16502704672212,
+   "Other|2+": 190.16502704672212
+  },
+  "bad_x": 1.1678321678321677,
+  "pairs_share": 0.9
+ },
+ "current": {
+  "stuck_s": [
+   300.0,
+   900.0
+  ],
+  "silent_exp": 30.0,
+  "busy_z": 6.0,
+  "busy_z_mates_x": 0.5833333333333334,
+  "busy_mate_delta": 0.3,
+  "busy_min_night": 20,
+  "too_many_veh_h_lane": 1800.0
+ },
+ "short": {
+  "note": "samples under ~8.5 h: bad starts where the 1.0.1 score passed .75",
+  "stuck_bad": [
+   2215.3846153846157,
+   0.3846153846153846,
+   1.6153846153846154
+  ],
+  "n_holds_bad_x": 1.6153846153846154,
+  "silent_bad_x": 2.435897435897436,
+  "too_fast_bad_x": 1.6153846153846154,
+  "too_many_bad_x": 1.6153846153846154
+ }
+}

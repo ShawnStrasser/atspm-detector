@@ -97,7 +97,8 @@ One row per event, standard Indiana hi-res format: `DeviceId` (any signal id), `
 | 3 hours | 98.2 % | 92.9 % | best for phase and function (3 to 24 hours) |
 | 24 hours | 98.4 % | 92.5 % | full health check |
 
-On the 115 test signals. Health runs on any length; time-of-day checks need a full day, night speed midnight to 5 am.
+On the 115 test signals. Health runs on any length; busy at night needs a full day, count drops, night misses and spiky
+counts 3 hours; night speed needs midnight to 5 am.
 
 ## How it works
 
@@ -128,21 +129,40 @@ All labels come from one agency; other agencies' conventions may differ.
 off the cabinet print on about 6 % of 5,254 (hand labels 9.7 %). Where model and hand label differed, the timing backed
 the model 104 times to 24, the print 398 to 177. Prints can be out of date.
 
-**Health:** flagged 19 of 20 detectors a traffic engineer judged faulty, and none of the 12 judged fine.
-Flagged (suspect or bad) per 100 detectors: 0.4 on 30 minutes, 1.2 on 3 hours, 3.9 on 24 hours. Not field-verified.
+**Health:** flagged 14 of 20 detectors a traffic engineer judged faulty, and 3 of the 12 judged fine.
+Flagged (suspect or bad) per 100 detectors: 0.7 on 30 minutes, 0.9 on 3 hours, 4.4 on 24 hours. Not field-verified.
 
 ## Detector health
 
-Each detector gets a status, a plain-words reason, the periods affected and the categories, judged against what is
-normal for its type (function x lanes x sample length). Checks: stuck on, goes silent, count drops, misses vehicles at
-night, erratic counts, too-fast actuations, chattering, too many for the traffic, erratic time ON, busy at night,
-unusual daily pattern, Count zone held ON. **Bad** = one strong finding, two checks agreeing, or 4+ hours of the day.
+Each detector gets a status (ok, watch, suspect, bad, not enough data), a plain-words reason, the periods affected and
+the categories, judged against what is normal for its type (function x lanes x sample length). Six checks:
+
+1. **Stuck on**: held ON longer than its type allows, and not a queue. On 24 hours suspect from 5 to 15 minutes by
+   type; bad from 10 minutes for a bike zone, 20 for Count and Yellow_Red, 30 for Advance, 35 for Mid, 60 for Presence
+   and Other. Several detectors (not two inputs of one zone) held ON together, starting and ending within 5 seconds:
+   one common failure, bad, with a note for the signal. A Count zone: also held ON in light traffic.
+2. **Counts fall**: goes silent while its phase mates keep counting, or its hourly count drops against theirs (GEH 10
+   suspect, 13 bad) while its own occupancy drops too.
+3. **Misses vehicles at night**: far fewer actuations from 9 pm to 5 am than its phase mates suggest (GEH 8 suspect,
+   10.5 bad). A night silence with fewer than 100 vehicles expected is suspect at most.
+4. **Busy at night**: much busier from 1 to 5 am than its type, and busier than its phase mates (needs a full day).
+5. **Too fast / too many**: ONs closer together than vehicles can follow (under 0.8 s per lane at the stop bar,
+   0.6 s elsewhere; a zone spanning 2+ lanes keeps the 1-lane limit), or more vehicles than a lane can carry (busiest
+   5 minutes over 2,100 per hour per lane suspect, 2,360 bad).
+6. **Spiky counts**: bursts in 10-minute counts at least 3 times its own level of the surrounding 2 hours (and GEH 5 or
+   more) that its phase mates do not share: 2 in a day suspect, 3 bad. Not checked under 200 vehicles a day; under 500,
+   suspect at most unless a burst is very large.
+
+Bike zones get no counts-fall or night check. **Bad** = a finding past its bad limit, two kinds of evidence, or a problem
+lasting 4+ hours of the day (busy at night, silent 4 h); otherwise **suspect** (a presence or other zone that only
+flickers evenly with traffic stays suspect). **Watch** = borderline, or no healthy phase mate to compare with. The limits
+are in `weights/health/health_limits.json` as [suspect, bad] per check and type; under about 8 hours of data stuck on,
+goes silent and too many keep the 1.0 limits. Flagged (suspect or bad) on 755 training signals: 4.4 % of detectors on 24
+hours (2.3 % suspect, 2.1 % bad), 0.9 % on 3 hours, 0.7 % on 30 minutes. Not field-verified.
 
 ![Stuck on: a Presence detector held ON three times in one day](https://raw.githubusercontent.com/ShawnStrasser/atspm-detector/main/docs/images/health_stuck_on.png)
 
 ![Busy at night: a detector ON 62 % of the time from 1 to 5 am](https://raw.githubusercontent.com/ShawnStrasser/atspm-detector/main/docs/images/health_busy_at_night.png)
-
-![Unusual daily pattern: an advance loop goes quiet at midday while its partner keeps counting](https://raw.githubusercontent.com/ShawnStrasser/atspm-detector/main/docs/images/health_unusual_day.png)
 
 ## License
 

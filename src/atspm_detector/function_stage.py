@@ -133,7 +133,7 @@ def run(con, top: pd.DataFrame, model_dir: Path, b0: float, b1: float, streams: 
         fr["n_lanes_spanned"] = 0
         fr["pk_span"], fr["stack_n"] = False, np.nan
         fr["pk_span_peers"], fr["pk_coloc_peers"] = "", ""
-        ph_t = pd.DataFrame()
+        ph_t, det_t, lctx = pd.DataFrame(), pd.DataFrame(), {}
         if lane_regime:
             # ---- lanes D (on the trees' function: the lane model was trained on it)
             Fm = np.hstack([g[feats].to_numpy(np.float64, na_value=np.nan), pt]).astype(np.float32)
@@ -143,7 +143,7 @@ def run(con, top: pd.DataFrame, model_dir: Path, b0: float, b1: float, streams: 
             ont = {(dev, int(d)): (on[int(d)], hour[int(d)]) for d in on}
             try:
                 ph_t, det_t = lane_mod.lanes(ont, pr, M["lanes"], b0, b1, fmat, inject.get("lane_probs"),
-                                             inject.get("lane_decoder"))
+                                             inject.get("lane_decoder"), ctx=lctx)
             except Exception as exc:                                      # pragma: no cover
                 log(f"lanes unavailable for {dev} ({type(exc).__name__}: {exc})")
                 ph_t, det_t = pd.DataFrame(), pd.DataFrame()
@@ -193,6 +193,15 @@ def run(con, top: pd.DataFrame, model_dir: Path, b0: float, b1: float, streams: 
             pos = {int(d): j for j, d in enumerate(dets)}
             tw = {pos[a]: {pos[b] for b in bs if b in pos} for a, bs in tw_det.items() if a in pos}
             pred = AD.twin_decode(Ps, pred, tw, n_on_frame >= 5, ("Count", "Yellow_Red"), "cy")
+        bikes = [int(d) for d, k in zip(dets, pred) if C7[k] == "Bike"]
+        if len(det_t) and bikes and dev in lctx:
+            # a final Bike zone covers one lane and never adds a lane to its phase (note 148); after the decision,
+            # so phase and function are unchanged
+            ph_t, det_t = lane_mod.bike_one_lane(dev, lctx[dev], ph_t, det_t, bikes)
+            lt = det_t.set_index(det_t.Detector.astype(int)).reindex(dets)
+            fr["lanes_out"] = lt.lanes.fillna("").to_numpy(object)
+            fr["n_lanes_spanned"] = lt.n_lanes_spanned.fillna(0).astype(int).to_numpy()
+            fr["lane_conf"] = lt.lane_conf.astype(float).to_numpy()
         out = pd.DataFrame({"DeviceId": dev, "Detector": dets})
         out["function_pred"] = np.array(C7, object)[pred]
         out["function_prob"] = Ps[np.arange(len(dets)), pred]

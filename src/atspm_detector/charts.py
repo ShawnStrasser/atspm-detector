@@ -6,8 +6,8 @@
     health_chart("day.parquet", out, detector=15, path="det15.png")
 
 One chart per detector, built from the package's own outputs and the log: the detector (thick) and its phase mates
-(thin) over the sample, counts per 15 min on top and % ON per 15 min below, real units; the periods the health check lists (stuck on, silent, counts dropped, unusual
-daily pattern) are shaded.  Title = the health categories; subtitle = 'det 15: P5 Presence', signal, sample, status;
+(thin) over the sample, counts per 15 min on top and % ON per 15 min below, real units; every period the health check
+lists (health_bad_periods) is shaded.  Title = the health categories; subtitle = 'det 15: P5 Presence', signal, sample, status;
 the reason line is printed under the chart.  Nothing is re-scored: the chart shows the answers as given.
 """
 from __future__ import annotations
@@ -20,7 +20,9 @@ import pandas as pd
 
 THIS, BAD, MUTED, GRID, INK = "#1f4e9c", "#d32f2f", "#8a8984", "#e6e5e0", "#1a1a1a"
 SHADE = {"stuck on": "#f8c9c4", "silent": "#f3d9a4", "silent at night": "#f3d9a4", "counts dropped": "#f3d9a4",
-         "unusual daily pattern": "#e3dcf3"}
+         "unusual daily pattern": "#e3dcf3", "count zone held ON": "#f8c9c4", "erratic time ON": "#f8c9c4",
+         "chattering": "#cfe3f3", "too-fast actuations": "#cfe3f3", "too many for the traffic": "#cfe3f3",
+         "erratic counts": "#e3dcf3", "busy at night": "#e3dcf3", "spiky counts": "#e3dcf3"}
 MATES = ["#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7", "#7a7a75", "#008300", "#8c564b", "#17becf",
          "#bcbd22", "#9e9ac8", "#c49c94"]
 
