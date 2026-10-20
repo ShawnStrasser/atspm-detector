@@ -56,6 +56,9 @@ results[["Detector", "phase_pred", "phase_prob", "function_pred", "function_prob
          "lanes", "distance_ft", "health_status"]].round(2).head()
 ```
 
+Events already in DuckDB? `health(con, "events", "detectors")` (or the SQL text from `health_sql(...)`) runs the
+detector health on your own connection without copying the data out; see [docs/embedding.md](docs/embedding.md).
+
 ```text
    Detector  phase_pred  phase_prob function_pred  function_prob lanes  distance_ft    health_status
 0         2           2        0.99       Advance           0.90     2        164.0               ok

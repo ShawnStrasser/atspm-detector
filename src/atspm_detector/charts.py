@@ -51,14 +51,34 @@ def _events(events, device_id):
 
 
 def _bins(ev, t0, t1, bs=900):
-    """counts and % ON per 15 min of every channel (health_core.events_to_bins: continuous ONs, the health view)."""
-    from . import health_core as hc
-    t = (ev.Timestamp - t0).dt.total_seconds().to_numpy()
-    P_ = hc.prep_arrays(t, ev.EventId.to_numpy(), ev.Parameter.to_numpy())
-    B = hc.events_to_bins(P_, t0, t1, bin_s=bs)
-    x = t0 + pd.to_timedelta(np.arange(B["n_on"].shape[1]) * bs + bs / 2, unit="s")
-    return {int(d): (B["n_on"][i].astype(float), 100 * B["occ"][i].astype(float) / bs) for i, d in
-            enumerate(B["dets"])}, x
+    """counts and % ON per 15 min of every channel, the health view: an ON after a non-ON starts a continuous ON that
+    lasts to the channel's next OFF (ONs logged again inside it count, but add no time ON; one over a gap of > 120 s
+    without a detector event adds none either); a channel whose first event is an OFF was ON from the start."""
+    T = (t1 - t0).total_seconds()
+    nb = int(np.ceil(T / bs))
+    ut = np.unique((ev.Timestamp - t0).dt.total_seconds().to_numpy())
+    g0 = ut[:-1][np.diff(ut) > 120.0]
+    out = {}
+    for d, g in ev.sort_values(["Parameter", "Timestamp", "EventId"], ascending=[True, True, False]).groupby("Parameter"):
+        t = (g.Timestamp - t0).dt.total_seconds().to_numpy()
+        e = g.EventId.to_numpy()
+        on = e == 82
+        n = np.bincount(np.minimum((t[on] // bs).astype(int), nb - 1), minlength=nb).astype(float)[:nb]
+        occ = np.zeros(nb)
+        starts = np.flatnonzero(on & (np.r_[0, e[:-1]] != 82))
+        offs = np.flatnonzero(~on)
+        k = np.searchsorted(offs, starts)
+        ends = np.array([t[offs[j]] if j < len(offs) else T for j in k], float)
+        iv = [(a, z) for a, z in zip(t[starts], ends)
+              if not (z - a > 60 and ((g0 >= a) & (g0 < z)).any())]
+        if len(e) and e[0] == 81:
+            iv.append((0.0, t[0]))
+        for a, z in iv:
+            for b in range(int(a // bs), min(int(z // bs), nb - 1) + 1):
+                occ[b] += max(min(z, (b + 1) * bs) - max(a, b * bs), 0.0)
+        out[int(d)] = (n, 100 * occ / bs)
+    x = t0 + pd.to_timedelta(np.arange(nb) * bs + bs / 2, unit="s")
+    return out, x
 
 
 def health_chart(events, out: pd.DataFrame, detector: int, device_id=None, path=None, max_mates: int = 12):

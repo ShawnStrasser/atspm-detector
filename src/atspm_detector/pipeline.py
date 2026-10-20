@@ -35,7 +35,8 @@ Pipeline (every model runs on the CPU with onnxruntime; no lightgbm / torch / sc
             probabilities, stack size, span / track / co-location, lanes, phase- and lane-mates) -> per-lane decode
             (lane confidence >= .9); samples under 30 min: no lanes, Count / Yellow_Red twin decode instead
   side      lanes (from 30 min), setback distance, night speed: computed from the log and the answers above
-  health    six rule checks on the log (health_core.py, health_v4.py, health_counts.py) against per-type limits
+  health    six rule checks on the log (health_duckdb.py: DuckDB SQL on `evd`, all signals of a batch in one run)
+            against per-type limits
             (function x lane span x sample length; weights/health), computed AFTER classification and reported next
             to it; it never changes a phase or function answer (only the review flag / reason).  Busy at night needs
             a full day; count drops, night misses and spiky counts need 3 h
@@ -86,8 +87,7 @@ from . import features_lag as f3
 from . import features_partner as f2
 from . import function as fn
 from . import function_stage as fs
-from . import health_core as hc
-from . import health_v4 as hv4
+from . import health_duckdb as hsql
 from . import night_speed as ns_mod
 from . import setback as sb_mod
 from . import similarity as sim_mod
@@ -786,112 +786,60 @@ def _ts(sec: float) -> pd.Timestamp:
     return pd.Timestamp("1970-01-01") + _td(seconds=float(sec))
 
 
-def _periods_json(L) -> str:
-    if not isinstance(L, list) or not L:
-        return ""
-    return json.dumps([{"start": str(d["start"]), "end": str(d["end"]), "what": d["what"],
-                        "recovered": d.get("recovered")} for d in L])
-
-
 def _lane_tuple(s) -> tuple:
     if not isinstance(s, str):
         return ()
     return tuple(int(x) for x in s.split(",") if x.strip().isdigit())
 
 
-HEALTH_FETCH_SIGNALS = 10   # health runs for this many signals at a time (bounds memory; larger gains nothing)
-COV_BIN_NS = 300 * 1_000_000_000
+HEALTH_COLS = ["health_status", "health_score", "health_reason", "health_bad_periods", "health_watch",
+               "health_categories", "health_config", "health_signal_note"]
 
 
-def _health_prep(con, W: pd.DataFrame) -> hc.Prep:
-    """one health_core.Prep for the signals of W (rows in signal order, all sharing one window [b0, b1)), straight
-    from `evd` (already de-duplicated and channel-filtered) in DuckDB (note 152): the detector events sorted by
-    (signal, channel, time, ON before OFF), the colour events, the comms gaps (no event of any allowed code for
-    > GAP_S s) and the 5-min bins with any event.  Times are seconds from the window start (exact: integer nanoseconds
-    / 1e9); the bins are integer nanoseconds // 300 s (= the bin of that time)."""
-    codes = ",".join(str(c) for c in hc.ALLOWED)
-    con.execute("CREATE OR REPLACE TEMP TABLE hwin (dev SMALLINT, s INTEGER, s_ns BIGINT, e_ns BIGINT)")
-    con.executemany("INSERT INTO hwin VALUES (?, ?, ?, ?)",
-                    [(int(d), k, int(_ts(a).value), int(_ts(b).value)) for k, (d, a, b) in
-                     enumerate(zip(W.dev, W.b0, W.b1))])
-    con.execute(f"CREATE OR REPLACE TEMP TABLE hsel AS SELECT w.s, epoch_ns(e.Timestamp) - w.s_ns AS dn, e.EventId, "
-                f"e.Parameter FROM evd e JOIN hwin w USING (dev) WHERE e.EventId IN ({codes}) "
-                f"AND epoch_ns(e.Timestamp) >= w.s_ns AND epoch_ns(e.Timestamp) < w.e_ns")
-    try:
-        d = con.execute("SELECT s, dn::DOUBLE / 1e9 AS t, EventId, Parameter FROM hsel WHERE EventId IN (81, 82) "
-                        "ORDER BY s, Parameter, dn, EventId <> 82").fetchnumpy()
-        c = con.execute(f"SELECT s, dn::DOUBLE / 1e9 AS t, EventId, Parameter FROM hsel "
-                        f"WHERE EventId IN ({','.join(str(x) for x in hc.COLOUR)}) ORDER BY s, Parameter, dn, EventId"
-                        ).fetchnumpy()
-        # consecutive event times (ties are 0 apart): each pair of consecutive distinct times appears once
-        g = con.execute(f"SELECT s, t, nt FROM (SELECT s, dn::DOUBLE / 1e9 AS t, lead(dn::DOUBLE / 1e9) OVER "
-                        f"(PARTITION BY s ORDER BY dn) AS nt FROM hsel) WHERE nt - t > {hc.GAP_S} "
-                        f"ORDER BY s, t").fetchnumpy()
-        v = con.execute(f"SELECT DISTINCT s, dn // {COV_BIN_NS} AS b FROM hsel").fetchnumpy()
-    finally:
-        con.execute("DROP TABLE IF EXISTS hsel")
-    S = len(W)
-    P = hc.Prep()
-    P.S, P.names, P.cache, P.ut, P.usig = S, list(W.DeviceId.astype(str)), {}, None, None
-    ds = np.asarray(d["s"], np.int64)
-    P.td, P.ed = np.asarray(d["t"], np.float64), np.asarray(d["EventId"]).astype(int)
-    P.pd_ = ds * hc.BASE + np.asarray(d["Parameter"]).astype(np.int64)
-    cs = np.asarray(c["s"], np.int64)
-    P.t, P.eid, P.tsig = np.asarray(c["t"], np.float64), np.asarray(c["EventId"]).astype(int), cs
-    P.par = cs * hc.PB + np.asarray(c["Parameter"]).astype(np.int64)
-    P.csorted = True                          # sorted by (signal, phase, time, code) = by (phase key, time, code)
-    P.g0, P.g1, P.gsig = np.asarray(g["t"], np.float64), np.asarray(g["nt"], np.float64), np.asarray(g["s"], np.int64)
-    vs, vb = np.asarray(v["s"], np.int64), np.asarray(v["b"], np.int64)
-    P.empty = not (len(P.td) or len(P.t) or len(vs))
+def _health(con, W: pd.DataFrame, d: pd.DataFrame, notes: dict) -> pd.DataFrame:
+    """Detector health of every signal of W in DuckDB (health_sql, note 153), straight from `evd` on this connection:
+    the classifier's answers per detector (raw predicted phase, final function, class probabilities, lane span -- a
+    bike zone covers one lane) and each signal's sample window [b0, b1).  A batch that fails is retried signal by
+    signal, so a failure only marks its own signal."""
+    fp = d.function_pred.where(d.function_pred.map(lambda v: isinstance(v, str)))
+    lanes = d.n_lanes_spanned.astype(float).where(d.n_lanes_spanned.astype(float) > 0)
+    det = pd.DataFrame({"DeviceId": d.DeviceId.astype(str), "Detector": d.Detector.astype(int),
+                        "phase": d.phase_pred.astype(float), "function": fp.astype(object),
+                        "lanes": np.where(fp.eq("Bike") & lanes.notna(), 1.0, lanes)})
+    for c in PROB_COLS:
+        det[c] = d[c].astype(float)
+    win = pd.DataFrame({"DeviceId": W.DeviceId.astype(str),
+                        "s_ns": [int(_ts(b).value) for b in W.b0], "e_ns": [int(_ts(b).value) for b in W.b1]})
 
-    def covs(nb, bin_s):                      # bins of bin_s seconds (a multiple of 5 min) with any event
-        k = int(bin_s) // 300
-        assert k * 300 == int(bin_s), "coverage bins are multiples of 5 min"
-        out = np.zeros((S, nb * k), bool)
-        ok = vb < nb * k
-        out[vs[ok], vb[ok]] = True
-        return out.reshape(S, nb, k).any(2)
-    P.covs = covs
-    return P
-
-
-def _health_items(g: pd.DataFrame) -> dict:
-    """the classifier's answers of one signal as health_v4.assess takes them."""
-    return dict(phase={int(k): float(v) for k, v in zip(g.Detector, g.phase_pred) if pd.notna(v)},
-                phase_conf={int(k): float(v) for k, v in zip(g.Detector, g.phase_prob) if pd.notna(v)} or None,
-                fn_prob={int(r.Detector): {c: float(getattr(r, pc)) for c, pc in zip(FUNC_CLASSES, PROB_COLS)}
-                         for r in g.itertuples() if pd.notna(r.p_advance)},
-                lanes={int(k): (1.0 if f == "Bike" else float(v))       # a bike zone covers one lane (note 148)
-                       for k, v, f in zip(g.Detector, g.n_lanes_spanned, g.function_pred) if pd.notna(v) and v > 0},
-                fn_label={int(k): v for k, v in zip(g.Detector, g.function_pred) if isinstance(v, str)})
-
-
-def _health(con, wpart: pd.DataFrame, dg: dict, notes: dict) -> dict:
-    """{DeviceId: (table, signal note)} for the signals of wpart: one batched assess per group of signals sharing a
-    window; a group that fails is retried signal by signal, so a failure only marks its own signal."""
-    res = {}
-    groups: dict = {}
-    for k, (b0, b1) in enumerate(zip(wpart.b0, wpart.b1)):
-        groups.setdefault((float(b0), float(b1)), []).append(k)
-
-    def run(rows):
-        Wg = wpart.iloc[rows].reset_index(drop=True)
-        devs = list(Wg.DeviceId.astype(str))
+    def run(ids):
+        con.register("hq_in_det", det[det.DeviceId.isin(ids)])
+        con.register("hq_in_win", win[win.DeviceId.isin(ids)])
         try:
-            P = _health_prep(con, Wg)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                out = hv4.assess_group(P, _ts(Wg.b0.iat[0]), _ts(Wg.b1.iat[0]), [_health_items(dg[x]) for x in devs])
-            res.update(zip(devs, out))
-        except Exception as exc:                                   # pragma: no cover
-            if len(rows) > 1:
-                for r in rows:
-                    run([r])
-            elif not any(n.startswith("health unavailable") for n in notes.get(devs[0], [])):
-                notes.setdefault(devs[0], []).append(f"health unavailable for {devs[0]} ({type(exc).__name__})")
-    for rows in groups.values():
-        run(rows)
-    return res
+            return hsql.health(con, "evd", "hq_in_det", windows_table="hq_in_win", max_events=None, distinct=False)
+        finally:
+            con.unregister("hq_in_det")
+            con.unregister("hq_in_win")
+    ids = list(win.DeviceId)
+    try:
+        parts = [run(ids)] if ids else []
+    except Exception:                                              # pragma: no cover
+        parts = []
+        for x in ids:
+            try:
+                parts.append(run([x]))
+            except Exception as exc:
+                notes.setdefault(x, []).append(f"health unavailable for {x} ({type(exc).__name__})")
+    parts = [h for h in parts if len(h)]
+    if not parts:
+        return pd.DataFrame(columns=["DeviceId", "Detector"] + HEALTH_COLS)
+    h = pd.concat(parts, ignore_index=True)
+    h["DeviceId"] = h.DeviceId.astype(str)
+    h["Detector"] = h.Detector.astype(int)
+    h["health_score"] = h.health_score.astype(float)
+    for c in HEALTH_COLS:
+        if c != "health_score":
+            h[c] = h[c].astype(object)
+    return h
 
 
 def _setback(con, d: pd.DataFrame, W: pd.DataFrame, model_dir: Path, notes: dict) -> pd.DataFrame:
@@ -940,7 +888,7 @@ def post_outputs(con, W: pd.DataFrame, univ: pd.DataFrame,
         for c in PROB_COLS + extra:
             d[c] = np.nan
     notes: dict = {}
-    h_parts, sp_det, sp_ph = [], [], []
+    sp_det, sp_ph = [], []
     bw = {str(x): (float(a), float(b)) for x, a, b in zip(W.DeviceId, W.b0, W.b1)}
     pt = lph.copy() if lph is not None and len(lph) else pd.DataFrame(columns=PHASE_COLS[:6])
     out = d[key].copy()
@@ -968,56 +916,40 @@ def post_outputs(con, W: pd.DataFrame, univ: pd.DataFrame,
     on_iv = on_iv if on_iv is not None else on_table(con, W)
     dg = {k: g for k, g in d.groupby("DeviceId", sort=True)}
     devs = sorted(dg)
-    wdev = W.set_index(W.DeviceId.astype(str))
-    for i0 in range(0, len(devs), HEALTH_FETCH_SIGNALS):
-        part = devs[i0:i0 + HEALTH_FETCH_SIGNALS]
-        hres = _health(con, wdev.loc[part].reset_index(drop=True), dg, notes)
-        for dev in part:
-            g = dg[dev]
-            b0, b1 = bw[dev]
-            if dev in hres:
-                h, sig_note = hres[dev]
-                if len(h):
-                    h = h.rename(columns={"detector": "Detector"})
-                    h.insert(0, "DeviceId", dev)
-                    h["health_signal_note"] = sig_note
-                    h_parts.append(h)
-            # night-time approach speed: advance -> lane-mate stop-bar zone, isolated night vehicles
-            try:
-                iv = on_iv.get(dev, {})
-                on = {k: v[0] for k, v in iv.items()}
-                off = {k: v[1] for k, v in iv.items()}
-                c = cyd.get(dev)
-                greens = ({} if c is None else
-                          {int(k): (np.maximum(x["gs"].to_numpy(float), b0), np.minimum(x["ge"].to_numpy(float), b1))
-                           for k, x in c.groupby("p")})
-                dl = []
-                for r in g.itertuples():
-                    if pd.isna(r.phase_pred) or not isinstance(r.function_pred, str):
-                        continue
-                    dl.append(dict(det=int(r.Detector), phase=int(r.phase_pred), function=r.function_pred,
-                                   lanes=_lane_tuple(r.lanes),
-                                   setback_ft=float(sbd.get((dev, int(r.Detector)), np.nan))))
-                dr, pr = ns_mod.night_speed(b0, b1, dl, on, off, greens)
-                for x in dr:
-                    sp_det.append((dev, int(x["det"]), x["speed_mph"], x["n"] if np.isfinite(x["speed_mph"]) else np.nan))
-                for x in pr:
-                    sp_ph.append((dev, int(x["phase"]), x["speed_mph"], x["n"] if np.isfinite(x["speed_mph"]) else np.nan))
-            except Exception as exc:                               # pragma: no cover
-                notes.setdefault(dev, []).append(f"night speed unavailable for {dev} ({type(exc).__name__}: {exc})")
+    hdf = _health(con, W, d, notes)
+    for dev in devs:
+        g = dg[dev]
+        b0, b1 = bw[dev]
+        # night-time approach speed: advance -> lane-mate stop-bar zone, isolated night vehicles
+        try:
+            iv = on_iv.get(dev, {})
+            on = {k: v[0] for k, v in iv.items()}
+            off = {k: v[1] for k, v in iv.items()}
+            c = cyd.get(dev)
+            greens = ({} if c is None else
+                      {int(k): (np.maximum(x["gs"].to_numpy(float), b0), np.minimum(x["ge"].to_numpy(float), b1))
+                       for k, x in c.groupby("p")})
+            dl = []
+            for r in g.itertuples():
+                if pd.isna(r.phase_pred) or not isinstance(r.function_pred, str):
+                    continue
+                dl.append(dict(det=int(r.Detector), phase=int(r.phase_pred), function=r.function_pred,
+                               lanes=_lane_tuple(r.lanes),
+                               setback_ft=float(sbd.get((dev, int(r.Detector)), np.nan))))
+            dr, pr = ns_mod.night_speed(b0, b1, dl, on, off, greens)
+            for x in dr:
+                sp_det.append((dev, int(x["det"]), x["speed_mph"], x["n"] if np.isfinite(x["speed_mph"]) else np.nan))
+            for x in pr:
+                sp_ph.append((dev, int(x["phase"]), x["speed_mph"], x["n"] if np.isfinite(x["speed_mph"]) else np.nan))
+        except Exception as exc:                                   # pragma: no cover
+            notes.setdefault(dev, []).append(f"night speed unavailable for {dev} ({type(exc).__name__}: {exc})")
     if sp_det:
         sdf = pd.DataFrame(sp_det, columns=["DeviceId", "Detector", "night_speed_mph", "night_speed_vehicles"])
         sdf["night_speed_mph"] = sdf.night_speed_mph.astype(float).round(1)
         out = out.merge(sdf, on=key, how="left")
-    if h_parts:
-        h = pd.concat(h_parts, ignore_index=True)
-        h["Detector"] = h.Detector.astype(int)
-        h["health_bad_periods"] = h.health_bad_periods.map(_periods_json)
-        # a detector too quiet to judge has no score, so filtering on health_score never keeps it by accident
-        h.loc[h.health_status.eq("not_enough_data"), "health_score"] = np.nan
-        out = out.merge(h[key + ["health_status", "health_score", "health_reason", "health_bad_periods",
-                                 "health_watch", "health_categories", "health_config", "health_signal_note"]],
-                        on=key, how="left")
+    if len(hdf):
+        # a detector too quiet to judge has no score (health_sql), so filtering on health_score never keeps it
+        out = out.merge(hdf[key + HEALTH_COLS], on=key, how="left")
     for c in POST_COLS:
         if c not in out.columns:
             out[c] = np.nan

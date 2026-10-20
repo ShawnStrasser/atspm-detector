@@ -514,16 +514,16 @@ def check_profile_ignored() -> str:
 CAT_RE = re.compile(r"^[A-Z][^();]* \((?:bad|suspect|watch)\)(?:; [A-Z][^();]* \((?:bad|suspect|watch)\))*$")
 
 
-def check_health_v4() -> str:
+def check_health() -> str:
     """Health smoke test -- the shipped references load; every detector gets a status and a reason
     that starts with its label; categories / config notes parse; a detector held ON for 12 minutes is called 'Stuck
     on' with the period listed, and nothing else in the sample turns bad."""
-    from . import health_v4 as hv
-    refs = hv._load_refs()
-    assert str(refs.d.get("version", "")).startswith("health v4d"), "health references missing or wrong"
-    assert set(refs.cell) == {"stuck_x", "n_ep"} and refs.g3 and refs.f118, "limit tables incomplete"
-    assert refs.tod_own["groups"], "time-of-day references missing"
-    lim = hv._load_limits()
+    from . import health_duckdb as hq
+    refs = hq._json("health_v4_refs.json")
+    assert str(refs.get("version", "")).startswith("health v4d"), "health references missing or wrong"
+    assert set(refs["cell"]["v4c"]) == {"stuck_x", "n_ep"} and refs["fast118c"], "limit tables incomplete"
+    assert refs["tod"]["groups"], "time-of-day references missing"
+    lim = hq._json("health_limits.json")
     assert str(lim.get("version", "")).startswith("health 1.1.0"), "health limits missing or wrong"
     tabs_ok = all(v[0] <= v[1] for t in ("stuck_s", "silent_exp") for v in lim["h24"][t].values())
     tabs_ok = tabs_ok and set(lim["h24"]) == {"stuck_s", "silent_exp", "busy_z"}
@@ -565,7 +565,7 @@ CHECKS = [("reproduces the stored answers", check_reproduces_reference),
           ("joint channel + phase permutation", check_joint_permutation),
           ("no hidden dependencies", check_no_hidden_dependencies),
           ("profile argument ignored", check_profile_ignored),
-          ("health smoke test", check_health_v4)]
+          ("health smoke test", check_health)]
 
 
 def main(argv=None) -> int:

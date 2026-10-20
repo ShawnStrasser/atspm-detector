@@ -1,6 +1,6 @@
 """Classifiability gate: which channels cannot be classified at all, and what to tell the user.
 
-This is NOT the detector health output -- that is `health_core.py` (status / score / reason / bad
+This is NOT the detector health output -- that is `health_duckdb.py` (status / score / reason / bad
 periods, notes 38-47), reported next to phase and function.  The gate below only decides when the
 phase / function answer is withheld.  Stage 02 found that the only detector pathology that costs
 phase accuracy is the absence of usable actuations, so the gate is a small, high-precision set:

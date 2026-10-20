@@ -33,7 +33,7 @@ ids = list_signals(events, start=None, end=None)        # DeviceIds present, sor
 - Concurrent calls in one process are not tested. Run one call at a time per process; for parallel work use a process pool (one signal or one group of signals per task).
 - DuckDB threads and memory: `predict(threads=, memory=)`. onnxruntime threads: environment variables `DC_TREE_THREADS` and `DC_NET_THREADS` (default 4 each). They are read at import, so set them before `import atspm_detector`.
 - Model sessions are loaded on first use and cached for the life of the process. Keep a worker process alive between calls instead of starting a new one for each signal.
-- Large batches: send many signals in one call; they are processed `batch_signals` at a time (default: half the free physical memory at about 45 MB per typical signal-day of input, between 1 and 25 signals, 10 when the free memory cannot be read; on 24-hour samples a batch of 10 is about 1.7x faster per signal than one at a time, above 10-25 there is no further gain, only memory). Health runs 10 signals at a time inside a batch. Pass `batch_signals` to fix it. `chunk_signals=N` additionally loads N signals at a time to bound peak memory. Answers are the same either way.
+- Large batches: send many signals in one call; they are processed `batch_signals` at a time (default: half the free physical memory at about 45 MB per typical signal-day of input, between 1 and 25 signals, 10 when the free memory cannot be read; on 24-hour samples a batch of 10 is about 1.7x faster per signal than one at a time, above 10-25 there is no further gain, only memory). Health runs once per batch (DuckDB SQL, about 0.3 s fixed plus 60-75 ms per signal-day). Pass `batch_signals` to fix it. `chunk_signals=N` additionally loads N signals at a time to bound peak memory. Answers are the same either way.
 - Rough cost on one desktop CPU: well under 2 s and about 250-300 MB per signal for a 3-hour sample. Measure on your own hardware.
 
 ## Errors and logging
@@ -50,6 +50,37 @@ ids = list_signals(events, start=None, end=None)        # DeviceIds present, sor
 - `health_bad_periods` is JSON text: a list of `{start, end, what, recovered}` periods, or empty text when there are none. `what` is one of `stuck on`, `count zone held ON`, `silent`, `silent at night`, `counts dropped`, `busy at night`, `too-fast actuations`, `too many for the traffic`, `spiky counts` (1.1.0; `erratic counts`, `chattering`, `erratic time ON` and `unusual daily pattern` were removed). Periods are whole 5-minute, 10-minute (spiky counts), 15-minute or 1-hour bins from the sample start (counts dropped: from the start of the first clock hour after the drop to the sample end; busy at night: 01:00-05:00 of the flagged day), clipped to the sample end; consecutive bins are merged.
 - `health_signal_note` is one line per signal, or empty: many detectors had an unusual night (a signal-wide event), and/or several detectors were held ON together with the same start and end (one common failure).
 - The health limits are `[suspect, bad]` pairs in `weights/health/health_limits.json`; a single finding is bad from the second number on.
+
+## Detector health in SQL, on your own DuckDB connection
+
+The health checks are plain DuckDB SQL (`predict` runs the same). When the events already sit in a DuckDB database (an atspm pipeline, a
+warehouse), run the health where they are instead of copying them out:
+
+```python
+import duckdb
+from atspm_detector import health, health_sql
+
+con = duckdb.connect("signals.duckdb")
+h = health(con, "events", "detectors", start=None, end=None)   # DataFrame, one row per detector
+sql = health_sql("events", "detectors")                         # the same as ONE query: con.execute(sql).df()
+```
+
+- `events`: `DeviceId`, `Timestamp`, `EventId`, `Parameter` (the hi-res log, local clock time). Other columns and event
+  codes are ignored; duplicate rows are dropped (`health(..., distinct=False)` skips that when there are none).
+- `detectors`: `DeviceId`, `Detector`, `phase`, `function`, `lanes`, optionally `p_advance`, `p_presence`, `p_count`,
+  `p_yellow_red`, `p_other`, `p_mid`, `p_bike`. From a `predict` output: `phase` = `phase_guess`, `function` =
+  `function_guess`, `lanes` = the number of entries in `lanes` (1 for a Bike zone), the `p_*` columns as they are.
+  Without the probabilities (`health_sql(..., probabilities=False)`; `health` looks for them itself) each detector is
+  judged by its own function's limits only, never the least strict of the plausible ones.
+- `start` / `end`: the sample window (`end` exclusive); default each signal's first event to one second past its last.
+- Returns `DeviceId`, `Detector` and the eight `health_*` columns of `predict` (same values: same checks, same limits),
+  for every detector channel with actuations in the window.
+- Nothing is copied out of the database. `health` runs the steps as temp tables named `hq_*` (each dropped as soon as it
+  is no longer needed) and groups signals so a group holds at most `max_events` events (default 4 million, about 2 GB
+  peak). `health_sql` is one `WITH` query whose steps are all named `hq_*`; DuckDB takes about half a second to plan it,
+  so for repeated calls prefer `health`. Table names are inserted as given.
+- Cost on one desktop CPU (4 threads, events already in DuckDB): about 0.5 s for one signal-day, 1 s for 10, 7.5 s
+  for 100 (about 75 ms per signal-day in large groups; a fixed half second or so per call).
 
 ## atspm detector configuration
 

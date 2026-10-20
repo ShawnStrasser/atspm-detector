@@ -10,7 +10,7 @@
   "function": "function229_s0 trees (229 features) + network function head (same pass) -> stacker mean3 (46 columns) -> per-lane ATSPM decode (lane confidence >= .9); < 30 min: twin decode",
   "lanes": "lane_pair_D_s0..s2 pair model + constrained decode (>= 30 min)",
   "setback": "P50 per length group (m30 / h6 / h24 / full) + P10 / P90 band (3 + 3 seeds) + same-lane pair HGB",
-  "health": "six rule checks on the log (health_core.py, health_v4.py, health_v4_stats.py, health_counts.py) against per-type limits (weights/health/health_limits.json, health_v4_refs.json); computed after classification, never a model input",
+  "health": "six rule checks on the log in DuckDB SQL (health_duckdb.py) against per-type limits (weights/health/health_limits.json, health_v4_refs.json); computed after classification, never a model input",
   "night_speed": "deterministic, from the answers above"
  },
  "accuracy_oof_six_fold": {
