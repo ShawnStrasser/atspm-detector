@@ -56,6 +56,19 @@ def streams_for(con, t0_ms: int, t1_ms: int, max_chunks: int = 48, grid: int = 0
     return s, rel
 
 
+def streams_batch(con, W: pd.DataFrame, cfg: dict):
+    """streams_for for every signal of a batch at once, each on its own sample [w0, w1) and piece plan (W: one row per
+    signal: DeviceId, w0, w1 in epoch seconds).  -> ({DeviceId: z}, {DeviceId: pieces relative to its origin})."""
+    from . import streams as st
+    wins, rel = {}, {}
+    for did, w0, w1 in zip(W.DeviceId.astype(str), W.w0, W.w1):
+        t0_ms, t1_ms = int(round(w0 * 1000)), int(round(w1 * 1000))
+        plan = piece_plan(cfg, round((w1 - w0) / 60.0))   # a request for exactly two hours stays on the all-pieces path
+        wins[did] = (t0_ms, t1_ms, st.split_range(t0_ms, t1_ms, st.CHUNK_MS, **plan))
+        rel[did] = st.split_range(0, t1_ms - t0_ms, st.CHUNK_MS, **plan)
+    return st.build_streams_batch(con, wins), rel
+
+
 def mix(df: pd.DataFrame, col: str, net: pd.DataFrame, weight: float) -> np.ndarray:
     """`weight` * df[col] + (1 - weight) * the network probability, renormalised per detector.  Rows the network has no
     opinion about (a candidate it did not score) keep the ranker probability."""

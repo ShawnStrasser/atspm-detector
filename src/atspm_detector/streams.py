@@ -98,19 +98,22 @@ def _ms(x, t0_ms: int, span: int) -> np.ndarray:
 _PIECE_MARGIN_S = 10.0   # > the 8 s minimum raster a very short piece is padded to
 
 
-def _near(sql: str, windows, a: str, b: str, order: str) -> str:
-    """`sql` restricted to rows whose [a, b] interval overlaps one of `windows` (intervals are defined over the whole
-    sample first and only then filtered, so every kept interval is exactly the one the full build gives)."""
-    if windows is None:
-        return f"SELECT * FROM ({sql}) q ORDER BY {order}"
-    m = _PIECE_MARGIN_S
-    cond = " OR ".join(f"({a} < {w1 / 1000.0 + m!r} AND {b} > {w0 / 1000.0 - m!r})"
-                       for w0, w1 in windows)
-    return f"SELECT * FROM ({sql}) q WHERE {cond or 'FALSE'} ORDER BY {order}"
+def _near(sql: str, a: str, b: str, order: str) -> str:
+    """`sql` restricted to rows whose [a, b] interval overlaps one of its signal's pieces (TEMP TABLE `st_pcs`,
+    see build_streams_batch; intervals are defined over the whole sample first and only then filtered, so every kept
+    interval is exactly the one the full build gives)."""
+    return (f"SELECT * FROM ({sql}) q WHERE EXISTS (SELECT 1 FROM st_pcs z WHERE z.pc_dev = q.DeviceId "
+            f"AND {a} < z.pc_hi AND {b} > z.pc_lo) ORDER BY {order}")
 
 
 def build_streams(con, t0_ms: int, t1_ms: int, windows=None) -> dict:
-    """-> {DeviceId: interval bundle} (all int64 milliseconds from `t0_ms`; pointers int32):
+    """build_streams_batch with the same window for every signal loaded (the single-signal call)."""
+    devs = [r[0] for r in con.sql("SELECT DeviceId FROM devmap").fetchall()]
+    return build_streams_batch(con, {str(d): (int(t0_ms), int(t1_ms), windows) for d in devs})
+
+
+def build_streams_batch(con, wins: dict) -> dict:
+    """-> {DeviceId: interval bundle} (all int64 milliseconds from the signal's own t0_ms; pointers int32):
 
         cand    [K]     candidate phases (every phase with a Begin Green)
         det_ch  [D]     detector channels with a completed actuation in the sample
@@ -118,29 +121,42 @@ def build_streams(con, t0_ms: int, t1_ms: int, windows=None) -> dict:
         g_* / y_* / r_* / c_*   per candidate phase: green / yellow / red-clearance / call intervals (ptr, on, off)
         co_on, co_off   intervals during which the signal is coordinated
 
-    `windows` (epoch-ms pairs, None = the whole sample) are the pieces the network will read: only intervals reaching
-    them are fetched.  Candidates and detector channels still come from the whole sample."""
-    span = int(t1_ms - t0_ms)
+    `wins` {DeviceId: (t0_ms, t1_ms, windows)}: each signal's sample and the pieces the network will read (epoch-ms
+    pairs, None = the whole sample); only intervals reaching a piece of their own signal are fetched (one query per
+    interval kind for all signals).  Candidates and detector channels still come from the whole sample."""
+    from .common import param_table
+    m = _PIECE_MARGIN_S
+    keys, lo, hi = [], [], []
+    for dev, (t0_ms, t1_ms, windows) in wins.items():
+        for w0, w1 in ([(t0_ms - 10**15, t1_ms + 10**15)] if windows is None else windows):
+            keys.append(dev)
+            lo.append(f"{w0 / 1000.0 - m!r}")
+            hi.append(f"{w1 / 1000.0 + m!r}")
+    param_table(con, "st_pcs", "pc_dev", keys, {"pc_lo": lo, "pc_hi": hi}, key_type="VARCHAR")
     ensure_cyc5(con)
     cands = con.sql(SQL_CAND).df()
-    chans = con.sql(SQL_DET_CH).df() if windows is not None else None
-    dets = con.sql(_near(SQL_DET, windows, "a", "b", "DeviceId, ch, a")).df()
+    chans = con.sql(SQL_DET_CH).df()
+    dets = con.sql(_near(SQL_DET, "a", "b", "DeviceId, ch, a")).df()
     # a row's green / yellow / red intervals all lie between g0 and its latest end
-    cyc = con.sql(_near(SQL_CYC, windows, "g0", "greatest(g1, y1, r1)", "DeviceId, p, g0")).df()
-    calls = con.sql(_near(SQL_CALL, windows, "a", "b", "DeviceId, p, a")).df()
+    cyc = con.sql(_near(SQL_CYC, "g0", "greatest(g1, y1, r1)", "DeviceId, p, g0")).df()
+    calls = con.sql(_near(SQL_CALL, "a", "b", "DeviceId, p, a")).df()
     # the last 131 runs to the end of the sample (b is NULL there)
-    coord = con.sql(_near(SQL_COORD, windows, "a", "coalesce(b, 1e18)", "DeviceId, a")).df()
+    coord = con.sql(_near(SQL_COORD, "a", "coalesce(b, 1e18)", "DeviceId, a")).df()
+    con.execute("DROP TABLE IF EXISTS st_pcs")
 
     gc = {k: v for k, v in cands.groupby("DeviceId", sort=False)}
     gd = {k: v for k, v in dets.groupby("DeviceId", sort=False)}
     gy = {k: v for k, v in cyc.groupby("DeviceId", sort=False)}
     gl = {k: v for k, v in calls.groupby("DeviceId", sort=False)}
     go = {k: v for k, v in coord.groupby("DeviceId", sort=False)}
-    src_ch = dets if chans is None else chans
-    gch = {k: np.sort(v.ch.astype(int).unique()) for k, v in src_ch.groupby("DeviceId")}
+    gch = {k: np.sort(v.ch.astype(int).unique()) for k, v in chans.groupby("DeviceId")}
 
     out = {}
     for dev in sorted(set(cands.DeviceId) | set(gch)):
+        if dev not in wins:
+            continue
+        t0_ms, t1_ms, _ = wins[dev]
+        span = int(t1_ms - t0_ms)
         c = gc.get(dev)
         cand = np.sort(c.p.astype(int).unique()) if c is not None else np.zeros(0, dtype=np.int64)
         z = {"cand": cand.astype(np.int16)}
@@ -184,8 +200,8 @@ def build_streams(con, t0_ms: int, t1_ms: int, windows=None) -> dict:
             k = co[co.is_coord.fillna(False).astype(bool)]
             a = _ms(k.a, t0_ms, span)
             b = _ms(k.b.fillna((t1_ms + 1000.0) / 1000.0), t0_ms, span)
-            m = b > a
-            z["co_on"], z["co_off"] = a[m], b[m]
+            m_ = b > a
+            z["co_on"], z["co_off"] = a[m_], b[m_]
         else:
             z["co_on"] = np.zeros(0, np.int64)
             z["co_off"] = np.zeros(0, np.int64)

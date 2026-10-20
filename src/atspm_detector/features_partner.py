@@ -96,15 +96,18 @@ FROM red_secs r FULL OUTER JOIN n43 k ON r.dev = k.dev AND r.p = k.p
 # --------------------------------------------------- partner / exclusive green
 def _partner_features(con) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Per (dev, p): best partner q by co-green seconds + exclusive-green behaviour."""
-    om = con.sql("SELECT dev, det, mask, n_on, occ FROM onmask").df()
-    mt = con.sql("SELECT dev, mask, secs FROM masktime").df()
+    om = con.sql("SELECT dev, det, mask, n_on, occ FROM onmask ORDER BY dev, det, mask, is_coord").df()
+    mt = con.sql("SELECT dev, mask, secs FROM masktime ORDER BY dev, mask, is_coord").df()
     cand = con.sql("SELECT * FROM cand").df()
     cyc = con.sql("SELECT dev, p, cyc, gs, ge FROM cyc_win").df()
+    gmt = {k: v for k, v in mt.groupby("dev", sort=False)}
+    gom = {k: v for k, v in om.groupby("dev", sort=False)}
+    gcy = {k: v for k, v in cyc.groupby("dev", sort=False)}
     rows, prows = [], []
     for dev, cd in cand.groupby("dev"):
         phases = sorted(int(x) for x in cd.p.unique())
-        mtd = mt[mt.dev == dev]
-        omd = om[om.dev == dev]
+        mtd = gmt.get(dev, mt.iloc[:0])
+        omd = gom.get(dev, om.iloc[:0])
         if not len(mtd):
             continue
         masks = mtd["mask"].to_numpy(dtype=np.int64)
@@ -133,7 +136,7 @@ def _partner_features(con) -> tuple[pd.DataFrame, pd.DataFrame]:
             exc_p[p] = float(np.mean([a for a, _ in exc_pq[p]]))
             exc_q[p] = float(np.mean([b for _, b in exc_pq[p]]))
         # green-start / end lead of p over its partner (cycle matched, nearest start)
-        cd_cyc = cyc[cyc.dev == dev]
+        cd_cyc = gcy.get(dev, cyc.iloc[:0])
         starts = {p: np.sort(cd_cyc.loc[cd_cyc.p == p, "gs"].to_numpy()) for p in phases}
         ends = {p: np.sort(cd_cyc.loc[cd_cyc.p == p, "ge"].to_numpy()) for p in phases}
 

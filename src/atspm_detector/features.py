@@ -33,20 +33,25 @@ RANK_FEATS = [
 ]
 
 
-def apply_window(con, w0: float, w1: float) -> None:
-    """Restrict the chunk tables to [w0, w1) and rebuild the mask aggregates."""
-    con.execute(f"CREATE OR REPLACE TEMP TABLE onev AS SELECT * FROM onev_all "
-                f"WHERE t_on >= {w0} AND t_on < {w1}")
+def apply_window(con, W) -> None:
+    """Restrict the chunk tables to each signal's own [w0, w1) (W: one row per signal: dev, w0, w1) and rebuild the
+    mask aggregates."""
+    from .common import param_table
+    param_table(con, "fwin", "dev", W.dev, {"w0": [f"{w0}" for w0 in W.w0], "w1": [f"{w1}" for w1 in W.w1],
+                                           "w0_back": [f"{w0 - 900}" for w0 in W.w0],
+                                           "w1_calls": [f"{w1} + 10" for w1 in W.w1]})
+    con.execute("CREATE OR REPLACE TEMP TABLE onev AS SELECT o.* FROM onev_all o JOIN fwin w USING (dev) "
+                "WHERE o.t_on >= w.w0 AND o.t_on < w.w1")
     # cycles: keep a lookback so an ON early in the window finds its green
-    con.execute(f"CREATE OR REPLACE TEMP TABLE cyc AS SELECT * FROM cyc_all "
-                f"WHERE gs >= {w0 - 900} AND gs < {w1}")
-    con.execute(f"CREATE OR REPLACE TEMP TABLE cyc_win AS SELECT * FROM cyc_all "
-                f"WHERE gs >= {w0} AND gs < {w1}")
-    con.execute(f"""CREATE OR REPLACE TEMP TABLE gs AS
-        SELECT dev, greatest(t0,{w0}) AS t0, least(t1,{w1}) AS t1, mask
-        FROM gs_all WHERE t1 > {w0} AND t0 < {w1}""")
-    con.execute(f"CREATE OR REPLACE TEMP TABLE calls AS SELECT * FROM calls_all "
-                f"WHERE t >= {w0} AND t < {w1} + 10")
+    con.execute("CREATE OR REPLACE TEMP TABLE cyc AS SELECT c.* FROM cyc_all c JOIN fwin w USING (dev) "
+                "WHERE c.gs >= w.w0_back AND c.gs < w.w1")
+    con.execute("CREATE OR REPLACE TEMP TABLE cyc_win AS SELECT c.* FROM cyc_all c JOIN fwin w USING (dev) "
+                "WHERE c.gs >= w.w0 AND c.gs < w.w1")
+    con.execute("""CREATE OR REPLACE TEMP TABLE gs AS
+        SELECT g.dev, greatest(g.t0, w.w0) AS t0, least(g.t1, w.w1) AS t1, g.mask
+        FROM gs_all g JOIN fwin w USING (dev) WHERE g.t1 > w.w0 AND g.t0 < w.w1""")
+    con.execute("CREATE OR REPLACE TEMP TABLE calls AS SELECT c.* FROM calls_all c JOIN fwin w USING (dev) "
+                "WHERE c.t >= w.w0 AND c.t < w.w1_calls")
     con.execute("""CREATE OR REPLACE TEMP TABLE onmask AS
         WITH a AS (
           SELECT o.dev, o.det, o.t_on, o.dur, coalesce(g.mask, 0) AS mask
@@ -246,38 +251,64 @@ def call_reverse(con) -> pd.DataFrame:
 # Peak memory: `j` has one row per detector ON x candidate phase (7 days, 40 channels: ~8 M rows).  Every aggregate
 # read from `j` / `lo2` is grouped by (dev, det, p[, cyc]), so the join is built and aggregated per BLOCK of detectors
 # of at most J_BLOCK_ROWS rows and the per-block results are concatenated: the same groups, the same rows per group,
-# bounded memory.  A sample whose join fits in one block (a day or less on almost every signal) runs exactly as before.
+# bounded memory.  A block holds whole signals where it can (a signal is split by detectors only when it alone is
+# larger), and its join reads the cycle / call / candidate tables of its own signals only, so a batch of many signals
+# costs the same per signal as one.  A sample whose join fits in one block runs as one block.
 J_BLOCK_ROWS = 1_500_000
 
 
 def _det_blocks(con) -> list:
     """[(dev, det) list per block] so that each block's ON x candidate rows <= J_BLOCK_ROWS (a detector is never
-    split); one block (None) when everything fits."""
+    split; a signal only when it alone is over the limit); one block (None) when everything fits."""
     w = con.sql("SELECT o.dev, o.det, count(*) * any_value(c.nc) AS n FROM onev o "
                 "JOIN (SELECT dev, count(*) AS nc FROM cand GROUP BY 1) c USING (dev) "
                 "GROUP BY 1, 2 ORDER BY 1, 2").fetchall()
     if sum(int(r[2]) for r in w) <= J_BLOCK_ROWS:
         return [None]
-    blocks, cur, n = [], [], 0
+    per_dev: dict = {}
     for dev, det, k in w:
-        if cur and n + int(k) > J_BLOCK_ROWS:
-            blocks.append(cur)
-            cur, n = [], 0
-        cur.append((int(dev), int(det)))
-        n += int(k)
+        per_dev.setdefault(int(dev), []).append((int(det), int(k)))
+    blocks, cur, n = [], [], 0
+    for dev, dk in per_dev.items():
+        tot = sum(k for _, k in dk)
+        if tot <= J_BLOCK_ROWS:                       # the whole signal in one block
+            if cur and n + tot > J_BLOCK_ROWS:
+                blocks.append(cur)
+                cur, n = [], 0
+            cur.extend((dev, det) for det, _ in dk)
+            n += tot
+            continue
+        for det, k in dk:                             # a signal larger than a block: split by detectors
+            if cur and n + k > J_BLOCK_ROWS:
+                blocks.append(cur)
+                cur, n = [], 0
+            cur.append((dev, det))
+            n += k
     if cur:
         blocks.append(cur)
     return blocks
 
 
+# the tables the block queries read besides `j` / `lo2`, and their per-block copies (the block's signals only)
+_BLOCK_AUX = (("JOIN cand c", "JOIN cand_b c"), ("ASOF LEFT JOIN cyc y", "ASOF LEFT JOIN cyc_b y"),
+              ("FROM cyc_win", "FROM cyc_win_b"), ("FROM calls WHERE", "FROM calls_b WHERE"))
+
+
+def _blockwise(sql: str) -> str:
+    for a, b in _BLOCK_AUX:
+        sql = sql.replace(a, b)
+    return sql
+
+
 def _j_aggregates(con, f2, src: str = "onev") -> tuple:
     """The aggregates read from `j` / `lo2` (state, cycle, release, fine timing, call pass) for the ON intervals in
-    table `src` (`onev`, or one block of it)."""
-    con.execute(SQL_J if src == "onev" else SQL_J.replace("FROM onev o JOIN cand", f"FROM {src} o JOIN cand"))
-    con.execute(SQL_LO2 if src == "onev" else SQL_LO2.replace("FROM onev o JOIN cand", f"FROM {src} o JOIN cand"))
+    table `src` (`onev`, or one block of it: then the cycle / call / candidate tables are the block's copies)."""
+    q = (lambda x: x) if src == "onev" else _blockwise
+    con.execute(q(SQL_J if src == "onev" else SQL_J.replace("FROM onev o JOIN cand", f"FROM {src} o JOIN cand")))
+    con.execute(q(SQL_LO2 if src == "onev" else SQL_LO2.replace("FROM onev o JOIN cand", f"FROM {src} o JOIN cand")))
     try:
-        out = (con.sql(SQL_STATE_AGG).df(), con.sql(SQL_CYC).df(), con.sql(SQL_RELEASE).df(),
-               con.sql(f2.SQL_FINE).df(), con.sql(SQL_CALLAGG).df())
+        out = (con.sql(SQL_STATE_AGG).df(), con.sql(q(SQL_CYC)).df(), con.sql(SQL_RELEASE).df(),
+               con.sql(q(f2.SQL_FINE)).df(), con.sql(q(SQL_CALLAGG)).df())
     finally:
         con.execute("DROP TABLE IF EXISTS j")
         con.execute("DROP TABLE IF EXISTS lo2")
@@ -290,6 +321,7 @@ def shared_parts(con) -> dict:
     are dropped afterwards."""
     from . import features_partner as f2
     res = []
+    aux = ("onev_j", "onev_keys", "blk_devs", "cand_b", "cyc_b", "cyc_win_b", "calls_b")
     try:
         for blk in _det_blocks(con):
             if blk is None:
@@ -299,10 +331,14 @@ def shared_parts(con) -> dict:
             con.executemany("INSERT INTO onev_keys VALUES (?, ?)", blk)
             con.execute("CREATE OR REPLACE TEMP TABLE onev_j AS SELECT o.* FROM onev o JOIN onev_keys k "
                         "ON o.dev = k.dev AND o.det = k.det")
+            con.execute("CREATE OR REPLACE TEMP TABLE blk_devs AS SELECT DISTINCT dev FROM onev_keys")
+            for t in ("cand", "cyc", "cyc_win", "calls"):
+                con.execute(f"CREATE OR REPLACE TEMP TABLE {t}_b AS SELECT x.* FROM {t} x SEMI JOIN blk_devs d "
+                            f"ON x.dev = d.dev")
             res.append(_j_aggregates(con, f2, "onev_j"))
     finally:
-        con.execute("DROP TABLE IF EXISTS onev_j")
-        con.execute("DROP TABLE IF EXISTS onev_keys")
+        for t in aux:
+            con.execute(f"DROP TABLE IF EXISTS {t}")
     if len(res) == 1:
         st, cy, rl, fi, ca = res[0]
     else:
@@ -336,14 +372,16 @@ def partner_mean(diffs, cot) -> float:
 
 
 def _mask_features(con) -> pd.DataFrame:
-    om = con.sql("SELECT * FROM onmask").df()
-    mt = con.sql("SELECT * FROM masktime").df()
+    om = con.sql("SELECT * FROM onmask ORDER BY dev, det, mask, is_coord").df()
+    mt = con.sql("SELECT * FROM masktime ORDER BY dev, mask, is_coord").df()
     cand = con.sql("SELECT * FROM cand").df()
+    gmt = {k: v for k, v in mt.groupby("dev", sort=False)}
+    gom = {k: v for k, v in om.groupby("dev", sort=False)}
     rows = []
     for dev, cd in cand.groupby("dev"):
         phases = sorted(int(x) for x in cd.p.unique())
-        mtd = mt[mt.dev == dev]
-        omd = om[om.dev == dev]
+        mtd = gmt.get(dev, mt.iloc[:0])
+        omd = gom.get(dev, om.iloc[:0])
         if not len(mtd) or not len(omd):
             continue
         masks = mtd["mask"].to_numpy(dtype=np.int64)
@@ -424,7 +462,8 @@ def _mask_features(con) -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------- assembly
-def build_window(con, win: str, secs: float, parts: dict, devmap: pd.DataFrame) -> pd.DataFrame:
+def build_window(con, win: str, secs, parts: dict, devmap: pd.DataFrame) -> pd.DataFrame:
+    """`secs`: the sample length, {dev: seconds} (one per signal) or one number for all."""
     m = _mask_features(con)
     if not len(m):
         return pd.DataFrame()
@@ -439,10 +478,11 @@ def build_window(con, win: str, secs: float, parts: dict, devmap: pd.DataFrame) 
                                                      "flong": "det_frac_long", "dmean": "det_dur_mean",
                                                      "dmax": "det_dur_max"}),
                     on=["dev", "det"], how="left")
-    out = out.merge(devmap, on="dev", how="left").drop(columns=["dev"])
-    out = out.rename(columns={"det": "Detector", "p": "cand_phase"})
+    out = out.merge(devmap, on="dev", how="left")
+    ws = out.dev.map(secs).to_numpy(np.float64) if isinstance(secs, dict) else secs
+    out = out.drop(columns=["dev"]).rename(columns={"det": "Detector", "p": "cand_phase"})
     out["win"] = win
-    out["win_secs"] = secs
+    out["win_secs"] = ws
     return out
 
 

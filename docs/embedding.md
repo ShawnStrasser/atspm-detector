@@ -8,7 +8,7 @@ For developers and agents building `atspm_detector` into a desktop app, web serv
 from atspm_detector import predict, list_signals, OUT_COLS, EXTRA_COLS, PHASE_COLS, __version__
 
 det = predict(events, start=None, end=None, device_ids=None, threads=4, memory="4GB",
-              chunk_signals=None, min_actuations=5, min_prob=0.0)
+              chunk_signals=None, batch_signals=None, min_actuations=5, min_prob=0.0)
 det, phases = predict(events, ..., return_phases=True)
 ids = list_signals(events, start=None, end=None)        # DeviceIds present, sorted
 ```
@@ -17,7 +17,7 @@ ids = list_signals(events, start=None, end=None)        # DeviceIds present, sor
 - Return: a DataFrame with columns `OUT_COLS + EXTRA_COLS`, one row per detector channel seen in the window. `phases` has `PHASE_COLS`, one row per phase. Treat the column lists as the contract; read columns by name.
 - `predict` never raises on thin or odd data. Signals or detectors it cannot judge come back with an empty `phase_pred` / `function_pred`, a `status` saying why and `review_flag = True`. An empty input returns empty frames with the right columns.
 - `min_prob > 0` withholds low-confidence answers (status "not confident enough"); the raw opinion stays in `phase_guess` / `function_guess`.
-- Each signal is scored on its own. Answers for a signal are identical whether it is sent alone or in a batch.
+- Signals are processed together (`batch_signals`, default 10, per batched pass), but each keeps its own window and nothing crosses between signals: answers for a signal are bit for bit identical whether it is sent alone or in a batch of any size.
 
 ## Time
 
@@ -33,7 +33,7 @@ ids = list_signals(events, start=None, end=None)        # DeviceIds present, sor
 - Concurrent calls in one process are not tested. Run one call at a time per process; for parallel work use a process pool (one signal or one group of signals per task).
 - DuckDB threads and memory: `predict(threads=, memory=)`. onnxruntime threads: environment variables `DC_TREE_THREADS` and `DC_NET_THREADS` (default 4 each). They are read at import, so set them before `import atspm_detector`.
 - Model sessions are loaded on first use and cached for the life of the process. Keep a worker process alive between calls instead of starting a new one for each signal.
-- Large batches: `chunk_signals=N` loads N signals at a time to bound peak memory. Answers are the same either way.
+- Large batches: send many signals in one call; they are processed `batch_signals` at a time (default 10: on 24-hour samples about 1.6x faster per signal than one at a time; 25-50 adds little speed and more memory). `chunk_signals=N` additionally loads N signals at a time to bound peak memory. Answers are the same either way.
 - Rough cost on one desktop CPU: well under 2 s and about 250-300 MB per signal for a 3-hour sample. Measure on your own hardware.
 
 ## Errors and logging

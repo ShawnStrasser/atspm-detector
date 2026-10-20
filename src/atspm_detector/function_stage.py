@@ -70,10 +70,11 @@ def _on_window(on_iv: dict, dev: str):
     return on, hour
 
 
-def run(con, top: pd.DataFrame, model_dir: Path, b0: float, b1: float, streams: dict | None, pieces_rel,
+def run(con, top: pd.DataFrame, model_dir: Path, bw: dict, streams: dict | None, pieces_rel,
         log=lambda m: None, inject: dict | None = None, net_keep: dict | None = None, on_iv: dict | None = None):
     """top: the function design frame (one row per detector, all signals; DeviceId, Detector, pred_phase, det_n_on and the
-    229 features).  -> (detector table with P_trees / P_net / P_final, lanes, function_pred ..., phase lane table).
+    229 features).  bw {DeviceId: (b0, b1)}: each signal's sample window; pieces_rel {DeviceId: its network pieces}.
+    -> (detector table with P_trees / P_net / P_final, lanes, function_pred ..., phase lane table).
     `inject` (research parity harness only): {"Pt" / "Pn": f(dev, dets) -> probs or None, "lane_probs": {dev: {(a, b): p}},
     "lane_decoder": Decoder, "stacker": object with .predict(minutes, Pt, Pn, fr), "capture": dict}.
     `net_keep` (siba candidate filter, ON by default since note 84): {DeviceId: {detector: set of candidate phases}}."""
@@ -89,12 +90,13 @@ def run(con, top: pd.DataFrame, model_dir: Path, b0: float, b1: float, streams: 
         if c not in top.columns:
             top[c] = np.nan
     top = top.sort_values(["DeviceId", "Detector"]).reset_index(drop=True)
-    Pt = M["ftrees"].predict(top[feats])
-    secs = max(b1 - b0, 1.0)
-    minutes = secs / 60.0
-    lane_regime = round(minutes) >= LANE_MIN_MINUTES
+    Pt = M["ftrees"].predict_by(top[feats], top.DeviceId.to_numpy())    # each signal's rows scored as if alone
     det_parts, ph_parts = [], []
     for dev, g in top.groupby("DeviceId", sort=True):
+        b0, b1 = bw[dev]
+        secs = max(b1 - b0, 1.0)
+        minutes = secs / 60.0
+        lane_regime = round(minutes) >= LANE_MIN_MINUTES
         ix = g.index.to_numpy()
         dets = g.Detector.astype(int).to_numpy()
         pt = Pt[ix]
@@ -104,9 +106,9 @@ def run(con, top: pd.DataFrame, model_dir: Path, b0: float, b1: float, streams: 
         # ---- function network
         pn = np.full_like(pt, np.nan)
         z = (streams or {}).get(dev) if net is not None else None
-        if z is not None and pieces_rel:
+        if z is not None and pieces_rel and pieces_rel.get(dev):
             zd = [int(c) for c in z["det_ch"]]
-            P = net.probs(z, zd, pieces_rel, keep=None if net_keep is None else net_keep.get(dev, {}))
+            P = net.probs(z, zd, pieces_rel[dev], keep=None if net_keep is None else net_keep.get(dev, {}))
             pos = {d: i for i, d in enumerate(zd)}
             for j, d in enumerate(dets):
                 if d in pos and np.isfinite(P[pos[d]]).all():

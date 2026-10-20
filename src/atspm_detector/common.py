@@ -32,6 +32,26 @@ ALLOWED_EVENTS = (1, 7, 8, 9, 10, 11, 43, 44, 81, 82, 131, 150, 173)
 MAX_DETECTOR_CHANNEL = 64
 
 
+def param_table(con, name: str, key: str, keys, cols: dict, key_type: str = "SMALLINT") -> None:
+    """TEMP TABLE `name` with one row per signal: `key` (`key_type`) and one DOUBLE column per entry of `cols`
+    {column: [SQL text per key]}.  Each value is its SQL text CAST to DOUBLE -- bit for bit the value a query got
+    when the same text was written into it inline for one signal (a literal like 1759017600.1 is a DECIMAL, `w + 10`
+    is DECIMAL arithmetic, and both are cast to DOUBLE where they meet a DOUBLE column).  Lets one batched query apply
+    every signal's own window."""
+    keys = list(keys)
+    names = list(cols)
+    if not keys:
+        defs = ", ".join([f"{key} {key_type}"] + [f"{c} DOUBLE" for c in names])
+        con.execute(f"CREATE OR REPLACE TEMP TABLE {name} ({defs})")
+        return
+    rows = []
+    for i, k in enumerate(keys):
+        kk = ("'" + str(k).replace("'", "''") + "'") if key_type == "VARCHAR" else f"{int(k)}::{key_type}"
+        rows.append("(" + ", ".join([kk] + [f"CAST({cols[c][i]} AS DOUBLE)" for c in names]) + ")")
+    con.execute(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT * FROM (VALUES {', '.join(rows)}) "
+                f"t({', '.join([key] + names)})")
+
+
 def read_json(path):
     """A JSON file (UTF-8), closed after reading."""
     import json

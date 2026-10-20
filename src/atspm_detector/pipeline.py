@@ -12,9 +12,10 @@ Command line
     python -m atspm_detector --events day.parquet --device-ids <guid> --start "..." --end "..." --out preds.csv
 
 `events` has the columns DeviceId, Timestamp, EventId, Parameter (lowercase / underscore spellings accepted).  Any number
-of signals and any duration from a few minutes to days.  Every signal is processed on its own (its own window and sample
-length), so a signal's answers never depend on which other signals are in the same call; for memory, pass a few
-signals at a time or `chunk_signals`.
+of signals and any duration from a few minutes to days.  Signals are processed together, `batch_signals` at a time (one
+set of queries and one model call per stage for the whole batch), but every signal keeps its own window and sample
+length and every computation stays within its signal, so a signal's answers are bit for bit the same alone or in any
+batch; for memory, lower `batch_signals` or load the signals in groups with `chunk_signals`.
 Timestamps are read as the controller's wall-clock time.  A time-zone-aware timestamp keeps its own wall-clock time
 (expressed in its own zone / offset, then the zone is dropped); it is never converted to this computer's zone.  A
 parquet column stored as UTC without a recorded zone is read as UTC wall-clock time (with a warning).  `start` / `end`
@@ -89,7 +90,7 @@ from . import night_speed as ns_mod
 from . import setback as sb_mod
 from . import similarity as sim_mod
 from . import trees_onnx
-from .common import ALLOWED_EVENTS, MAX_DETECTOR_CHANNEL, read_json
+from .common import ALLOWED_EVENTS, MAX_DETECTOR_CHANNEL, param_table, read_json
 from .common import timedelta as _td
 from .health import flag_detectors, status_for_user
 
@@ -132,6 +133,7 @@ PHASE_COLS = ["DeviceId", "phase", "n_detectors", "n_lanes", "n_lanes_conf",
 PHASE_STEM = "phase_lgbm_v5"
 DECODE_STEM = "decode_v3"
 
+BATCH_SIGNALS = 10       # signals processed together (one batched pass); answers do not depend on it
 MIN_ACTUATIONS = 5       # below this many detector ON events in the sample: no answer
 MIN_PROB = 0.0           # below this top-phase probability: no answer (0 = off)
 # The network's candidate filter: the pair graph runs only on (detector, candidate) pairs with ranker p >= .01 (ON by
@@ -360,15 +362,37 @@ def _window(con):
     return w0, w1, {"n_events": int(n), "n_signals": int(nd), "t0": t0, "t1": t1}
 
 
-def _one_signal(con, device_id: str):
-    """Restrict `evd` / `devmap` to ONE signal of `evd_all` (signal key 1, exactly as when it is passed alone), so a
-    signal's answers never depend on the other signals of the call: its own window, sample length and tables."""
-    con.execute("CREATE OR REPLACE TEMP TABLE evd AS SELECT 1::SMALLINT AS dev, DeviceId, Timestamp, EventId, "
-                "Parameter FROM evd_all WHERE DeviceId = ?", [device_id])
+def _select_signals(con, device_ids: list) -> None:
+    """Restrict `evd` / `devmap` to the signals `device_ids` of `evd_all` (signal keys 1..n in DeviceId order, exactly
+    as when they are passed alone): one batch."""
+    ids = sorted(str(d) for d in device_ids)
     con.execute("CREATE OR REPLACE TEMP TABLE devmap (DeviceId VARCHAR, dev SMALLINT)")
-    con.execute("INSERT INTO devmap VALUES (?, 1)", [device_id])
-    con.execute("DROP TABLE IF EXISTS cyc5")      # built once per signal by streams.py
-    return _window(con)
+    con.executemany("INSERT INTO devmap VALUES (?, ?)", [(d, i + 1) for i, d in enumerate(ids)])
+    con.execute("CREATE OR REPLACE TEMP TABLE evd AS SELECT m.dev, e.DeviceId, e.Timestamp, e.EventId, e.Parameter "
+                "FROM evd_all e JOIN devmap m USING (DeviceId)")
+    con.execute("DROP TABLE IF EXISTS cyc5")      # built once per batch by streams.py
+
+
+def _windows(con, start, end) -> pd.DataFrame:
+    """Every signal's own windows, one row per signal of `evd` (by signal key): w0 / w1 = its first event and one second
+    past its last (epoch seconds, the per-signal formula of `_window`), b0 / b1 = the sample window (`_bin_window`
+    clipped by `_clip_window`)."""
+    rows = con.sql("SELECT m.dev, m.DeviceId, min(e.Timestamp), max(e.Timestamp) FROM evd e JOIN devmap m USING (dev) "
+                   "GROUP BY 1, 2 ORDER BY 1").fetchall()
+    out = []
+    for dev, did, t0, t1 in rows:
+        w0 = (pd.Timestamp(t0) - pd.Timestamp("1970-01-01")).total_seconds()
+        w1 = (pd.Timestamp(t1) - pd.Timestamp("1970-01-01")).total_seconds() + 1.0
+        b0, b1 = _clip_window(*_bin_window(start, end, w0, w1), w0, w1)
+        out.append((int(dev), str(did), w0, w1, b0, b1))
+    return pd.DataFrame(out, columns=["dev", "DeviceId", "w0", "w1", "b0", "b1"])
+
+
+def _bin_params(con, W: pd.DataFrame) -> None:
+    """TEMP TABLE bwin (dev, b0, b1): the sample windows as the exact Python floats (as a bound `?` gets them)."""
+    con.execute("CREATE OR REPLACE TEMP TABLE bwin (dev SMALLINT, b0 DOUBLE, b1 DOUBLE)")
+    con.executemany("INSERT INTO bwin VALUES (?, ?, ?)",
+                    [(int(d), float(a), float(b)) for d, a, b in zip(W.dev, W.b0, W.b1)])
 
 
 def build_chunk_tables(con) -> None:
@@ -464,34 +488,35 @@ def signal_facts(con) -> pd.DataFrame:
         FROM evd GROUP BY 1""").df()
 
 
-def gate_frame(con, win_secs: float, w1: float | None = None) -> pd.DataFrame:
+def gate_frame(con, W: pd.DataFrame) -> pd.DataFrame:
     """The classifiability gate (`health.py`): no actuations / stuck ON / chatter storm.  A channel with no completed
     actuation but an ON that never ends inside the sample (82s and no 81 after them) is stuck ON from its first such
     82 to the sample end `w1` (`open_on_s`): reported as stuck ON, not as 'no actuations'.  Channels with completed
-    actuations are judged on those alone (an ON still open at the sample end is normal, e.g. a queue at red)."""
-    days = max(win_secs / 86400.0, 1e-6)
-    tail_end = float(w1) if w1 is not None else None
-    tail = ("" if tail_end is None else f"""
-        , e AS (SELECT dev, Parameter::SMALLINT AS det, Timestamp AS ts, EventId FROM evd WHERE EventId IN (81,82)),
-        lo AS (SELECT dev, det, max(ts) FILTER (EventId = 81) AS last_off FROM e GROUP BY 1,2),
-        tl AS (SELECT e.dev, e.det, greatest({tail_end} - epoch_ms(min(e.ts))/1000.0, 0) AS tail_s
-               FROM e JOIN lo USING (dev, det)
-               WHERE e.EventId = 82 AND (lo.last_off IS NULL OR e.ts > lo.last_off) GROUP BY 1,2)""")
-    src = "a" if tail_end is None else "a FULL OUTER JOIN tl USING (dev, det)"
-    tcol = "0" if tail_end is None else "(CASE WHEN a.n_on IS NULL THEN coalesce(tl.tail_s, 0) ELSE 0 END)"
+    actuations are judged on those alone (an ON still open at the sample end is normal, e.g. a queue at red).
+    W: one row per signal (dev, w0, w1), every signal judged on its own window."""
+    ws = [w1 - w0 for w0, w1 in zip(W.w0, W.w1)]
+    param_table(con, "gwin", "dev", W.dev, {"days": [f"{max(s / 86400.0, 1e-6)}" for s in ws],
+                                            "secs": [f"{max(s, 1.0)}" for s in ws],
+                                            "tail_end": [f"{float(w1)}" for w1 in W.w1]})
+    tcol = "(CASE WHEN a.n_on IS NULL THEN coalesce(tl.tail_s, 0) ELSE 0 END)"
     h = con.sql(f"""
         WITH a AS (
           SELECT dev, det, count(*) AS n_on, sum(dur) AS occ, max(dur) AS longest_on_s,
                  max(cnt) AS max_on_per_min
           FROM (SELECT dev, det, dur, count(*) OVER (PARTITION BY dev, det,
                        (t_on/60)::BIGINT) AS cnt FROM onev_all) GROUP BY 1,2
-        ){tail}
+        ), e AS (SELECT dev, Parameter::SMALLINT AS det, Timestamp AS ts, EventId FROM evd WHERE EventId IN (81,82)),
+        lo AS (SELECT dev, det, max(ts) FILTER (EventId = 81) AS last_off FROM e GROUP BY 1,2),
+        tl AS (SELECT e.dev, e.det, greatest(any_value(g.tail_end) - epoch_ms(min(e.ts))/1000.0, 0) AS tail_s
+               FROM e JOIN lo USING (dev, det) JOIN gwin g USING (dev)
+               WHERE e.EventId = 82 AND (lo.last_off IS NULL OR e.ts > lo.last_off) GROUP BY 1,2)
         SELECT d.DeviceId, det::INT AS Detector, coalesce(a.n_on, 0) AS n_on,
-               coalesce(a.n_on, 0) / {days} AS on_per_day,
-               (coalesce(a.occ, 0) + {tcol}) / {max(win_secs, 1.0)} AS frac_time_on,
+               coalesce(a.n_on, 0) / g.days AS on_per_day,
+               (coalesce(a.occ, 0) + {tcol}) / g.secs AS frac_time_on,
                greatest(coalesce(a.longest_on_s, 0), {tcol}) AS longest_on_s, coalesce(a.max_on_per_min, 0)
                    AS max_on_per_min, {tcol} AS open_on_s
-        FROM {src} JOIN devmap d USING (dev)
+        FROM a FULL OUTER JOIN tl USING (dev, det) JOIN devmap d USING (dev) JOIN gwin g USING (dev)
+        ORDER BY 1, 2
     """).df()
     if not len(h):
         h = pd.DataFrame(columns=["DeviceId", "Detector", "n_on", "on_per_day",
@@ -499,11 +524,13 @@ def gate_frame(con, win_secs: float, w1: float | None = None) -> pd.DataFrame:
     return flag_detectors(h)
 
 
-def on_table(con, b0: float, b1: float) -> dict:
-    """{DeviceId: {det: (t_on, t_off)}} of the ON intervals starting inside [b0, b1), sorted by time; fetched once and
-    shared by the function stage (pick / lanes / twins) and the night speed."""
+def on_table(con, W: pd.DataFrame) -> dict:
+    """{DeviceId: {det: (t_on, t_off)}} of the ON intervals starting inside each signal's [b0, b1), sorted by time;
+    fetched once and shared by the function stage (pick / lanes / twins) and the night speed."""
+    _bin_params(con, W)
     r = con.execute("SELECT m.DeviceId, o.det::INT AS det, o.t_on, o.t_off FROM onev_all o JOIN devmap m USING (dev) "
-                    "WHERE o.t_on >= ? AND o.t_on < ? ORDER BY m.DeviceId, o.det, o.t_on", [b0, b1]).fetchnumpy()
+                    "JOIN bwin w USING (dev) WHERE o.t_on >= w.b0 AND o.t_on < w.b1 "
+                    "ORDER BY m.DeviceId, o.det, o.t_on").fetchnumpy()
     out: dict = {}
     n = len(r["det"])
     if not n:
@@ -525,10 +552,11 @@ EMPTY_SIM = pd.DataFrame({"DeviceId": pd.Series(dtype=object),
                           "win": pd.Series(dtype=object)})
 
 
-def build_features(con, w0: float, w1: float, devmap: pd.DataFrame):
-    """-> (pair features, similarity graph, lead-neighbour graph, detector-pair lag table)."""
-    secs = max(w1 - w0, 1.0)
-    f1.apply_window(con, w0, w1)
+def build_features(con, W: pd.DataFrame, devmap: pd.DataFrame):
+    """-> (pair features, similarity graph, lead-neighbour graph, detector-pair lag table) of every signal of the batch,
+    each on its own window [w0, w1) (W: one row per signal)."""
+    secs = {int(d): max(w1 - w0, 1.0) for d, w0, w1 in zip(W.dev, W.w0, W.w1)}
+    f1.apply_window(con, W)
     parts = f1.shared_parts(con)
     base = f1.build_window(con, WIN, secs, parts, devmap)
     if not len(base):
@@ -573,10 +601,11 @@ def _normalise_by_detector(df: pd.DataFrame, s: np.ndarray) -> np.ndarray:
     return (v / v.groupby(_det_groups(df), sort=False).transform("sum")).to_numpy()
 
 
-def siba_phase_probs(streams: dict, pieces_rel, net, keep: dict) -> pd.DataFrame:
+def siba_phase_probs(streams: dict, pieces_rel: dict, net, keep: dict) -> pd.DataFrame:
     """The phase network = the network's pair phase head, on the KEPT (detector, candidate) pairs (`keep`
     {(DeviceId, det): set of candidate phases}) -> DeviceId, Detector, cand_phase, p_gru (per detector a softmax over its
-    kept candidates, members averaged).  The pass is memoised on the streams and reused by the function stage."""
+    kept candidates, members averaged).  `pieces_rel` {DeviceId: the signal's pieces}.  The pass is memoised on the
+    streams and reused by the function stage."""
     rows = []
     for dev, z in streams.items():
         dets = [int(c) for c in z["det_ch"]]
@@ -586,7 +615,8 @@ def siba_phase_probs(streams: dict, pieces_rel, net, keep: dict) -> pd.DataFrame
         kd = {d: {int(c) for c in keep[(dev, d)]} for d in dets if (dev, d) in keep}
         if not kd:
             continue
-        _, pp = net.both(z, dets, pieces_rel, keep=kd)
+        _, pp = net.both(z, dets, pieces_rel[dev], keep=kd)
+        z.pop("_r15", None)        # the rasters (the pass itself stays memoised for the function stage): memory
         km = np.array([[int(c) in kd.get(d, ()) for c in cand] for d in dets], bool)
         di, ki = np.nonzero(km)
         rows.append(pd.DataFrame({"DeviceId": dev, "Detector": np.asarray(dets, np.int64)[di],
@@ -597,14 +627,14 @@ def siba_phase_probs(streams: dict, pieces_rel, net, keep: dict) -> pd.DataFrame
     return pd.concat(rows, ignore_index=True)
 
 
-def score(df: pd.DataFrame, sim: pd.DataFrame, model_dir: Path, con=None, w0: float | None = None,
-          w1: float | None = None, blend_cfg: dict | None = None, streams=None, pieces_rel=None,
-          lead: pd.DataFrame | None = None) -> pd.DataFrame:
+def score(df: pd.DataFrame, sim: pd.DataFrame, model_dir: Path, blend_cfg: dict | None = None, streams=None,
+          pieces_rel=None, lead: pd.DataFrame | None = None) -> pd.DataFrame:
     """Phase scoring.  Stage 1: the pair ranker, softmax per detector (p0; kept as p0_tree).  Stage 1b: the network's
     phase head on the candidates the ranker gives >= .01, blended 0.5 / 0.5 (a signal without streams -- not seen in
     practice, the streams are built from the same candidates and detectors -- keeps the ranker alone).  Stage 2: the
     joint decoder decode_v3, reading the similarity and lead-neighbour graphs; its binary output is normalised per
-    detector (prob)."""
+    detector (prob).  Every model call is row-blocked by signal (trees_onnx.by_group): a signal's scores are the ones
+    it gets alone."""
     meta = read_json(model_dir / f"{PHASE_STEM}.json")
     files = _bag_files(model_dir, PHASE_STEM, meta)
     miss = [c for c in meta["features"] if c not in df.columns]
@@ -612,7 +642,8 @@ def score(df: pd.DataFrame, sim: pd.DataFrame, model_dir: Path, con=None, w0: fl
         df = pd.concat([df, pd.DataFrame(np.nan, index=df.index, columns=miss)], axis=1)
     df = df.sort_values(["DeviceId", "Detector", "cand_phase"]).reset_index(drop=True)
     X = df[meta["features"]].to_numpy(np.float64, na_value=np.nan)
-    ps = [_softmax_by_detector(df, np.asarray(trees_onnx.load(f).predict(X))) for f in files]
+    sig = df.DeviceId.to_numpy()
+    ps = [_softmax_by_detector(df, np.asarray(trees_onnx.load(f).predict_by(X, sig))) for f in files]
     p0 = np.mean(ps, axis=0)
     # p0_tree = ranker only (the network's candidate filter reads it); p0 is blended below
     df = pd.concat([df, pd.DataFrame({"p0": p0, "p0_tree": p0.copy()}, index=df.index)], axis=1)
@@ -632,7 +663,8 @@ def score(df: pd.DataFrame, sim: pd.DataFrame, model_dir: Path, con=None, w0: fl
     for c in dmeta["features"]:
         if c not in Xd.columns:
             Xd[c] = np.nan
-    sd = np.asarray(dbst.predict(Xd[dmeta["features"]].to_numpy(np.float64, na_value=np.nan)))
+    sd = np.asarray(dbst.predict_by(Xd[dmeta["features"]].to_numpy(np.float64, na_value=np.nan),
+                                    Xd.DeviceId.to_numpy()))
     Xd["prob"] = (_normalise_by_detector(Xd, sd) if dmeta.get("mode") == "binary"
                   else _softmax_by_detector(Xd, sd, dmeta.get("temperature", 1.0)))
     return df.merge(Xd[key + ["prob"]], on=key, how="left")
@@ -696,20 +728,21 @@ def siba_keep(df: pd.DataFrame, thr: float = SIBA_KEEP_MIN_TREE_P) -> dict:
     return out
 
 
-def score_function(df: pd.DataFrame, model_dir: Path, con, b0: float, b1: float, streams=None, pieces_rel=None,
+def score_function(df: pd.DataFrame, model_dir: Path, con, W: pd.DataFrame, streams=None, pieces_rel=None,
                    siba_filter: bool | None = None, lag=None, devmap=None,
                    on_iv: dict | None = None):
     """The function half (function_stage.py) on the design frame built at each detector's predicted phase, with the
-    expert count bins laid on [b0, b1)."""
+    expert count bins laid on each signal's [b0, b1) (W: one row per signal)."""
     use_f = SIBA_FILTER if siba_filter is None else bool(siba_filter)
     net_keep = siba_keep(df) if use_f and "p0_tree" in df.columns else None
     top = _function_frame(df, lag)
     if not len(top):
         return None, pd.DataFrame()
-    ex = fx.build(con, b0, b1, top, devmap)
+    ex = fx.build(con, W, top, devmap)
     ex["Detector"] = ex.Detector.astype(top.Detector.dtype)
     top = top.merge(ex, on=["DeviceId", "Detector"], how="left")
-    return fs.run(con, top, model_dir, b0, b1, streams, pieces_rel, log, net_keep=net_keep, on_iv=on_iv)
+    bw = {str(d): (float(a), float(b)) for d, a, b in zip(W.DeviceId, W.b0, W.b1)}
+    return fs.run(con, top, model_dir, bw, streams, pieces_rel, log, net_keep=net_keep, on_iv=on_iv)
 
 
 # ----------------------------------------------------------------- assembly
@@ -760,23 +793,67 @@ def _lane_tuple(s) -> tuple:
     return tuple(int(x) for x in s.split(",") if x.strip().isdigit())
 
 
-def _health_events(con, dev: str, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> hc.Prep:
-    """One signal's allowed events inside [start, end) as health_core's prepared arrays, straight from `evd` (already
-    de-duplicated and channel-filtered): seconds from the window start (exact: integer nanoseconds / 1e9)."""
-    s_ns, e_ns = int(start_ts.value), int(end_ts.value)
+HEALTH_FETCH_SIGNALS = 10   # the health input is fetched for this many signals at a time (bounds memory)
+
+
+def _health_events(con, W: pd.DataFrame) -> dict:
+    """{DeviceId: health_core.Prep}: the allowed events of every signal of W inside its own [b0, b1), straight from
+    `evd` (already de-duplicated and channel-filtered), in ONE query: seconds from the window start (exact: integer
+    nanoseconds / 1e9)."""
     codes = ",".join(str(c) for c in hc.ALLOWED)
-    r = con.execute(f"SELECT (epoch_ns(e.Timestamp) - {s_ns})::DOUBLE / 1e9 AS t, e.EventId, e.Parameter "
-                    f"FROM evd e JOIN devmap m USING (dev) WHERE m.DeviceId = ? AND e.EventId IN ({codes}) "
-                    f"AND epoch_ns(e.Timestamp) >= {s_ns} AND epoch_ns(e.Timestamp) < {e_ns}", [dev]).fetchnumpy()
-    return hc.prep_arrays(r["t"], r["EventId"], r["Parameter"])
+    con.execute("CREATE OR REPLACE TEMP TABLE hwin (dev SMALLINT, s_ns BIGINT, e_ns BIGINT)")
+    con.executemany("INSERT INTO hwin VALUES (?, ?, ?)",
+                    [(int(d), int(_ts(a).value), int(_ts(b).value)) for d, a, b in zip(W.dev, W.b0, W.b1)])
+    r = con.execute(f"SELECT e.dev, (epoch_ns(e.Timestamp) - w.s_ns)::DOUBLE / 1e9 AS t, e.EventId, e.Parameter "
+                    f"FROM evd e JOIN hwin w USING (dev) WHERE e.EventId IN ({codes}) "
+                    f"AND epoch_ns(e.Timestamp) >= w.s_ns AND epoch_ns(e.Timestamp) < w.e_ns "
+                    f"ORDER BY e.dev, e.Timestamp, e.EventId, e.Parameter").fetchnumpy()
+    dv = np.asarray(r["dev"], dtype=np.int64)
+    t, eid, par = np.asarray(r["t"]), np.asarray(r["EventId"]), np.asarray(r["Parameter"])
+    name = dict(zip(W.dev.astype(int), W.DeviceId.astype(str)))
+    out = {}
+    for dev in W.dev.astype(int):
+        a, b = np.searchsorted(dv, dev, "left"), np.searchsorted(dv, dev, "right")
+        out[name[dev]] = hc.prep_arrays(t[a:b], eid[a:b], par[a:b])
+    return out
 
 
-def post_outputs(con, w0: float, w1: float, b0: float, b1: float, univ: pd.DataFrame,
+def _setback(con, d: pd.DataFrame, W: pd.DataFrame, model_dir: Path, notes: dict) -> pd.DataFrame:
+    """Setback of every detector with a predicted phase and function: one call per group of signals sharing the same
+    sample window [b0, b1) (one call for a batch with a common start / end); a group that fails is retried signal by
+    signal, so a failure only marks its own signal."""
+    key = ["DeviceId", "Detector"]
+    sbm = fs._cached(("setback", str(model_dir)), lambda: sb_mod.SetbackModel(model_dir / "setback"))
+    sd = d[key + ["phase_pred", "function_pred", "p_mid"]].rename(
+        columns={"phase_pred": "phase", "function_pred": "function"})
+    groups: dict = {}
+    for did, b0, b1 in zip(W.DeviceId.astype(str), W.b0, W.b1):
+        groups.setdefault((float(b0), float(b1)), []).append(did)
+    parts = []
+
+    def one(b0, b1, devs):
+        try:
+            parts.append(sb_mod.setback(con, b0, b1, sd[sd.DeviceId.isin(devs)], sbm, devices=devs))
+        except Exception as exc:                                   # pragma: no cover
+            if len(devs) > 1:
+                for x in devs:
+                    one(b0, b1, [x])
+            else:
+                notes.setdefault(devs[0], []).append(f"setback unavailable ({type(exc).__name__}: {exc})")
+    for (b0, b1), devs in groups.items():
+        one(b0, b1, devs)
+    parts = [p for p in parts if len(p)]
+    if not parts:
+        return pd.DataFrame(columns=key + ["distance_ft", "setback_confidence"])
+    return pd.concat(parts, ignore_index=True)[key + ["distance_ft", "setback_confidence"]]
+
+
+def post_outputs(con, W: pd.DataFrame, univ: pd.DataFrame,
                  top: pd.DataFrame, fn: pd.DataFrame | None, lph: pd.DataFrame | None, model_dir: Path,
                  on_iv: dict | None = None):
     """Lanes (from the function stage), setback, health and night speed for every detector, from the log still open on
-    `con` and the model's own answers (the raw opinion, before any refusal).  [b0, b1) = the sample window.
-    Returns (detector table with POST_COLS, phase table, note)."""
+    `con` and the model's own answers (the raw opinion, before any refusal).  W: one row per signal with its sample
+    window [b0, b1).  Returns (detector table with POST_COLS, phase table, {DeviceId: [notes]})."""
     key = ["DeviceId", "Detector"]
     d = univ[key].merge(top[key + ["phase_pred", "phase_prob"]], on=key, how="left")
     extra = ["lanes", "n_lanes_spanned", "lane_conf", "lane_phase"]
@@ -786,8 +863,9 @@ def post_outputs(con, w0: float, w1: float, b0: float, b1: float, univ: pd.DataF
         d["function_pred"] = None
         for c in PROB_COLS + extra:
             d[c] = np.nan
-    notes, h_parts, sp_det, sp_ph = [], [], [], []
-    start_ts, end_ts = _ts(b0), _ts(b1)
+    notes: dict = {}
+    h_parts, sp_det, sp_ph = [], [], []
+    bw = {str(x): (float(a), float(b)) for x, a, b in zip(W.DeviceId, W.b0, W.b1)}
     pt = lph.copy() if lph is not None and len(lph) else pd.DataFrame(columns=PHASE_COLS[:6])
     out = d[key].copy()
     lt = d[key + ["lanes", "lane_conf", "lane_phase"]].copy()
@@ -803,63 +881,75 @@ def post_outputs(con, w0: float, w1: float, b0: float, b1: float, univ: pd.DataF
     lt.loc[lt.lanes.eq(""), ["phase_n_lanes", "phase_n_lanes_conf", "lane_conf"]] = np.nan
     out = out.merge(lt[key + ["lanes", "lane_conf", "phase_n_lanes", "phase_n_lanes_conf"]], on=key, how="left")
     # setback: every detector with a predicted phase and function (the final, decoded function)
-    try:
-        sbm = fs._cached(("setback", str(model_dir)), lambda: sb_mod.SetbackModel(model_dir / "setback"))
-        sd = d[key + ["phase_pred", "function_pred", "p_mid"]].rename(
-            columns={"phase_pred": "phase", "function_pred": "function"})
-        st = sb_mod.setback(con, b0, b1, sd, sbm)
-        out = out.merge(st[key + ["distance_ft", "setback_confidence"]], on=key, how="left")
-    except Exception as exc:                                       # pragma: no cover
-        notes.append(f"setback unavailable ({type(exc).__name__}: {exc})")
-        out["distance_ft"] = np.nan
+    st = _setback(con, d, W, model_dir, notes)
+    out = out.merge(st, on=key, how="left")
     sbd = dict(zip(zip(out.DeviceId, out.Detector.astype(int)), out.distance_ft))
-    # greens of every phase inside the window (night speed), one query for all signals
+    # greens of every phase inside each signal's window (night speed), one query for all signals
+    _bin_params(con, W)
     cy = con.execute("SELECT m.DeviceId, c.p::INT AS p, c.gs, c.ge FROM cyc_all c JOIN devmap m USING (dev) "
-                     "WHERE c.gs < ? AND c.ge > ? ORDER BY m.DeviceId, c.p, c.gs", [b1, b0]).df()
+                     "JOIN bwin w USING (dev) WHERE c.gs < w.b1 AND c.ge > w.b0 ORDER BY m.DeviceId, c.p, c.gs").df()
     cyd = {k: v for k, v in cy.groupby("DeviceId", sort=False)}
-    on_iv = on_iv if on_iv is not None else on_table(con, b0, b1)
-    for dev, g in d.groupby("DeviceId", sort=True):
+    on_iv = on_iv if on_iv is not None else on_table(con, W)
+    dg = {k: g for k, g in d.groupby("DeviceId", sort=True)}
+    devs = sorted(dg)
+    wdev = W.set_index(W.DeviceId.astype(str))
+    for i0 in range(0, len(devs), HEALTH_FETCH_SIGNALS):
+        part = devs[i0:i0 + HEALTH_FETCH_SIGNALS]
         try:
-            prep = _health_events(con, dev, start_ts, end_ts)
-            phase = {int(k): float(v) for k, v in zip(g.Detector, g.phase_pred) if pd.notna(v)}
-            pconf = {int(k): float(v) for k, v in zip(g.Detector, g.phase_prob) if pd.notna(v)}
-            func = {int(r.Detector): {c: float(getattr(r, pc)) for c, pc in zip(FUNC_CLASSES, PROB_COLS)}
-                    for r in g.itertuples() if pd.notna(r.p_advance)}
-            span = {int(k): (1.0 if f == "Bike" else float(v))       # a bike zone covers one lane (note 148)
-                    for k, v, f in zip(g.Detector, g.n_lanes_spanned, g.function_pred) if pd.notna(v) and v > 0}
-            flab = {int(k): v for k, v in zip(g.Detector, g.function_pred) if isinstance(v, str)}
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                h, sig_note = hv4.assess(prep, start_ts, end_ts, phase, flab, func, span, pconf or None)
-            if len(h):
-                h = h.rename(columns={"detector": "Detector"})
-                h.insert(0, "DeviceId", dev)
-                h["health_signal_note"] = sig_note
-                h_parts.append(h)
+            preps = _health_events(con, wdev.loc[part].reset_index(drop=True))
         except Exception as exc:                                   # pragma: no cover
-            notes.append(f"health unavailable for {dev} ({type(exc).__name__})")
-        # night-time approach speed: advance -> lane-mate stop-bar zone, isolated night vehicles
-        try:
-            iv = on_iv.get(dev, {})
-            on = {k: v[0] for k, v in iv.items()}
-            off = {k: v[1] for k, v in iv.items()}
-            c = cyd.get(dev)
-            greens = ({} if c is None else
-                      {int(k): (np.maximum(x["gs"].to_numpy(float), b0), np.minimum(x["ge"].to_numpy(float), b1))
-                       for k, x in c.groupby("p")})
-            dl = []
-            for r in g.itertuples():
-                if pd.isna(r.phase_pred) or not isinstance(r.function_pred, str):
-                    continue
-                dl.append(dict(det=int(r.Detector), phase=int(r.phase_pred), function=r.function_pred,
-                               lanes=_lane_tuple(r.lanes), setback_ft=float(sbd.get((dev, int(r.Detector)), np.nan))))
-            dr, pr = ns_mod.night_speed(b0, b1, dl, on, off, greens)
-            for x in dr:
-                sp_det.append((dev, int(x["det"]), x["speed_mph"], x["n"] if np.isfinite(x["speed_mph"]) else np.nan))
-            for x in pr:
-                sp_ph.append((dev, int(x["phase"]), x["speed_mph"], x["n"] if np.isfinite(x["speed_mph"]) else np.nan))
-        except Exception as exc:                                   # pragma: no cover
-            notes.append(f"night speed unavailable for {dev} ({type(exc).__name__}: {exc})")
+            preps = {}
+            for dev in part:
+                notes.setdefault(dev, []).append(f"health unavailable for {dev} ({type(exc).__name__})")
+        for dev in part:
+            g = dg[dev]
+            b0, b1 = bw[dev]
+            start_ts, end_ts = _ts(b0), _ts(b1)
+            try:
+                if dev not in preps:
+                    raise KeyError(dev)
+                prep = preps.pop(dev)
+                phase = {int(k): float(v) for k, v in zip(g.Detector, g.phase_pred) if pd.notna(v)}
+                pconf = {int(k): float(v) for k, v in zip(g.Detector, g.phase_prob) if pd.notna(v)}
+                func = {int(r.Detector): {c: float(getattr(r, pc)) for c, pc in zip(FUNC_CLASSES, PROB_COLS)}
+                        for r in g.itertuples() if pd.notna(r.p_advance)}
+                span = {int(k): (1.0 if f == "Bike" else float(v))       # a bike zone covers one lane (note 148)
+                        for k, v, f in zip(g.Detector, g.n_lanes_spanned, g.function_pred) if pd.notna(v) and v > 0}
+                flab = {int(k): v for k, v in zip(g.Detector, g.function_pred) if isinstance(v, str)}
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    h, sig_note = hv4.assess(prep, start_ts, end_ts, phase, flab, func, span, pconf or None)
+                if len(h):
+                    h = h.rename(columns={"detector": "Detector"})
+                    h.insert(0, "DeviceId", dev)
+                    h["health_signal_note"] = sig_note
+                    h_parts.append(h)
+            except Exception as exc:                               # pragma: no cover
+                if not any(n.startswith("health unavailable") for n in notes.get(dev, [])):
+                    notes.setdefault(dev, []).append(f"health unavailable for {dev} ({type(exc).__name__})")
+            # night-time approach speed: advance -> lane-mate stop-bar zone, isolated night vehicles
+            try:
+                iv = on_iv.get(dev, {})
+                on = {k: v[0] for k, v in iv.items()}
+                off = {k: v[1] for k, v in iv.items()}
+                c = cyd.get(dev)
+                greens = ({} if c is None else
+                          {int(k): (np.maximum(x["gs"].to_numpy(float), b0), np.minimum(x["ge"].to_numpy(float), b1))
+                           for k, x in c.groupby("p")})
+                dl = []
+                for r in g.itertuples():
+                    if pd.isna(r.phase_pred) or not isinstance(r.function_pred, str):
+                        continue
+                    dl.append(dict(det=int(r.Detector), phase=int(r.phase_pred), function=r.function_pred,
+                                   lanes=_lane_tuple(r.lanes),
+                                   setback_ft=float(sbd.get((dev, int(r.Detector)), np.nan))))
+                dr, pr = ns_mod.night_speed(b0, b1, dl, on, off, greens)
+                for x in dr:
+                    sp_det.append((dev, int(x["det"]), x["speed_mph"], x["n"] if np.isfinite(x["speed_mph"]) else np.nan))
+                for x in pr:
+                    sp_ph.append((dev, int(x["phase"]), x["speed_mph"], x["n"] if np.isfinite(x["speed_mph"]) else np.nan))
+            except Exception as exc:                               # pragma: no cover
+                notes.setdefault(dev, []).append(f"night speed unavailable for {dev} ({type(exc).__name__}: {exc})")
     if sp_det:
         sdf = pd.DataFrame(sp_det, columns=["DeviceId", "Detector", "night_speed_mph", "night_speed_vehicles"])
         sdf["night_speed_mph"] = sdf.night_speed_mph.astype(float).round(1)
@@ -887,7 +977,7 @@ def post_outputs(con, w0: float, w1: float, b0: float, b1: float, univ: pd.DataF
         pt = pt[PHASE_COLS].sort_values(["DeviceId", "phase"]).reset_index(drop=True)
     else:
         pt = pd.DataFrame(columns=PHASE_COLS)
-    return out, pt, "; ".join(notes)
+    return out, pt, notes
 
 
 def _shown(v: float, d0: int) -> str:
@@ -912,7 +1002,7 @@ def _below(x: float, lim: float, d0: int) -> str:
     return f"{np.floor(x * 1e6) / 1e6:.6f}"
 
 
-def _assemble(univ, facts, gate, top, fn, post, model_note: str,
+def _assemble(univ, facts, gate, top, fn, post, model_note,
               min_actuations: int = MIN_ACTUATIONS,
               min_prob: float = MIN_PROB) -> pd.DataFrame:
     key = ["DeviceId", "Detector"]
@@ -1012,7 +1102,12 @@ def _assemble(univ, facts, gate, top, fn, post, model_note: str,
                    "function_pred", "function_prob", "phase_margin"] + PROB_COLS +
             ["lanes", "lane_conf", "phase_n_lanes", "phase_n_lanes_conf", "distance_ft",
              "setback_confidence", "night_speed_mph", "night_speed_vehicles"]] = np.nan
-    if model_note:
+    if isinstance(model_note, dict):           # {DeviceId: note}: each signal's own notes
+        nd = {k: v for k, v in model_note.items() if v}
+        if nd:
+            has = res.DeviceId.isin(list(nd)).to_numpy()
+            res.loc[has, "status"] = [f"{a}; {nd[k]}" for a, k in zip(res.status[has], res.DeviceId[has])]
+    elif model_note:
         res["status"] = res.status + "; " + model_note
 
     for c in ("phase_pred", "phase_2nd", "phase_guess", "phase_n_lanes", "night_speed_vehicles"):
@@ -1030,7 +1125,7 @@ def predict(events, start=None, end=None,
             chunk_signals: int | None = None, verbose: bool = False,
             min_actuations: int = MIN_ACTUATIONS,
             min_prob: float = MIN_PROB, return_phases: bool = False, siba_filter: bool | None = None,
-            profile: str | None = None):
+            profile: str | None = None, batch_signals: int | None = None):
     """Raw hi-res events -> one row per detector channel.  Never raises on thin data.
 
     Parameters
@@ -1042,6 +1137,8 @@ def predict(events, start=None, end=None,
     model_dir      weight folder (default: the packaged weights; env DC_WEIGHTS).
     threads, memory  DuckDB threads / memory limit (onnxruntime: env DC_TREE_THREADS / DC_NET_THREADS, default 4).
     chunk_signals  load the signals in groups of this many to bound peak memory (answers are the same either way).
+    batch_signals  process this many loaded signals together in one batched pass (default BATCH_SIGNALS = 50; 1 =
+                   one signal at a time).  Answers are bit for bit the same for any value.
     min_actuations below this many detector ON events no answer is given.
     min_prob       below this top-phase probability no answer is given (0 = off).
                    The model's raw opinion is kept in phase_guess / function_guess.
@@ -1058,13 +1155,14 @@ def predict(events, start=None, end=None,
     if gb.config(model_dir) is None:
         raise FileNotFoundError(f"no network ({gb.CONFIG_FILE} and its weights) in {model_dir}")
     empty = (_empty_result(), pd.DataFrame(columns=PHASE_COLS))
+    batch = max(1, int(batch_signals)) if batch_signals else BATCH_SIGNALS
 
     if chunk_signals:
         ids = device_ids or list_signals(events, start, end, threads, memory)
         if len(ids) > chunk_signals:
             parts = [predict(events, start, end, ids[i:i + chunk_signals],
                              model_dir, threads, memory, None, verbose, min_actuations,
-                             min_prob, True, siba_filter)
+                             min_prob, True, siba_filter, None, batch)
                      for i in range(0, len(ids), chunk_signals)]
             dets = [a for a, _ in parts if len(a)]
             phs = [b for _, b in parts if len(b)]
@@ -1078,15 +1176,14 @@ def predict(events, start=None, end=None,
         if not info["n_events"]:
             return empty if return_phases else empty[0]
         ids = [r[0] for r in con.sql("SELECT DeviceId FROM devmap ORDER BY dev").fetchall()]
-        if len(ids) > 1:
-            # every signal on its own (its own window, sample length and tables): batching never changes an answer
+        if len(ids) > batch:
             con.execute("ALTER TABLE evd RENAME TO evd_all")
         dets, phs = [], []
-        for dv in ids:
-            if len(ids) > 1:
-                w0, w1, info = _one_signal(con, dv)
-            r = _predict_loaded(con, w0, w1, start, end, model_dir, siba_filter, min_actuations, min_prob)
-            if r is not None:
+        for i in range(0, len(ids), batch):
+            part = ids[i:i + batch]
+            if len(ids) > batch:
+                _select_signals(con, part)
+            for r in _predict_batch(con, part, start, end, model_dir, siba_filter, min_actuations, min_prob):
                 dets.append(r[0])
                 if len(r[1]):
                     phs.append(r[1])
@@ -1099,51 +1196,91 @@ def predict(events, start=None, end=None,
         con.close()
 
 
-def _predict_loaded(con, w0: float, w1: float, start, end, model_dir: Path, siba_filter,
-                    min_actuations: int, min_prob: float):
-    """The whole pipeline on the ONE signal loaded in `evd` / `devmap` -> (detector table, phase table), or None."""
+class _BatchFailed(Exception):
+    """A batched stage failed: the batch is re-run one signal at a time (a failure then only marks its own signal,
+    as when each signal is passed alone)."""
+
+
+def _predict_batch(con, ids: list, start, end, model_dir: Path, siba_filter, min_actuations: int,
+                   min_prob: float) -> list:
+    """The pipeline on the signals loaded in `evd` / `devmap` (= `ids`) -> [(detector table, phase table)] (empty list
+    if nothing to report).  If a batched stage fails, every signal is re-run alone."""
+    W = _windows(con, start, end)
+    try:
+        r = _predict_loaded(con, W, model_dir, siba_filter, min_actuations, min_prob, strict=len(W) > 1)
+        return [] if r is None else [r]
+    except _BatchFailed:
+        con.execute("DROP TABLE IF EXISTS evd_batch")
+        con.execute("ALTER TABLE evd RENAME TO evd_batch")
+        out = []
+        try:
+            for dv in ids:
+                con.execute("CREATE OR REPLACE TEMP TABLE devmap (DeviceId VARCHAR, dev SMALLINT)")
+                con.execute("INSERT INTO devmap VALUES (?, 1)", [dv])
+                con.execute("CREATE OR REPLACE TEMP TABLE evd AS SELECT 1::SMALLINT AS dev, DeviceId, Timestamp, "
+                            "EventId, Parameter FROM evd_batch WHERE DeviceId = ?", [dv])
+                con.execute("DROP TABLE IF EXISTS cyc5")
+                r = _predict_loaded(con, _windows(con, start, end), model_dir, siba_filter, min_actuations,
+                                    min_prob, strict=False)
+                if r is not None:
+                    out.append(r)
+        finally:
+            con.execute("DROP TABLE IF EXISTS evd")
+            con.execute("ALTER TABLE evd_batch RENAME TO evd")
+        return out
+
+
+def _predict_loaded(con, W: pd.DataFrame, model_dir: Path, siba_filter, min_actuations: int, min_prob: float,
+                    strict: bool = False):
+    """The whole pipeline on the signals loaded in `evd` / `devmap`, each on its own windows (W, one row per signal)
+    -> (detector table, phase table), or None.  `strict`: a failing feature / function stage raises _BatchFailed
+    (the caller re-runs the signals one at a time) instead of marking the signals."""
     build_chunk_tables(con)
     univ = detector_universe(con)
     facts = signal_facts(con)
     if not len(univ):
         return None
     devmap = con.sql("SELECT dev, DeviceId FROM devmap").df()
-    gate = gate_frame(con, w1 - w0, w1)
-    note = ""
+    gate = gate_frame(con, W)
+    notes: dict = {}
+
+    def mark(msg):
+        for dv in W.DeviceId.astype(str):
+            notes.setdefault(dv, []).append(msg)
     # ---- the network's input (one network serves both tasks; it runs at every sample length)
     cfg = gb.config(model_dir)
-    minutes = round((w1 - w0) / 60.0)       # a request for exactly two hours stays on the all-pieces path
-    streams, pieces_rel = gb.streams_for(con, int(round(w0 * 1000)), int(round(w1 * 1000)),
-                                         **gb.piece_plan(cfg, minutes))
+    streams, pieces_rel = gb.streams_batch(con, W, cfg)
     try:
-        df, sim, lead, lag = build_features(con, w0, w1, devmap)
+        df, sim, lead, lag = build_features(con, W, devmap)
     except Exception as exc:                                  # pragma: no cover
+        if strict:
+            raise _BatchFailed() from exc
         df, sim, lead, lag = None, None, None, None
-        note = f"feature build failed ({type(exc).__name__})"
+        mark(f"feature build failed ({type(exc).__name__})")
     ph = fnr = lph = None
-    b0, b1 = _clip_window(*_bin_window(start, end, w0, w1), w0, w1)
-    on_iv = on_table(con, b0, b1)
+    on_iv = on_table(con, W)
     if df is not None and len(df):
         log(f"features {df.shape}, similarity {sim.shape}")
-        df = score(df, sim, model_dir, con, w0, w1, cfg, streams, pieces_rel, lead)
+        df = score(df, sim, model_dir, cfg, streams, pieces_rel, lead)
         ph = df[["DeviceId", "Detector", "cand_phase", "prob"]].copy()
         s = ph.groupby(["DeviceId", "Detector"])["prob"].transform("sum")
         ph["prob"] = ph.prob / s.replace(0, np.nan)
         ph = ph.dropna(subset=["prob"])
         try:
-            fnr, lph = score_function(df, model_dir, con, b0, b1, streams, pieces_rel, siba_filter, lag, devmap,
-                                      on_iv)
+            fnr, lph = score_function(df, model_dir, con, W, streams, pieces_rel, siba_filter, lag, devmap, on_iv)
         except Exception as exc:                              # pragma: no cover
-            note = (note + "; " if note else "") + \
-                f"function model unavailable ({type(exc).__name__}: {exc})"
+            if strict:
+                raise _BatchFailed() from exc
+            mark(f"function model unavailable ({type(exc).__name__}: {exc})")
         del df, sim, lead, lag
     streams = None
     top = _top_phase(ph)
-    post, phases, pnote = post_outputs(con, w0, w1, b0, b1, univ, top, fnr, lph, model_dir, on_iv)
+    post, phases, pnotes = post_outputs(con, W, univ, top, fnr, lph, model_dir, on_iv)
     log("lanes, setback, health and night speed done")
-    if pnote:
-        note = (note + "; " if note else "") + pnote
-    res = _assemble(univ, facts, gate, top, fnr, post, note, min_actuations, min_prob)
+    for dv, v in pnotes.items():
+        notes.setdefault(dv, []).extend(v)
+    res = _assemble(univ, facts, gate, top, fnr, post, {k: "; ".join(v) for k, v in notes.items()},
+                    min_actuations, min_prob)
     return res, phases
 
 
@@ -1171,12 +1308,13 @@ def run(events: str, out: str, device_ids=None, start=None, end=None,
         min_actuations: int = MIN_ACTUATIONS,
         min_prob: float = MIN_PROB, out_phases: str | None = None,
         siba_filter: bool | None = None, profile: str | None = None, verbose: bool = True,
-        out_atspm: str | None = None) -> pd.DataFrame:
+        out_atspm: str | None = None, batch_signals: int | None = None) -> pd.DataFrame:
     """CLI helper: predict and write a CSV (and, if asked, the per-phase lane table and the atspm detector
     configuration from `to_atspm_config` with its defaults)."""
     t0 = time.time()
     res, phases = predict(events, start, end, device_ids, model_dir, threads,
-                          memory, chunk_signals, verbose, min_actuations, min_prob, True, siba_filter, profile)
+                          memory, chunk_signals, verbose, min_actuations, min_prob, True, siba_filter, profile,
+                          batch_signals)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     res.to_csv(out, index=False)
     if out_phases:
@@ -1212,7 +1350,9 @@ def main(argv=None) -> None:
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--memory", default="4GB")
     ap.add_argument("--chunk-signals", type=int, default=None,
-                    help="process this many signals at a time to bound memory")
+                    help="load this many signals at a time to bound memory")
+    ap.add_argument("--batch-signals", type=int, default=None,
+                    help=f"process this many loaded signals together (default {BATCH_SIGNALS}; same answers)")
     ap.add_argument("--min-actuations", type=int, default=MIN_ACTUATIONS,
                     help="below this many detector ON events in the sample, report "
                          "'not enough data' instead of an answer (default %(default)s; "
@@ -1228,7 +1368,7 @@ def main(argv=None) -> None:
     ids = [s.strip() for s in a.device_ids.split(",")] if a.device_ids else None
     run(a.events, a.out, ids, a.start, a.end, Path(a.models),
         a.threads, a.memory, a.chunk_signals, a.min_actuations, a.min_prob, a.out_phases,
-        False if a.no_siba_filter else None, a.profile, not a.quiet, a.out_atspm)
+        False if a.no_siba_filter else None, a.profile, not a.quiet, a.out_atspm, a.batch_signals)
 
 
 if __name__ == "__main__":

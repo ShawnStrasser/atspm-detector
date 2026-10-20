@@ -78,6 +78,50 @@ class OnnxTrees:
         return raw[:, 0] if self.k == 1 else raw
 
 
+    def predict_by(self, X, groups) -> np.ndarray:
+        """`predict(X)` with every group of rows (one signal) scored exactly as if it were passed alone: see
+        `by_group`."""
+        return by_group(self.predict, X, groups)
+
+
+# onnxruntime's TreeEnsemble sums the trees in one order for a call of at most this many rows and in another for a
+# larger call (its parallel_N default): the two orders differ in the last bits.  Within each regime a row's score does
+# not depend on the other rows of the call.
+SMALL_CALL_ROWS = 50
+
+
+def by_group(predict, X, groups) -> np.ndarray:
+    """`predict(X)` row-blocked so that every group (a signal) gets the bits it gets when it is scored ALONE: groups of
+    at most SMALL_CALL_ROWS rows are scored one call each, all larger groups together in one call (one regime for
+    both: more than SMALL_CALL_ROWS rows).  Rows keep their positions."""
+    if hasattr(X, "to_numpy"):
+        X = X.to_numpy(dtype=np.float64, na_value=np.nan)
+    X = np.asarray(X, dtype=np.float64)
+    g = np.asarray(groups)
+    if len(g) != len(X):
+        raise ValueError("by_group: one group label per row")
+    if not len(X):
+        return predict(X)
+    _, inv, cnt = np.unique(g, return_inverse=True, return_counts=True)
+    inv = inv.reshape(-1)
+    small = cnt[inv] <= SMALL_CALL_ROWS
+    out = None
+    big = np.flatnonzero(~small)
+    parts = []
+    if len(big):
+        parts.append((big, predict(X[big])))
+    if small.any():
+        for k in np.unique(inv[small]):
+            ix = np.flatnonzero(inv == k)
+            parts.append((ix, predict(X[ix])))
+    for ix, p in parts:
+        p = np.asarray(p)
+        if out is None:
+            out = np.empty((len(X),) + p.shape[1:], dtype=p.dtype)
+        out[ix] = p
+    return out
+
+
 def load(path, threads: int = DEFAULT_THREADS) -> OnnxTrees:
     """Cached tree model per file (stays loaded for the life of the process: warm calls skip the load)."""
     key = (str(Path(path).resolve()), int(threads))
@@ -103,3 +147,7 @@ class Bag:
             p = m.predict(X)
             out = p if out is None else out + p
         return out / len(self.models)
+
+    def predict_by(self, X, groups) -> np.ndarray:
+        """`predict(X)` with every group of rows (one signal) scored exactly as if it were passed alone."""
+        return by_group(self.predict, X, groups)

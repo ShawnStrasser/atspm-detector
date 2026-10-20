@@ -109,16 +109,19 @@ class SetbackModel:
         return "full"
 
     def apply(self, F: pd.DataFrame, hours: float) -> pd.DataFrame:
+        """F may hold several signals (column `dev`): every model call is row-blocked by signal, so each signal's
+        rows get the scores they get alone (trees_onnx.by_group)."""
         g = self.group(hours)
+        sig = F["dev"].astype(str).to_numpy() if "dev" in F.columns else np.zeros(len(F))
         Fg = add_physics(F, self.p50["groups"][g]["L_fit"])
-        p50 = np.exp(self.p50_model(g).predict(Fg[self.p50["features"]].astype(float)))
+        p50 = np.exp(self.p50_model(g).predict_by(Fg[self.p50["features"]].astype(float), sig))
         Fb = add_physics(F, self.meta["L_fit"])
         Xb = Fb[self.features].astype(float)
         q = self.meta["cqr"]
         out = pd.DataFrame(index=F.index)
-        out["p10"] = np.minimum(np.exp(self.band(0.1).predict(Xb) - q), p50)
+        out["p10"] = np.minimum(np.exp(self.band(0.1).predict_by(Xb, sig) - q), p50)
         out["p50"] = p50
-        out["p90"] = np.maximum(np.exp(self.band(0.9).predict(Xb) + q), p50)
+        out["p90"] = np.maximum(np.exp(self.band(0.9).predict_by(Xb, sig) + q), p50)
         for c in ("p10", "p50", "p90"):
             out[c] = np.where(out[c] < CLIP0, 0.0, out[c])
         out["covered"] = F.covered
@@ -520,10 +523,11 @@ def confidence(p10, p50, p90, cuts) -> pd.Series:
 
 
 # --------------------------------------------------------------------------- entry point
-def setback(con, w0: float, w1: float, dets: pd.DataFrame, model: SetbackModel) -> pd.DataFrame:
+def setback(con, w0: float, w1: float, dets: pd.DataFrame, model: SetbackModel, devices=None) -> pd.DataFrame:
     """`con` = predict's open connection (onev_all, cyc_all, devmap built).  `dets`: DeviceId, Detector,
     phase (predicted), function (predicted, 7 classes), p_mid.  -> DeviceId, Detector, distance_ft,
-    setback_confidence (+ internal p10 / p50 / p90)."""
+    setback_confidence (+ internal p10 / p50 / p90).  [w0, w1) = the sample window shared by the signals
+    `devices` (None = every signal loaded)."""
     cols = ["DeviceId", "Detector", "distance_ft", "setback_confidence"]
     p = dets.rename(columns={"DeviceId": "dev", "Detector": "det", "function": "fn"}).copy()
     p = p[p.phase.notna() & p.fn.notna()].copy()
@@ -532,14 +536,20 @@ def setback(con, w0: float, w1: float, dets: pd.DataFrame, model: SetbackModel) 
     p["phase"] = p.phase.astype(int)
     p["det"] = p.det.astype(int)
     hours = (w1 - w0) / 3600.0
+    con.execute("CREATE OR REPLACE TEMP TABLE sb_devs (DeviceId VARCHAR)")
+    if devices is None:
+        con.execute("INSERT INTO sb_devs SELECT DeviceId FROM devmap")
+    else:
+        con.executemany("INSERT INTO sb_devs VALUES (?)", [(str(x),) for x in devices])
     con.execute(f"""CREATE OR REPLACE TEMP TABLE sb_iv AS
         SELECT m.DeviceId AS dev, o.det, o.t_on - {w0} AS t, o.dur::DOUBLE AS dur,
                (floor((o.t_on % 86400) / 3600) >= 22 OR floor((o.t_on % 86400) / 3600) < 6) AS quiet
-        FROM onev_all o JOIN devmap m USING (dev)""")
+        FROM onev_all o JOIN devmap m USING (dev) SEMI JOIN sb_devs s ON s.DeviceId = m.DeviceId""")
     con.execute(f"""CREATE OR REPLACE TEMP TABLE sb_cyc AS
         SELECT m.DeviceId AS dev, c.p::INT AS phase, c.gs - {w0} AS t_g, c.ge - {w0} AS t_y,
                c.rs - {w0} AS t_red, c.ng - {w0} AS t_next
-        FROM cyc_all c JOIN devmap m USING (dev) WHERE c.ng IS NOT NULL""")
+        FROM cyc_all c JOIN devmap m USING (dev) SEMI JOIN sb_devs s ON s.DeviceId = m.DeviceId
+        WHERE c.ng IS NOT NULL""")
     n = con.sql("SELECT dev, det::INT AS det, count(*) AS n_on FROM sb_iv GROUP BY ALL").df()
     p = p.merge(n, on=["dev", "det"], how="left")
     p["n_on"] = p.n_on.fillna(0)
@@ -549,7 +559,7 @@ def setback(con, w0: float, w1: float, dets: pd.DataFrame, model: SetbackModel) 
         else:
             F = pd.DataFrame()
     finally:
-        for t in ("sb_iv", "sb_cyc", "sb_ad", "sb_onc", "sb_ptab", "sb_prs", "sb_onw"):
+        for t in ("sb_iv", "sb_cyc", "sb_ad", "sb_onc", "sb_ptab", "sb_prs", "sb_onw", "sb_devs"):
             con.execute(f"DROP TABLE IF EXISTS {t}")
     if len(F):
         E = model.apply(F, hours)

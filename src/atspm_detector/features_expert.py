@@ -37,9 +37,9 @@ from .streams import ensure_cyc5
 # --------------------------------------------------------------- detector level
 SQL_DET = """
 WITH b AS (
-  SELECT dev, det, t_on, t_off, dur,
-         least(cast((t_on - {t0}) / {bs} AS INT), {nb} - 1) AS bk
-  FROM onw
+  SELECT o.dev, o.det, o.t_on, o.t_off, o.dur,
+         least(cast((o.t_on - x.t0) / x.bs AS INT), x.nb::INT - 1) AS bk, x.bs AS bsz
+  FROM onw o JOIN fxp x USING (dev)
 ), agg AS (
   SELECT dev, det, count(*) AS n,
     avg(CASE WHEN dur <= 0.25 THEN 1 ELSE 0 END)                 AS px_pulse_frac,
@@ -54,14 +54,14 @@ WITH b AS (
     max(dur) AS dmax
   FROM b GROUP BY 1,2
 ), pb AS (
-  SELECT dev, det, bk, count(*) AS n, sum(least(dur, {bs})) AS occ FROM b GROUP BY 1,2,3
+  SELECT dev, det, bk, count(*) AS n, sum(least(dur, bsz)) AS occ, any_value(bsz) AS bsz FROM b GROUP BY 1,2,3
 ), pstat AS (
   SELECT dev, det,
     var_samp(n) / nullif(avg(n), 0)                              AS px_disp_index,
     stddev_samp(n) / nullif(avg(n), 0)                           AS px_cnt_cv,
     quantile_cont(n, 0.9) / nullif(quantile_cont(n, 0.5), 0)     AS px_peak_over_med,
-    max(occ) / {bs}                                              AS px_occ_bin_max,
-    quantile_cont(occ, 0.9) / {bs}                               AS px_occ_bin_p90,
+    max(occ) / any_value(bsz)                                    AS px_occ_bin_max,
+    quantile_cont(occ, 0.9) / any_value(bsz)                     AS px_occ_bin_p90,
     count(*) AS nbin_seen
   FROM pb GROUP BY 1,2
 ), sat AS (
@@ -164,13 +164,13 @@ LEFT JOIN sec s ON a.dev = s.dev AND t.p = s.p
 # ------------------------------------------------------------- detector pairs
 SQL_PAIR = """
 WITH cnt AS (
-  SELECT dev, det, least(cast((t_on - {t0}) / {bs} AS INT), {nb} - 1) AS bk,
+  SELECT o.dev, o.det, least(cast((o.t_on - x.t0) / x.bs AS INT), x.nb::INT - 1) AS bk,
          count(*) AS n
-  FROM onw GROUP BY 1,2,3
+  FROM onw o JOIN fxp x USING (dev) GROUP BY 1,2,3
 ), dets AS (
   SELECT dev, det FROM cnt GROUP BY 1,2 HAVING sum(n) >= 20
-), bins AS (SELECT unnest(range(0, {nb})) AS bk)
-, grid AS (SELECT d.dev, d.det, b.bk FROM dets d CROSS JOIN bins b)
+), bins AS (SELECT dev, unnest(range(0, nb::BIGINT)) AS bk FROM fxp)
+, grid AS (SELECT d.dev, d.det, b.bk FROM dets d JOIN bins b ON d.dev = b.dev)
 , bc AS (
   SELECT g.dev, g.det, g.bk, coalesce(c.n, 0)::DOUBLE AS n
   FROM grid g LEFT JOIN cnt c ON g.dev = c.dev AND g.det = c.det AND g.bk = c.bk
@@ -228,9 +228,11 @@ def bins(secs: float) -> tuple[int, float]:
     return nb, secs / nb
 
 
-def prepare_tables(con, w0: float, w1: float, tgt: pd.DataFrame) -> None:
-    """The four input tables of the SQL above, from the package's own tables.
+def prepare_tables(con, W: pd.DataFrame, tgt: pd.DataFrame) -> None:
+    """The input tables of the SQL above, from the package's own tables, every signal on its own sample window
+    [w0, w1) = W's [b0, b1) (one row per signal: dev, b0, b1).
 
+    fxp    per signal: t0 (= w0), bs / nb (the count bins of `bins`)
     onw    detector ON intervals with the ON inside [w0, w1), duration in double
            precision (whole milliseconds, exactly as the research cache stored it)
     cycw   color cycles of every phase: begin green (1), begin yellow (8), begin red
@@ -239,20 +241,25 @@ def prepare_tables(con, w0: float, w1: float, tgt: pd.DataFrame) -> None:
     coordw the coordination state changes (event 131)
     tgt    each detector's predicted phase (DeviceId, Detector, pred_phase)
     """
-    con.execute(f"""CREATE OR REPLACE TEMP TABLE onw AS
-        SELECT dev, det, t_on, t_off, round((t_off - t_on) * 1000.0) / 1000.0 AS dur
-        FROM onev_all
-        WHERE t_on >= {w0} AND t_on < {w1} AND det BETWEEN 1 AND 64 AND t_off IS NOT NULL""")
+    from .common import param_table
+    bn = [bins(max(w1 - w0, 1.0)) for w0, w1 in zip(W.b0, W.b1)]
+    param_table(con, "fxp", "dev", W.dev, {"w0": [f"{w0}" for w0 in W.b0], "w1": [f"{w1}" for w1 in W.b1],
+                                          "t0": [f"{w0}" for w0 in W.b0], "bs": [f"{bs}" for _, bs in bn],
+                                          "nb": [f"{nb}" for nb, _ in bn]})
+    con.execute("""CREATE OR REPLACE TEMP TABLE onw AS
+        SELECT o.dev, o.det, o.t_on, o.t_off, round((o.t_off - o.t_on) * 1000.0) / 1000.0 AS dur
+        FROM onev_all o JOIN fxp x USING (dev)
+        WHERE o.t_on >= x.w0 AND o.t_on < x.w1 AND o.det BETWEEN 1 AND 64 AND o.t_off IS NOT NULL""")
     ensure_cyc5(con)            # the 1 / 8 / 10 / 11 cycle table, shared with the network input (streams.py)
-    con.execute(f"""CREATE OR REPLACE TEMP TABLE cycw AS
+    con.execute("""CREATE OR REPLACE TEMP TABLE cycw AS
         SELECT n.dev, n.p, n.cyc::INT AS cyc,
                epoch_ms(n.green_start)/1000.0 AS gs,
                epoch_ms(coalesce(n.yellow_start, n.red_start, n.next_green))/1000.0 AS ge,
                epoch_ms(n.next_green)/1000.0 AS ng
-        FROM cyc5 n
+        FROM cyc5 n JOIN fxp x USING (dev)
         WHERE n.next_green IS NOT NULL
-          AND epoch_ms(n.green_start)/1000.0 >= {w0}
-          AND epoch_ms(n.green_start)/1000.0 < {w1}""")
+          AND epoch_ms(n.green_start)/1000.0 >= x.w0
+          AND epoch_ms(n.green_start)/1000.0 < x.w1""")
     con.execute("""CREATE OR REPLACE TEMP TABLE coordw AS
         SELECT dev, t0, coalesce(is_coord, false) AS is_coord FROM coordiv""")
     t = tgt[["DeviceId", "Detector", "pred_phase"]].copy()
@@ -266,12 +273,11 @@ def prepare_tables(con, w0: float, w1: float, tgt: pd.DataFrame) -> None:
     con.unregister("tgt_df")
 
 
-def compute(con, t0: float, secs: float) -> pd.DataFrame:
+def compute(con) -> pd.DataFrame:
     """Run the three blocks over the prepared tables -> one row per (dev, det)."""
-    nb, bs = bins(secs)
-    d = con.sql(SQL_DET.format(t0=t0, bs=bs, nb=nb)).df()
+    d = con.sql(SQL_DET).df()
     c = con.sql(SQL_CYC).df()
-    p = con.sql(SQL_PAIR.format(t0=t0, bs=bs, nb=nb)).df()
+    p = con.sql(SQL_PAIR).df()
     out = d.merge(c, on=["dev", "det"], how="outer").merge(p, on=["dev", "det"], how="outer")
     out = out.replace([np.inf, -np.inf], np.nan)
     for col in out.columns:          # the training tables were stored in float32
@@ -280,12 +286,12 @@ def compute(con, t0: float, secs: float) -> pd.DataFrame:
     return out
 
 
-def build(con, w0: float, w1: float, tgt: pd.DataFrame, devmap: pd.DataFrame) -> pd.DataFrame:
-    """-> DeviceId, Detector, px_* for every detector of the sample."""
-    prepare_tables(con, w0, w1, tgt)
-    out = compute(con, w0, max(w1 - w0, 1.0))
+def build(con, W: pd.DataFrame, tgt: pd.DataFrame, devmap: pd.DataFrame) -> pd.DataFrame:
+    """-> DeviceId, Detector, px_* for every detector of every signal, each on its own [b0, b1) (W)."""
+    prepare_tables(con, W, tgt)
+    out = compute(con)
     out = out.merge(devmap[["dev", "DeviceId"]], on="dev", how="left").rename(columns={"det": "Detector"})
     out = out.drop(columns=["dev", "px_n_on"])
-    for tname in ("onw", "cycw", "coordw", "tgt"):
+    for tname in ("onw", "cycw", "coordw", "tgt", "fxp"):
         con.execute(f"DROP TABLE IF EXISTS {tname}")
     return out

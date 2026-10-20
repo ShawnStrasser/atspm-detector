@@ -44,14 +44,19 @@ SELECT p.dev, p.a, p.c, p.n_ab, ka.n AS na, kc.n AS nc
 FROM pa p JOIN na ka ON ka.dev=p.dev AND ka.det=p.a
           JOIN na kc ON kc.dev=p.dev AND kc.det=p.c
 WHERE p.n_ab >= 3
+ORDER BY p.dev, p.a, p.c
 """
 
 
-def build_window(con, win: str, secs: float, devmap: pd.DataFrame) -> pd.DataFrame:
+def build_window(con, win: str, secs, devmap: pd.DataFrame) -> pd.DataFrame:
+    """`secs`: the sample length, {dev: seconds} (one per signal) or one number for all."""
     d = con.sql(SQL_SIM).df()
     if not len(d):
         return pd.DataFrame()
-    N = max(secs / BIN_SECS, 2.0)
+    if isinstance(secs, dict):
+        N = np.array([max(secs[int(k)] / BIN_SECS, 2.0) for k in d.dev], dtype=np.float64)
+    else:
+        N = max(secs / BIN_SECS, 2.0)
     na, nc, nab = d.na.to_numpy(float), d.nc.to_numpy(float), d.n_ab.to_numpy(float)
     denom = np.sqrt(np.clip(na * (N - na) * nc * (N - nc), 1e-9, None))
     d["phi"] = (nab * N - na * nc) / denom

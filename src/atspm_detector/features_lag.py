@@ -79,6 +79,7 @@ FROM tot t JOIN pk  ON t.dev = pk.dev AND t.det = pk.det AND t.oth = pk.oth
 QUALIFY rank() OVER (PARTITION BY t.dev, t.det
                      ORDER BY ((pk.pk_c3 - 3.0 * t.n_m / {NBIN}) /
                                nullif(na.n_a, 0)::DOUBLE)::FLOAT DESC) <= {TOPK_LAG}
+ORDER BY t.dev, t.det, t.oth
 """
 
 
