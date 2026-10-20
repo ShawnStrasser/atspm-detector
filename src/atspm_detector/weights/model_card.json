@@ -1,6 +1,6 @@
 {
  "name": "atspm_detector",
- "version": "1.1.0",
+ "version": "1.2.0",
  "date": "2026-10-14",
  "status": "first public release. Trained on the high-resolution logs of several hundred signals (phase from the official controller timing, function from configuration exports checked against cabinet prints); evaluated by six-fold signal-grouped cross-validation and once on 115 held-out signals",
  "what_it_does": "per detector from the hi-res controller log alone: phase, function (Advance / Presence / Count / Yellow_Red / Mid / Bike / Other), lanes, setback distance, night speed; detector health is a separate output computed after classification and never read by it",

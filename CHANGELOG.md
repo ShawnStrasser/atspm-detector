@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (proposed 1.1.1) - batched prediction
+## 1.2.0 - batched prediction, detector health in DuckDB SQL
 
 - Detector health is now DuckDB SQL (note 153; `health_duckdb.py`), run for all signals of a batch in one pass straight
   from the loaded events; the numpy health modules (`health_core`, `health_v4`, `health_v4_stats`, `health_counts`)
