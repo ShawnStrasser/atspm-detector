@@ -2,9 +2,10 @@
 
 ## Unreleased (proposed 1.1.1) - batched prediction
 
-- `predict()` now processes many signals together (`batch_signals`, default 10; CLI `--batch-signals`): one set of DuckDB queries, one tree-model call per stage and one setback call for the whole batch, every signal still on its own window. On 24-hour samples a 100-signal call takes 81 s instead of 129 s (1.6x; 0.81 s per signal-day); one signal alone is unchanged. Peak memory for 100 signals 2.1 GB (was 1.7 GB); `batch_signals=1` restores one signal at a time.
+- `predict()` now processes many signals together (`batch_signals`; CLI `--batch-signals`): one set of DuckDB queries, one tree-model call per stage and one setback call for the whole batch, every signal still on its own window. On 24-hour samples a 100-signal call takes 81 s instead of 129 s (1.6x; 0.81 s per signal-day); one signal alone is unchanged. Peak memory for 100 signals 2.1 GB (was 1.7 GB); `batch_signals=1` restores one signal at a time.
 - Answers are bit for bit the same as 1.1.0 and the same alone or in any batch (checked on the bundled sample, 100 24-hour signals alone and batched, and 4-5 day logs). The tree models are scored per signal block, because onnxruntime sums trees in a different order for calls of more than 50 rows.
-- Health reads its events for 10 signals in one query; the health checks themselves still run signal by signal (unchanged time, about 125 ms per signal-day).
+- Health runs for 10 signals at a time as one batched pass (note 152): DuckDB returns each batch's detector events already sorted, its colour events, comms gaps and 5-minute coverage, and every health check runs for all signals of the batch at once. Health in a 100-signal 24-hour call takes 7.7 s instead of 12.3 s (77 ms per signal-day, was 123 ms; total 75 s instead of 79 s); 4-5 day logs 3.3 s instead of 4.2 s; one signal alone unchanged (0.12 s). Answers (every health column, notes and periods) are bit for bit the same as before, alone or batched.
+- `batch_signals=None` (the default) now follows the free physical memory: half of it at about 260 MB per million loaded events of an average signal (about 45 MB per typical signal-day), between 1 and 25 signals; 10 when the free memory cannot be read. Above 10-25 signals a batch gains no speed and only costs memory (100 signals in one call: peak 2.1 GB at 10, 2.7 GB at 25, 3.9 GB at 50). An explicit `batch_signals` still wins.
 
 ## 1.1.0 - reviewed health checks, bike lanes
 

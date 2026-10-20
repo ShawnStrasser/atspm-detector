@@ -12,8 +12,9 @@ Command line
     python -m atspm_detector --events day.parquet --device-ids <guid> --start "..." --end "..." --out preds.csv
 
 `events` has the columns DeviceId, Timestamp, EventId, Parameter (lowercase / underscore spellings accepted).  Any number
-of signals and any duration from a few minutes to days.  Signals are processed together, `batch_signals` at a time (one
-set of queries and one model call per stage for the whole batch), but every signal keeps its own window and sample
+of signals and any duration from a few minutes to days.  Signals are processed together, `batch_signals` at a time
+(default from the free memory; one set of queries and one model call per stage for the whole batch, health 10 signals
+at a time), but every signal keeps its own window and sample
 length and every computation stays within its signal, so a signal's answers are bit for bit the same alone or in any
 batch; for memory, lower `batch_signals` or load the signals in groups with `chunk_signals`.
 Timestamps are read as the controller's wall-clock time.  A time-zone-aware timestamp keeps its own wall-clock time
@@ -64,6 +65,7 @@ several detectors were held ON together (one common failure).
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import re
@@ -133,7 +135,11 @@ PHASE_COLS = ["DeviceId", "phase", "n_detectors", "n_lanes", "n_lanes_conf",
 PHASE_STEM = "phase_lgbm_v5"
 DECODE_STEM = "decode_v3"
 
-BATCH_SIGNALS = 10       # signals processed together (one batched pass); answers do not depend on it
+BATCH_SIGNALS = 10       # signals processed together when the free memory is unknown; answers do not depend on it
+BATCH_RANGE = (1, 25)    # the memory-based default batch stays inside this range (no speed gain above ~10-25)
+MB_PER_MEVENT = 260.0    # peak working memory of a batched pass per million loaded events (note 152: ~45 MB per
+                         # typical signal-day of ~190k events)
+MEM_SHARE = 0.5          # share of the free physical memory the batch may use
 MIN_ACTUATIONS = 5       # below this many detector ON events in the sample: no answer
 MIN_PROB = 0.0           # below this top-phase probability: no answer (0 = off)
 # The network's candidate filter: the pair graph runs only on (detector, candidate) pairs with ranker p >= .01 (ON by
@@ -793,29 +799,99 @@ def _lane_tuple(s) -> tuple:
     return tuple(int(x) for x in s.split(",") if x.strip().isdigit())
 
 
-HEALTH_FETCH_SIGNALS = 10   # the health input is fetched for this many signals at a time (bounds memory)
+HEALTH_FETCH_SIGNALS = 10   # health runs for this many signals at a time (bounds memory; larger gains nothing)
+COV_BIN_NS = 300 * 1_000_000_000
 
 
-def _health_events(con, W: pd.DataFrame) -> dict:
-    """{DeviceId: health_core.Prep}: the allowed events of every signal of W inside its own [b0, b1), straight from
-    `evd` (already de-duplicated and channel-filtered), in ONE query: seconds from the window start (exact: integer
-    nanoseconds / 1e9)."""
+def _health_prep(con, W: pd.DataFrame) -> hc.Prep:
+    """one health_core.Prep for the signals of W (rows in signal order, all sharing one window [b0, b1)), straight
+    from `evd` (already de-duplicated and channel-filtered) in DuckDB (note 152): the detector events sorted by
+    (signal, channel, time, ON before OFF), the colour events, the comms gaps (no event of any allowed code for
+    > GAP_S s) and the 5-min bins with any event.  Times are seconds from the window start (exact: integer nanoseconds
+    / 1e9); the bins are integer nanoseconds // 300 s (= the bin of that time)."""
     codes = ",".join(str(c) for c in hc.ALLOWED)
-    con.execute("CREATE OR REPLACE TEMP TABLE hwin (dev SMALLINT, s_ns BIGINT, e_ns BIGINT)")
-    con.executemany("INSERT INTO hwin VALUES (?, ?, ?)",
-                    [(int(d), int(_ts(a).value), int(_ts(b).value)) for d, a, b in zip(W.dev, W.b0, W.b1)])
-    r = con.execute(f"SELECT e.dev, (epoch_ns(e.Timestamp) - w.s_ns)::DOUBLE / 1e9 AS t, e.EventId, e.Parameter "
-                    f"FROM evd e JOIN hwin w USING (dev) WHERE e.EventId IN ({codes}) "
-                    f"AND epoch_ns(e.Timestamp) >= w.s_ns AND epoch_ns(e.Timestamp) < w.e_ns "
-                    f"ORDER BY e.dev, e.Timestamp, e.EventId, e.Parameter").fetchnumpy()
-    dv = np.asarray(r["dev"], dtype=np.int64)
-    t, eid, par = np.asarray(r["t"]), np.asarray(r["EventId"]), np.asarray(r["Parameter"])
-    name = dict(zip(W.dev.astype(int), W.DeviceId.astype(str)))
-    out = {}
-    for dev in W.dev.astype(int):
-        a, b = np.searchsorted(dv, dev, "left"), np.searchsorted(dv, dev, "right")
-        out[name[dev]] = hc.prep_arrays(t[a:b], eid[a:b], par[a:b])
-    return out
+    con.execute("CREATE OR REPLACE TEMP TABLE hwin (dev SMALLINT, s INTEGER, s_ns BIGINT, e_ns BIGINT)")
+    con.executemany("INSERT INTO hwin VALUES (?, ?, ?, ?)",
+                    [(int(d), k, int(_ts(a).value), int(_ts(b).value)) for k, (d, a, b) in
+                     enumerate(zip(W.dev, W.b0, W.b1))])
+    con.execute(f"CREATE OR REPLACE TEMP TABLE hsel AS SELECT w.s, epoch_ns(e.Timestamp) - w.s_ns AS dn, e.EventId, "
+                f"e.Parameter FROM evd e JOIN hwin w USING (dev) WHERE e.EventId IN ({codes}) "
+                f"AND epoch_ns(e.Timestamp) >= w.s_ns AND epoch_ns(e.Timestamp) < w.e_ns")
+    try:
+        d = con.execute("SELECT s, dn::DOUBLE / 1e9 AS t, EventId, Parameter FROM hsel WHERE EventId IN (81, 82) "
+                        "ORDER BY s, Parameter, dn, EventId <> 82").fetchnumpy()
+        c = con.execute(f"SELECT s, dn::DOUBLE / 1e9 AS t, EventId, Parameter FROM hsel "
+                        f"WHERE EventId IN ({','.join(str(x) for x in hc.COLOUR)}) ORDER BY s, Parameter, dn, EventId"
+                        ).fetchnumpy()
+        # consecutive event times (ties are 0 apart): each pair of consecutive distinct times appears once
+        g = con.execute(f"SELECT s, t, nt FROM (SELECT s, dn::DOUBLE / 1e9 AS t, lead(dn::DOUBLE / 1e9) OVER "
+                        f"(PARTITION BY s ORDER BY dn) AS nt FROM hsel) WHERE nt - t > {hc.GAP_S} "
+                        f"ORDER BY s, t").fetchnumpy()
+        v = con.execute(f"SELECT DISTINCT s, dn // {COV_BIN_NS} AS b FROM hsel").fetchnumpy()
+    finally:
+        con.execute("DROP TABLE IF EXISTS hsel")
+    S = len(W)
+    P = hc.Prep()
+    P.S, P.names, P.cache, P.ut, P.usig = S, list(W.DeviceId.astype(str)), {}, None, None
+    ds = np.asarray(d["s"], np.int64)
+    P.td, P.ed = np.asarray(d["t"], np.float64), np.asarray(d["EventId"]).astype(int)
+    P.pd_ = ds * hc.BASE + np.asarray(d["Parameter"]).astype(np.int64)
+    cs = np.asarray(c["s"], np.int64)
+    P.t, P.eid, P.tsig = np.asarray(c["t"], np.float64), np.asarray(c["EventId"]).astype(int), cs
+    P.par = cs * hc.PB + np.asarray(c["Parameter"]).astype(np.int64)
+    P.csorted = True                          # sorted by (signal, phase, time, code) = by (phase key, time, code)
+    P.g0, P.g1, P.gsig = np.asarray(g["t"], np.float64), np.asarray(g["nt"], np.float64), np.asarray(g["s"], np.int64)
+    vs, vb = np.asarray(v["s"], np.int64), np.asarray(v["b"], np.int64)
+    P.empty = not (len(P.td) or len(P.t) or len(vs))
+
+    def covs(nb, bin_s):                      # bins of bin_s seconds (a multiple of 5 min) with any event
+        k = int(bin_s) // 300
+        assert k * 300 == int(bin_s), "coverage bins are multiples of 5 min"
+        out = np.zeros((S, nb * k), bool)
+        ok = vb < nb * k
+        out[vs[ok], vb[ok]] = True
+        return out.reshape(S, nb, k).any(2)
+    P.covs = covs
+    return P
+
+
+def _health_items(g: pd.DataFrame) -> dict:
+    """the classifier's answers of one signal as health_v4.assess takes them."""
+    return dict(phase={int(k): float(v) for k, v in zip(g.Detector, g.phase_pred) if pd.notna(v)},
+                phase_conf={int(k): float(v) for k, v in zip(g.Detector, g.phase_prob) if pd.notna(v)} or None,
+                fn_prob={int(r.Detector): {c: float(getattr(r, pc)) for c, pc in zip(FUNC_CLASSES, PROB_COLS)}
+                         for r in g.itertuples() if pd.notna(r.p_advance)},
+                lanes={int(k): (1.0 if f == "Bike" else float(v))       # a bike zone covers one lane (note 148)
+                       for k, v, f in zip(g.Detector, g.n_lanes_spanned, g.function_pred) if pd.notna(v) and v > 0},
+                fn_label={int(k): v for k, v in zip(g.Detector, g.function_pred) if isinstance(v, str)})
+
+
+def _health(con, wpart: pd.DataFrame, dg: dict, notes: dict) -> dict:
+    """{DeviceId: (table, signal note)} for the signals of wpart: one batched assess per group of signals sharing a
+    window; a group that fails is retried signal by signal, so a failure only marks its own signal."""
+    res = {}
+    groups: dict = {}
+    for k, (b0, b1) in enumerate(zip(wpart.b0, wpart.b1)):
+        groups.setdefault((float(b0), float(b1)), []).append(k)
+
+    def run(rows):
+        Wg = wpart.iloc[rows].reset_index(drop=True)
+        devs = list(Wg.DeviceId.astype(str))
+        try:
+            P = _health_prep(con, Wg)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                out = hv4.assess_group(P, _ts(Wg.b0.iat[0]), _ts(Wg.b1.iat[0]), [_health_items(dg[x]) for x in devs])
+            res.update(zip(devs, out))
+        except Exception as exc:                                   # pragma: no cover
+            if len(rows) > 1:
+                for r in rows:
+                    run([r])
+            elif not any(n.startswith("health unavailable") for n in notes.get(devs[0], [])):
+                notes.setdefault(devs[0], []).append(f"health unavailable for {devs[0]} ({type(exc).__name__})")
+    for rows in groups.values():
+        run(rows)
+    return res
 
 
 def _setback(con, d: pd.DataFrame, W: pd.DataFrame, model_dir: Path, notes: dict) -> pd.DataFrame:
@@ -895,38 +971,17 @@ def post_outputs(con, W: pd.DataFrame, univ: pd.DataFrame,
     wdev = W.set_index(W.DeviceId.astype(str))
     for i0 in range(0, len(devs), HEALTH_FETCH_SIGNALS):
         part = devs[i0:i0 + HEALTH_FETCH_SIGNALS]
-        try:
-            preps = _health_events(con, wdev.loc[part].reset_index(drop=True))
-        except Exception as exc:                                   # pragma: no cover
-            preps = {}
-            for dev in part:
-                notes.setdefault(dev, []).append(f"health unavailable for {dev} ({type(exc).__name__})")
+        hres = _health(con, wdev.loc[part].reset_index(drop=True), dg, notes)
         for dev in part:
             g = dg[dev]
             b0, b1 = bw[dev]
-            start_ts, end_ts = _ts(b0), _ts(b1)
-            try:
-                if dev not in preps:
-                    raise KeyError(dev)
-                prep = preps.pop(dev)
-                phase = {int(k): float(v) for k, v in zip(g.Detector, g.phase_pred) if pd.notna(v)}
-                pconf = {int(k): float(v) for k, v in zip(g.Detector, g.phase_prob) if pd.notna(v)}
-                func = {int(r.Detector): {c: float(getattr(r, pc)) for c, pc in zip(FUNC_CLASSES, PROB_COLS)}
-                        for r in g.itertuples() if pd.notna(r.p_advance)}
-                span = {int(k): (1.0 if f == "Bike" else float(v))       # a bike zone covers one lane (note 148)
-                        for k, v, f in zip(g.Detector, g.n_lanes_spanned, g.function_pred) if pd.notna(v) and v > 0}
-                flab = {int(k): v for k, v in zip(g.Detector, g.function_pred) if isinstance(v, str)}
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    h, sig_note = hv4.assess(prep, start_ts, end_ts, phase, flab, func, span, pconf or None)
+            if dev in hres:
+                h, sig_note = hres[dev]
                 if len(h):
                     h = h.rename(columns={"detector": "Detector"})
                     h.insert(0, "DeviceId", dev)
                     h["health_signal_note"] = sig_note
                     h_parts.append(h)
-            except Exception as exc:                               # pragma: no cover
-                if not any(n.startswith("health unavailable") for n in notes.get(dev, [])):
-                    notes.setdefault(dev, []).append(f"health unavailable for {dev} ({type(exc).__name__})")
             # night-time approach speed: advance -> lane-mate stop-bar zone, isolated night vehicles
             try:
                 iv = on_iv.get(dev, {})
@@ -1120,6 +1175,42 @@ def _assemble(univ, facts, gate, top, fn, post, model_note,
 
 
 # ---------------------------------------------------------------- entry points
+def available_memory_mb() -> float | None:
+    """free physical memory in MB (Windows: GlobalMemoryStatusEx; Linux: MemAvailable in /proc/meminfo; elsewhere
+    os.sysconf available pages), or None when it cannot be read."""
+    try:
+        if os.name == "nt":
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            m = _MS()
+            m.dwLength = ctypes.sizeof(_MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                return m.ullAvailPhys / 2 ** 20
+            return None
+        if os.path.exists("/proc/meminfo"):
+            with open("/proc/meminfo", encoding="ascii") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return float(line.split()[1]) / 1024
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2 ** 20
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def auto_batch(n_events: int, n_signals: int, free_mb: float | None = None) -> int:
+    """the default batch_signals: as many signals as half the free memory holds at MB_PER_MEVENT per million loaded
+    events of an average signal, within BATCH_RANGE; BATCH_SIGNALS when the free memory is unknown."""
+    free_mb = available_memory_mb() if free_mb is None else free_mb
+    if not free_mb or free_mb <= 0 or n_signals <= 0:
+        return BATCH_SIGNALS
+    per_signal = max(n_events / n_signals, 1.0) / 1e6 * MB_PER_MEVENT
+    return int(min(max(MEM_SHARE * free_mb // per_signal, BATCH_RANGE[0]), BATCH_RANGE[1]))
+
+
 def predict(events, start=None, end=None,
             device_ids=None, model_dir=None, threads: int = 4, memory: str = "4GB",
             chunk_signals: int | None = None, verbose: bool = False,
@@ -1137,8 +1228,10 @@ def predict(events, start=None, end=None,
     model_dir      weight folder (default: the packaged weights; env DC_WEIGHTS).
     threads, memory  DuckDB threads / memory limit (onnxruntime: env DC_TREE_THREADS / DC_NET_THREADS, default 4).
     chunk_signals  load the signals in groups of this many to bound peak memory (answers are the same either way).
-    batch_signals  process this many loaded signals together in one batched pass (default BATCH_SIGNALS = 50; 1 =
-                   one signal at a time).  Answers are bit for bit the same for any value.
+    batch_signals  process this many loaded signals together in one batched pass (1 = one signal at a time).  Default
+                   None: from the free physical memory (half of it, ~260 MB per million loaded events of an average
+                   signal, i.e. ~45 MB per typical signal-day), between 1 and 25; 10 when the free memory cannot be
+                   read.  Answers are bit for bit the same for any value.
     min_actuations below this many detector ON events no answer is given.
     min_prob       below this top-phase probability no answer is given (0 = off).
                    The model's raw opinion is kept in phase_guess / function_guess.
@@ -1155,7 +1248,7 @@ def predict(events, start=None, end=None,
     if gb.config(model_dir) is None:
         raise FileNotFoundError(f"no network ({gb.CONFIG_FILE} and its weights) in {model_dir}")
     empty = (_empty_result(), pd.DataFrame(columns=PHASE_COLS))
-    batch = max(1, int(batch_signals)) if batch_signals else BATCH_SIGNALS
+    batch = max(1, int(batch_signals)) if batch_signals else None
 
     if chunk_signals:
         ids = device_ids or list_signals(events, start, end, threads, memory)
@@ -1176,6 +1269,9 @@ def predict(events, start=None, end=None,
         if not info["n_events"]:
             return empty if return_phases else empty[0]
         ids = [r[0] for r in con.sql("SELECT DeviceId FROM devmap ORDER BY dev").fetchall()]
+        if batch is None:
+            batch = auto_batch(int(info["n_events"]), len(ids))
+            log(f"batch_signals {batch} (free memory)")
         if len(ids) > batch:
             con.execute("ALTER TABLE evd RENAME TO evd_all")
         dets, phs = [], []
@@ -1352,7 +1448,7 @@ def main(argv=None) -> None:
     ap.add_argument("--chunk-signals", type=int, default=None,
                     help="load this many signals at a time to bound memory")
     ap.add_argument("--batch-signals", type=int, default=None,
-                    help=f"process this many loaded signals together (default {BATCH_SIGNALS}; same answers)")
+                    help="process this many loaded signals together (default: from the free memory, 1-25; same answers)")
     ap.add_argument("--min-actuations", type=int, default=MIN_ACTUATIONS,
                     help="below this many detector ON events in the sample, report "
                          "'not enough data' instead of an answer (default %(default)s; "

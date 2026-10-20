@@ -55,26 +55,17 @@ def _phase_vec(dets, phase):
     return np.array([phase.get(int(d), np.nan) for d in dets], float)
 
 
-def yardsticks(B, phase):
-    """per detector of B: the yardstick weight matrix W (R = W @ counts), the occupancy mates matrix (partner or
-    phase reference; empty row = none) and the kind ('partner' / 'phase' / 'signal').  Cached in B."""
-    key = ("_yard", tuple(sorted((int(k), float(v)) for k, v in phase.items())))
-    if key in B:
-        return B[key]
-    dets = B["dets"]
-    nd = len(dets)
-    n, cov = B["n_on"].astype(float), B["cov"]
+def _yard_one(n, cov, tw, ph, n15, ok):
+    """yardsticks of ONE signal (its rows only): W, Wm (rows x rows), kind, live."""
+    nd = len(n)
     live = n[:, cov].sum(1) > 0
-    tw = hc.twins_of(B)
-    ph = _phase_vec(dets, phase)
     eye = np.eye(nd, dtype=bool)
     same = np.isfinite(ph)[:, None] & (ph[:, None] == ph[None, :]) & ~eye
-    # phase reference (health_core._refs): other live same-phase detectors, no twin, >= 2 of them
+    # phase reference (health_core refs): other live same-phase detectors, no twin, >= 2 of them
     ref = same & live[None, :] & ~tw
     is_ph = ref.sum(1) >= 2
     # partner (health_core._partner): best 15-min correlation among the live same-phase detectors, >= .7
     cand = same & live[None, :]
-    n15, ok = hc._counts15(B)
     part = np.full(nd, -1)
     if ok.sum() >= 16 and cand.any():
         X = n15[:, ok].astype(float)
@@ -101,22 +92,65 @@ def yardsticks(B, phase):
     W[np.flatnonzero(hp), part[hp]] = 1.0
     Wm[np.flatnonzero(hp), part[hp]] = True
     kind = np.where(hp, "partner", np.where(is_ph, "phase", "signal"))
-    out = dict(W=W, Wm=Wm.astype(float), has_m=Wm.any(1), kind=kind, live=live, tw=tw, ph=ph)
+    return W, Wm.astype(float), kind, live
+
+
+def yardsticks(B, phase):
+    """per signal of B: the yardstick weight matrix W (R = W @ counts) and the occupancy mates matrix Wm (partner or
+    phase reference; empty row = none) of its rows; per row: has_m, kind, live, phase key; the twins (padded, local
+    rows).  Cached in B."""
+    key = ("_yard", tuple(sorted((int(k), float(v)) for k, v in phase.items())))
+    if key in B:
+        return B[key]
+    L = hc.layout(B)
+    dets = B["dets"]
+    nd = len(dets)
+    n, cov = B["n_on"].astype(float), B["cov"]
+    tw = hc.twins_of(B)
+    ph = _phase_vec(dets, phase)
+    n15, ok = hc._counts15(B)
+    Ws, Wms = [], []
+    kind = np.empty(nd, object)
+    live = np.zeros(nd, bool)
+    has_m = np.zeros(nd, bool)
+    for s in range(L["S"]):
+        r = hc._rows_of_signal(L, s)
+        if not len(r):
+            Ws.append(np.zeros((0, 0)))
+            Wms.append(np.zeros((0, 0)))
+            continue
+        W, Wm, k, lv = _yard_one(n[r], cov[s], tw[s][:len(r), :len(r)], ph[r], n15[r], ok[s])
+        Ws.append(W)
+        Wms.append(Wm)
+        kind[r], live[r], has_m[r] = k, lv, Wm.any(1)
+    out = dict(W=Ws, Wm=Wms, has_m=has_m, kind=kind, live=live, tw=tw, ph=ph, L=L)
     B[key] = out
+    return out
+
+
+def _per_signal_matmul(L, Ws, X):
+    """rows x k: for each signal, its matrix (rows x rows) @ its rows of X (the one-signal matmul, same call)."""
+    out = np.zeros((len(X),) + X.shape[1:])
+    for s, W in enumerate(Ws):
+        a, b = L["ptr"][s], L["ptr"][s + 1]
+        if b > a:
+            out[a:b] = W @ X[a:b]
     return out
 
 
 # ============================================================================ hourly GEH (count drops, night)
 def _hours(B):
-    """5-min bins -> clock hours: hour index of each bin, the fully covered hours, their hour of day and start."""
-    nb = len(B["cov"])
+    """5-min bins -> clock hours: hour index of each bin, the fully covered hours (signals x hours), their hour of day
+    and start."""
+    cov = np.atleast_2d(B["cov"])
+    nb = cov.shape[1]
     s0 = int(pd.Timestamp(B["start"]).value)
     t = s0 + np.arange(nb, dtype=np.int64) * int(B["bin_s"]) * 1_000_000_000
     hid = t // HOUR_NS
     u, inv, cnt = np.unique(hid, return_inverse=True, return_counts=True)
-    cov_h = np.bincount(inv, weights=B["cov"].astype(float), minlength=len(u))
+    cov_h = np.stack([np.bincount(inv, weights=c.astype(float), minlength=len(u)) for c in cov])
     per_h = HOUR_NS // (int(B["bin_s"]) * 1_000_000_000)
-    ch = (cnt == per_h) & (cov_h == per_h)
+    ch = (cnt == per_h)[None, :] & (cov_h == per_h)
     return inv, ch, (u % 24).astype(int), pd.to_datetime(u * HOUR_NS)
 
 
@@ -134,14 +168,15 @@ def hourly_geh(B, phase) -> pd.DataFrame:
     """per detector of B: geh_ok (scored), geh_night, night_n, night_exp, geh_drop, drop_t (start of the first hour
     after the drop), own_before / own_after / exp_after (per hour), occ_own / occ_mates (mean hourly occupancy after
     / before the drop point)."""
+    hc.norm_bins(B)
     dets = B["dets"]
     nd = len(dets)
     cols = ["detector", "geh_ok", "geh_night", "geh_night_n", "geh_night_exp", "geh_drop", "drop_t", "own_before", "own_after",
             "exp_after", "occ_own", "occ_mates"]
     if not nd:
         return pd.DataFrame(columns=cols)
-    inv, ch, hod, h0 = _hours(B)
-    H = len(ch)
+    inv, chs, hod, h0 = _hours(B)
+    H = chs.shape[1]
     n = B["n_on"].astype(float)
     occ = B["occ"].astype(float)
     Mh = np.zeros((nd, H))
@@ -149,37 +184,38 @@ def hourly_geh(B, phase) -> pd.DataFrame:
     np.add.at(Mh.T, inv, n.T)
     np.add.at(Oh.T, inv, occ.T)
     Y = yardsticks(B, phase)
-    R = Y["W"] @ Mh
-    Om = Y["Wm"] @ Oh
-    day = ch & (hod >= DAY_H[0]) & (hod < DAY_H[1])
-    nt = ch & ((hod >= NIGHT_H[0]) | (hod < NIGHT_H[1]))
-    D2 = np.broadcast_to(day, (nd, H))
+    L = Y["L"]
+    ch = chs[L["rs"]]
+    R = _per_signal_matmul(L, Y["W"], Mh)
+    Om = _per_signal_matmul(L, Y["Wm"], Oh)
+    day = ch & ((hod >= DAY_H[0]) & (hod < DAY_H[1]))[None, :]
+    nt = ch & ((hod >= NIGHT_H[0]) | (hod < NIGHT_H[1]))[None, :]
     elig = ((Mh * day).sum(1) >= 20) & ((R * day).sum(1) > 0)
-    s = _share(Mh, R, D2)
+    s = _share(Mh, R, day)
     C = s[:, None] * R
     # misses at night: the average night hour
-    nn = int(nt.sum())
+    nn = nt.sum(1)
     with np.errstate(invalid="ignore", divide="ignore"):
-        mn, cn = (Mh * nt).sum(1) / max(nn, 1), (C * nt).sum(1) / max(nn, 1)
+        mn, cn = (Mh * nt).sum(1) / np.maximum(nn, 1), (C * nt).sum(1) / np.maximum(nn, 1)
     g_night = np.where(elig & (nn >= 4), sgeh(mn, cn), np.nan)
     # count drops: the hour with the largest step up in under-counting (two-sample, scaled), >= 3 covered hours each side
-    sg = np.where(ch[None, :], sgeh(Mh, C), 0.0)
-    cs, cc = np.cumsum(sg, 1), np.cumsum(ch)
-    na = cc[:-1].astype(float)                       # covered hours before k = 1 .. H-1
-    nbk = float(cc[-1]) - na
+    sg = np.where(ch, sgeh(Mh, C), 0.0)
+    cs, cc = np.cumsum(sg, 1), np.cumsum(ch, 1)
+    na = cc[:, :-1].astype(float)                    # covered hours before k = 1 .. H-1
+    nbk = cc[:, -1:].astype(float) - na
     sa, sb = cs[:, :-1], cs[:, -1:] - cs[:, :-1]
     with np.errstate(invalid="ignore", divide="ignore"):
         stat = (sb / nbk - sa / na) * np.sqrt(na * nbk / (na + nbk))
     valid = (na >= 3) & (nbk >= 3)
-    stat = np.where(valid[None, :], stat, -np.inf)
-    has_k = elig & valid.any()
+    stat = np.where(valid, stat, -np.inf)
+    has_k = elig & valid.any(1)
     k = np.argmax(stat, 1) + 1                      # first hour after the drop point
     idx = np.arange(H)
-    pre = ch[None, :] & (idx[None, :] < k[:, None])
-    post = ch[None, :] & (idx[None, :] >= k[:, None])
+    pre = ch & (idx[None, :] < k[:, None])
+    post = ch & (idx[None, :] >= k[:, None])
     s2 = _share(Mh, R, pre)
     re = (pre & (R >= 30)).sum(1) >= 3
-    sg2 = np.where(re[:, None], np.where(ch[None, :], sgeh(Mh, s2[:, None] * R), 0.0), sg)
+    sg2 = np.where(re[:, None], np.where(ch, sgeh(Mh, s2[:, None] * R), 0.0), sg)
     med = nanmedian_last(np.where(post, sg2, np.nan))
     g_drop = np.where(has_k & (med > 0), med, np.nan)
     sh = np.where(re, s2, s)
@@ -218,6 +254,7 @@ def spiky(B, phase, hours, P) -> tuple[pd.DataFrame, dict]:
     """per detector of B: spk_bursts (bursts per day), spk_gmax (largest GEH), spk_daily (vehicles per day), spk_lvl
     (0 / 1 suspect / 2 bad by P = limits['spiky']); and {detector: [(first bin, end bin), ...]} of the bursts (bins of
     P['bin_min'] minutes from the window start)."""
+    hc.norm_bins(B)
     dets = B["dets"]
     nd = len(dets)
     k = int(P["bin_min"] * 60 // int(B["bin_s"]))
@@ -227,12 +264,15 @@ def spiky(B, phase, hours, P) -> tuple[pd.DataFrame, dict]:
     if not nd or T < 2 * P["window_bins"]:
         return pd.DataFrame(columns=cols), {}
     own = n[:, :T * k].reshape(nd, T, k).sum(2)
-    c1 = cov[:T * k].reshape(T, k).all(1)
-    c = np.broadcast_to(c1, own.shape)
+    c1 = cov[:, :T * k].reshape(len(cov), T, k).all(2)
     Y = yardsticks(B, phase)
-    same = np.isfinite(Y["ph"])[:, None] & (Y["ph"][:, None] == Y["ph"][None, :]) & ~np.eye(nd, dtype=bool)
-    Wt = same & Y["live"][None, :] & ~Y["tw"]
-    m = np.where(Wt.any(1)[:, None], Wt.astype(float) @ own, 0.0)
+    L = Y["L"]
+    c = c1[L["rs"]]
+    pp = hc.pad(L, Y["ph"], np.nan)
+    lp = hc.pad(L, Y["live"], False)
+    same = np.isfinite(pp)[:, :, None] & (pp[:, :, None] == pp[:, None, :]) & ~np.eye(L["m"], dtype=bool)[None]
+    Wt = same & lp[:, None, :] & ~Y["tw"]
+    m = np.where(Wt.any(2)[L["rs"], L["li"]][:, None], hc.ref_sum(L, Wt, own), 0.0)    # counts: exact in any order
     w = int(P["window_bins"])
     b, bm = _level(own, c, w), _level(m, c, w)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -261,36 +301,55 @@ def spiky(B, phase, hours, P) -> tuple[pd.DataFrame, dict]:
 
 
 # ============================================================================ holds shared with other detectors
+TW_K = 1 << 24
+
+
 def twin_matrix(B):
-    """detector-channel x detector-channel bool matrix of twins (one zone wired to two inputs: health_core.twins on the
-    whole sample's 5-min counts), indexed by channel number."""
+    """detector-channel x detector-channel bool matrix of twins of ONE signal (one zone wired to two inputs:
+    health_core twins on the whole sample's 5-min counts), indexed by channel number."""
     dets = np.asarray(B["dets"], int)
     m = int(dets.max()) + 1 if len(dets) else 1
     T = np.zeros((m, m), bool)
     if len(dets):
-        T[np.ix_(dets, dets)] = hc.twins_of(B)
+        T[np.ix_(dets, dets)] = hc.twins_of(B)[0][:len(dets), :len(dets)]
     return T
+
+
+def twin_pairs(B):
+    """the twin pairs of every signal of B as sorted codes key_a * TW_K + key_b (detector keys)."""
+    L = hc.layout(B)
+    s, a, b = np.nonzero(hc.twins_of(B))
+    ka = np.asarray(B["dets"], np.int64)[L["ptr"][s] + a]
+    kb = np.asarray(B["dets"], np.int64)[L["ptr"][s] + b]
+    return np.sort(ka * TW_K + kb)
 
 
 def _not_twin(T, a, b):
     if T is None:
         return True
+    if T.ndim == 1:                                  # twin_pairs codes
+        if not len(T):
+            return True
+        code = np.asarray(a, np.int64) * TW_K + np.asarray(b, np.int64)
+        k = np.minimum(np.searchsorted(T, code), len(T) - 1)
+        return T[k] != code
     n = len(T)
     ok = (a < n) & (b < n)
     return ~np.where(ok, T[np.minimum(a, n - 1), np.minimum(b, n - 1)], False)
 
 
 def common_holds(s, f, c, tol=5.0, block=2048, twin=None):
-    """per hold (start s, end f in seconds, detector c): overlaps another detector's hold, and is a COMMON hold (every
-    overlapping hold starts AND ends within `tol` s of it).  A twin (twin_matrix: the same zone on another input) never
-    counts as another detector here.  Blocked broadcast (memory <= block x n)."""
+    """per hold (start s, end f in seconds, detector c): overlaps another detector's hold (same signal), and is a
+    COMMON hold (every overlapping hold starts AND ends within `tol` s of it).  A twin (twin_matrix / twin_pairs: the
+    same zone on another input) never counts as another detector here.  Blocked broadcast (memory <= block x n)."""
     s, f, c = (np.asarray(v) for v in (s, f, c))
     n = len(s)
+    g = c // hc.BASE
     anyov, common = np.zeros(n, bool), np.zeros(n, bool)
     for a in range(0, n, block):
         z = min(a + block, n)
         ov = ((np.minimum(f[a:z, None], f[None, :]) > np.maximum(s[a:z, None], s[None, :])) & (c[a:z, None] != c[None, :])
-              & _not_twin(twin, c[a:z, None], c[None, :]))
+              & (g[a:z, None] == g[None, :]) & _not_twin(twin, c[a:z, None], c[None, :]))
         near = (np.abs(s[None, :] - s[a:z, None]) <= tol) & (np.abs(f[None, :] - f[a:z, None]) <= tol)
         anyov[a:z] = ov.any(1)
         common[a:z] = anyov[a:z] & ~(ov & ~near).any(1)
@@ -298,6 +357,8 @@ def common_holds(s, f, c, tol=5.0, block=2048, twin=None):
 
 
 def common_mates(s, f, c, i, twin=None):
-    """the other (non-twin) detectors whose holds overlap hold i (sorted)."""
-    ov = (np.minimum(f[i], f) > np.maximum(s[i], s)) & (c != c[i]) & _not_twin(twin, np.full(len(c), c[i]), c)
+    """the other (non-twin) detectors of the same signal whose holds overlap hold i (sorted keys)."""
+    g = c // hc.BASE
+    ov = ((np.minimum(f[i], f) > np.maximum(s[i], s)) & (c != c[i]) & (g == g[i])
+          & _not_twin(twin, np.full(len(c), c[i]), c))
     return sorted(set(int(x) for x in c[ov]))

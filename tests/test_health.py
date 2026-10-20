@@ -175,3 +175,53 @@ def test_sample_reports_only_the_checks():
     for w in REMOVED:
         assert w not in text, w
     json.loads(out.health_bad_periods.dropna().iloc[0] or "[]")
+
+
+def _three_windows():
+    """the bundled sample as three signals sharing one window: as it is, without two detector channels, and with its
+    phases renumbered; with the classifier's answers of the sample."""
+    from atspm_detector import predict
+    from atspm_detector.check import SAMPLE
+    ev = pd.read_parquet(SAMPLE)
+    ev["Timestamp"] = pd.to_datetime(ev.Timestamp)
+    out = predict(ev, min_actuations=1)
+    start = ev.Timestamp.min().floor("min")
+    end = ev.Timestamp.max().ceil("min")
+    cls = ["Advance", "Presence", "Count", "Yellow_Red", "Other", "Mid", "Bike"]
+    pc = ["p_advance", "p_presence", "p_count", "p_yellow_red", "p_other", "p_mid", "p_bike"]
+    o = out.dropna(subset=["phase_guess"])
+    it = dict(phase={int(r.Detector): float(r.phase_guess) for r in o.itertuples()},
+              fn_label={int(r.Detector): r.function_guess for r in o.itertuples() if isinstance(r.function_guess, str)},
+              fn_prob={int(r.Detector): {c: float(getattr(r, p)) for c, p in zip(cls, pc)} for r in o.itertuples()},
+              lanes={int(r.Detector): 1.0 for r in o.itertuples()})
+    drop = sorted(it["phase"])[:2]
+    ev_b = ev[~(ev.EventId.isin([81, 82]) & ev.Parameter.isin(drop))]
+    it_b = {k: {d: v for d, v in m.items() if d not in drop} for k, m in it.items()}
+    ev_c = ev.copy()
+    col = ev_c.EventId.isin([1, 8, 9, 10])
+    ev_c.loc[col, "Parameter"] = ev_c.loc[col, "Parameter"] + 20
+    it_c = dict(it, phase={d: p + 20 for d, p in it["phase"].items()})
+    preps = [hc._prep(e[["Timestamp", "EventId", "Parameter"]], start, end) for e in (ev, ev_b, ev_c)]
+    return preps, [it, it_b, it_c], start, end
+
+
+def test_health_batch_equals_alone():
+    preps, items, start, end = _three_windows()
+    alone = [hv.assess(P, start, end, **it) for P, it in zip(preps, items)]
+    batch = hv.assess_group(hc.prep_group(preps), start, end, items)     # one batch: every check for all three
+    assert len(batch) == 3 and any(len(o) for o, _ in alone)
+    for (a, na), (b, nb) in zip(alone, batch):
+        assert na == nb
+        pd.testing.assert_frame_equal(a.reset_index(drop=True), b.reset_index(drop=True), check_exact=True)
+    # the renumbered phases change only the "P<n>" labels
+    pa, pc = alone[0][0], alone[2][0]
+    assert pa.health_status.tolist() == pc.health_status.tolist()
+
+
+def test_memory_based_batch():
+    from atspm_detector.pipeline import BATCH_RANGE, BATCH_SIGNALS, MB_PER_MEVENT, auto_batch
+    assert auto_batch(10**6, 5, free_mb=0) == BATCH_SIGNALS              # unknown free memory
+    assert auto_batch(2 * 10**6, 10, free_mb=10**7) == BATCH_RANGE[1]    # plenty: the ceiling
+    assert auto_batch(5 * 10**7, 1, free_mb=100) == BATCH_RANGE[0]       # a huge signal: one at a time
+    per = 0.2 * MB_PER_MEVENT                                            # 200k events per signal
+    assert auto_batch(2 * 10**6, 10, free_mb=2 * 12 * per + 1) == 12     # half the free memory

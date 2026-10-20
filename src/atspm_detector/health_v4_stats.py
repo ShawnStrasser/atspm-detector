@@ -1,18 +1,17 @@
-"""Detector health -- statistics from the hi-res log for ONE signal window (notes 104-144).
+"""Detector health -- statistics from the hi-res log for the signal windows of one batch (notes 104-144, 152).
 
 Every function here is a production port of one research event pass (research/code/health*/ ...), computed on the
-window's prepared event arrays (`health_core.Prep`) and the classifier's own answers (predicted phase, function,
-lane span).  numpy + pandas only; no loop over events (loops are over detectors, phases or episodes).  The phase
-number is only a key to that phase's color events and to "who are its phase mates" -- never a feature.
+window's prepared event arrays (`health_core.Prep`, one signal or several sharing the window: detector and phase keys
+as in health_core) and the classifier's own answers (predicted phase, function, lane span).  numpy + pandas only; no
+loop over events (loops are over phases, episodes or rank levels; a per-row loop is left only where numpy's own
+correlation is the arithmetic).  The phase number is only a key to that phase's color events and to "who are its
+phase mates" -- never a feature.
 
 Research source of each block (same arithmetic, same order):
   occ_bins / bins_ctx            h96_occ.one, h104_resolve.load_bins          (15-min bins: counts, % ON, traffic, congestion;
                                                                               detector x bin matrices since note 128)
   slopes / like_corr / occ_hi    h108_base.bin_stats, h108_resolve.context, score_v4c.occ_hi_c (Count zone held ON)
   act_stats / act118             h108_events.stats, h118_events.stats         (ON durations, extension, starts)
-  shape110                       h110_events.one                              (yardstick, 15-min bins)
-  level110 / drop_evidence       h110_resolve.level110, h118_resolve.drop_evidence
-  erratic                        h118_erratic.off_bins
   episodes_ctx                   h110_resolve.episodes + traffic_evidence     (queue test per stuck ON)
   q5_stats / fast_even           h117_events.one + h118c_fast, h135_fast      (too many for the traffic; rule F)
   too_fast                       h141_events item 1                           (ON-to-ON gaps too short for vehicles)
@@ -29,6 +28,7 @@ from . import health_core as hc
 FNS = ("Advance", "Presence", "Count", "Yellow_Red", "Mid", "Bike", "Other")
 TRAF = ("Advance", "Count")
 GAP_S = 120.0
+BASE, PB = hc.BASE, hc.PB
 
 
 def _nan(n):
@@ -41,14 +41,6 @@ def _corr(a, b):
     if m.sum() < 4 or np.std(a[m]) == 0 or np.std(b[m]) == 0:
         return np.nan
     return float(np.corrcoef(a[m], b[m])[0, 1])
-
-
-def _spans_gap(g0, a, b):
-    if not len(g0):
-        return np.zeros(len(a), bool)
-    k = np.searchsorted(g0, a)
-    kk = np.minimum(k, len(g0) - 1)
-    return (k < len(g0)) & (g0[kk] < b)
 
 
 # ============================================================================ 15-min bins (h96_occ, h104 load_bins)
@@ -73,6 +65,41 @@ def _ksum(M):
     return s, k
 
 
+def ksum_groups(M, g):
+    """_ksum of the rows of M within each group (g: one key per row; rows of a group taken top to bottom) for every
+    group at once: one compensated step per rank of a row inside its group.  Returns (sum, count) per ROW (its
+    group's)."""
+    nr, nb = M.shape
+    s_r, k_r = np.zeros((nr, nb)), np.zeros((nr, nb), np.int64)
+    if not nr:
+        return s_r, k_r
+    u, gi = np.unique(np.asarray(g), return_inverse=True)
+    order = np.argsort(gi, kind="stable")
+    gs = gi[order]
+    first = np.r_[0, np.flatnonzero(gs[1:] != gs[:-1]) + 1]
+    cnt = np.diff(np.r_[first, nr])
+    rank = np.arange(nr) - np.repeat(first, cnt)
+    G = len(first)
+    s, c, k = np.zeros((G, nb)), np.zeros((G, nb)), np.zeros((G, nb), np.int64)
+    grp = np.repeat(np.arange(G), cnt)
+    with np.errstate(invalid="ignore"):
+        for r in range(int(cnt.max())):
+            sel = rank == r
+            gg = grp[sel]
+            row = M[order[sel]]
+            ok = ~np.isnan(row)
+            sg, cg = s[gg], c[gg]
+            y = row - cg
+            t = sg + y
+            cn = (t - sg) - y
+            cn = np.where(cn != cn, 0.0, cn)
+            s[gg] = np.where(ok, t, sg)
+            c[gg] = np.where(ok, cn, cg)
+            k[gg] += ok
+    s_r[order], k_r[order] = s[grp], k[grp]
+    return s_r, k_r
+
+
 def _ksum_rows(M):
     """_ksum of every ROW of M separately (its columns taken left to right, NaN skipped) -- the same compensated
     additions, one column at a time for all rows together.  Returns (sum, count) per row."""
@@ -92,40 +119,36 @@ def _ksum_rows(M):
     return s, k
 
 
-def _median_excl(V):
-    """per row i and column j: the median of column j's finite values without row i (= np.nanmedian(V[others], 0):
-    the two middle values added and halved); NaN where nothing is left."""
-    nd, nb = V.shape
-    out = np.full((nd, nb), np.nan)
+def median_excl(V):
+    """V: signals x rows x bins (NaN = missing).  Per signal, row i and bin j: the median of bin j's finite values of
+    the signal's other rows (= np.nanmedian of the others: the two middle values added and halved); NaN where nothing
+    is left."""
+    S, m, nb = V.shape
     fin = np.isfinite(V)
-    for j in range(nb):
-        f = fin[:, j]
-        v = np.sort(V[f, j])
-        m = len(v)
-        if not m:
-            continue
-        p = np.where(f, np.searchsorted(v, np.where(f, V[:, j], 0.0), "left"), m)
-        mm = np.where(f, m - 1, m)
-        ok = mm > 0
-        h = mm // 2
-        lo = np.where(mm % 2 == 1, h, h - 1)
-        vv = np.r_[v, np.nan]
-        a = vv[np.clip(np.where(lo < p, lo, lo + 1), 0, m)]
-        b = vv[np.clip(np.where(h < p, h, h + 1), 0, m)]
-        out[ok, j] = ((a + b) / 2.0)[ok]
-    return out
+    Vs = np.sort(V, axis=1)                                     # NaN last
+    cnt = fin.sum(1)[:, None, :]
+    p = np.where(fin, (Vs[:, None, :, :] < V[:, :, None, :]).sum(2), cnt)   # searchsorted 'left' among the finite
+    mm = np.where(fin, cnt - 1, cnt)
+    ok = mm > 0
+    h = mm // 2
+    lo = np.where(mm % 2 == 1, h, h - 1)
+    Vs2 = np.concatenate([Vs, np.full((S, 1, nb), np.nan)], 1)
+    a = np.take_along_axis(Vs2, np.clip(np.where(lo < p, lo, lo + 1), 0, cnt), 1)
+    b = np.take_along_axis(Vs2, np.clip(np.where(h < p, h, h + 1), 0, cnt), 1)
+    return np.where(ok, (a + b) / 2.0, np.nan)
 
 
 def occ_bins(P, start, end, bs, fn, phase):
     """counts n, fraction ON occ (NaN in uncovered bins), traffic reference ref, congestion index cong per detector x
     bin (bs seconds), plus per-detector mean ON fraction, total and share of the reference.  fn / phase: dicts."""
     B = hc.events_to_bins(P, start, end, bin_s=bs)
+    L = hc.layout(B)
     dets = B["dets"]
     n = B["n_on"].astype(float)
     occ = B["occ"].astype(float) / bs
-    cov = B["cov"]
-    n[:, ~cov] = np.nan
-    occ[:, ~cov] = np.nan
+    covr = B["cov"][L["rs"]]
+    n[~covr] = np.nan
+    occ[~covr] = np.nan
     nd, nb = n.shape
     F = np.array([fn.get(int(d)) for d in dets], dtype=object)
     Ph = np.array([phase.get(int(d), np.nan) for d in dets], dtype=float)
@@ -133,30 +156,31 @@ def occ_bins(P, start, end, bs, fn, phase):
         tot = np.nansum(n, 1)
         mocc = np.nanmean(occ, 1) if nb else np.full(nd, np.nan)
         rel = occ / np.where(mocc[:, None] > 0.01, mocc[:, None], np.nan)
-    istraf = np.isin(F.astype(str), TRAF) & np.array([f is not None for f in F])
-    ref = np.full((nd, nb), np.nan)
+    istraf = np.isin(F.astype(str), TRAF) & np.array([f is not None for f in F], bool)
     cong = np.full((nd, nb), np.nan)
-    share = np.full(nd, np.nan)
-    idx = np.arange(nd)
-    ref_mem = []
-    if nd - 1 >= 3:
-        cong = _median_excl(rel)
-    for i in range(nd):
-        oth = idx != i
-        same = oth & (Ph == Ph[i]) if np.isfinite(Ph[i]) else np.zeros(nd, bool)
-        if (same & istraf).any():
-            rm = same & istraf
-        elif (oth & istraf).any():
-            rm = oth & istraf
-        else:
-            rm = oth
-        r = np.nansum(n[rm], 0) if rm.any() else np.full(nb, np.nan)
-        r[~cov] = np.nan
-        ref[i] = r
-        ref_mem.append(np.flatnonzero(rm))
-        share[i] = tot[i] / max(np.nansum(r), 1)
-    return dict(dets=dets, n=n, occ=occ, cov=cov, ref=ref, cong=cong, tot=tot, mocc=mocc, share_ref=share,
-                hour=B["hour"], fn=F, phase=Ph, bs=bs, nb=nb, B=B, ref_mem=ref_mem)
+    m = L["m"]
+    oth = L["valid"][:, None, :] & ~np.eye(m, dtype=bool)[None]
+    pp, tp = hc.pad(L, Ph, np.nan), hc.pad(L, istraf, False)
+    same = oth & (pp[:, :, None] == pp[:, None, :]) & np.isfinite(pp)[:, :, None]
+    st_, ot_ = same & tp[:, None, :], oth & tp[:, None, :]
+    rm = np.where(st_.any(2)[..., None], st_, np.where(ot_.any(2)[..., None], ot_, oth))
+    with np.errstate(all="ignore"):
+        ref = hc.ref_sum(L, rm, np.where(np.isnan(n), 0.0, n))   # counts: exact in any order
+    ref[~rm.any(2)[L["rs"], L["li"]]] = np.nan
+    ref[~covr] = np.nan
+    with np.errstate(all="ignore"), _quiet():
+        share = tot / np.maximum(np.nansum(ref, 1), 1)
+    ref_mem = [hc.ref_list(L, rm, i) for i in range(nd)]
+    big = np.flatnonzero(L["cnt"] - 1 >= 3)
+    if len(big) and nb:
+        rp = hc.pad(L, rel, np.nan)
+        cg = np.full(rp.shape, np.nan)
+        with np.errstate(all="ignore"):
+            cg[big] = median_excl(rp[big])
+        sel = np.isin(L["rs"], big)
+        cong[sel] = cg[L["rs"][sel], L["li"][sel]]
+    return dict(dets=dets, n=n, occ=occ, cov=B["cov"], covr=covr, ref=ref, cong=cong, tot=tot, mocc=mocc,
+                share_ref=share, hour=B["hour"], fn=F, phase=Ph, bs=bs, nb=nb, B=B, ref_mem=ref_mem, L=L)
 
 
 class _quiet:
@@ -183,15 +207,11 @@ def bins_ctx(O, status1):
     hl = (st != "bad")[:, None] & ~np.isnan(occ) if nd else np.zeros((0, nb), bool)
     ho = np.where(hl, occ, np.nan)
     peer = np.full((nd, nb), np.nan)
-    for p in np.unique(ph):
-        mem = np.flatnonzero(ph == p)
-        hs_, hc_ = _ksum(ho[mem])
-        if p < 0:
-            continue
-        for i in mem:
-            den = hc_ - hl[i].astype(int)
-            with np.errstate(invalid="ignore", divide="ignore"):
-                peer[i] = (hs_ - np.nan_to_num(ho[i], nan=0.0)) / np.where(den > 0, den, np.nan)
+    hs_, hc_ = ksum_groups(ho, ph)
+    r = ph >= 0
+    den = hc_[r] - hl[r].astype(int)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        peer[r] = (hs_[r] - np.nan_to_num(ho[r], nan=0.0)) / np.where(den > 0, den, np.nan)
     return dict(O, dets_i=dets.astype(int), ph=ph, st=st, hl=hl, ho=ho, peer_occ=peer)
 
 
@@ -203,18 +223,19 @@ def slopes(M, m30):
     n, occ, ref = M["n"], M["occ"], M["ref"]
     nd, nb = n.shape
     ok = ~np.isnan(n) & ~np.isnan(ref)
-    rmed = np.array([np.median(ref[i][ok[i]]) if ok[i].any() else np.nan for i in range(nd)])
+    from .health_counts import nanmedian_last
+    rmed = nanmedian_last(np.where(ok, ref, np.nan)) if nd else np.zeros(0)
     with np.errstate(invalid="ignore"):
         use = ok & (ref >= rmed[:, None])
     has = use.any(1)
     L = int(use.sum(1).max()) if nd else 0
     Z = np.full((7, nd, max(L, 1)), np.nan)
-    for i in np.flatnonzero(has):
-        r_, n_, o_ = ref[i][use[i]], n[i][use[i]], occ[i][use[i]]
-        lr, ln, lo = np.log(r_ + 1.0), np.log(n_ + 1.0), np.log(o_ + 0.005)
-        k = len(lr)
-        Z[0, i, :k], Z[1, i, :k], Z[2, i, :k], Z[3, i, :k] = 1.0, lr, ln, lo
-        Z[4, i, :k], Z[5, i, :k], Z[6, i, :k] = lr ** 2, lr * ln, lr * lo
+    r_, b_ = np.nonzero(use)
+    if len(r_):
+        pos = (np.cumsum(use, 1) - 1)[r_, b_]
+        lr, ln, lo = np.log(ref[r_, b_] + 1.0), np.log(n[r_, b_] + 1.0), np.log(occ[r_, b_] + 0.005)
+        Z[0, r_, pos], Z[1, r_, pos], Z[2, r_, pos], Z[3, r_, pos] = 1.0, lr, ln, lo
+        Z[4, r_, pos], Z[5, r_, pos], Z[6, r_, pos] = lr ** 2, lr * ln, lr * lo
     one, slr, sln, slo, x2, xn, xo = (_ksum_rows(Z[j])[0] for j in range(7))
     with np.errstate(invalid="ignore", divide="ignore"):
         vx = x2 - slr ** 2 / one
@@ -233,16 +254,17 @@ def like_corr(M, m30):
     fn = M["fn"]
     nd, nb = occ.shape
     same = np.full((nd, nb), np.nan)
-    key = [(p, f) if isinstance(f, str) else None for p, f in zip(ph, fn)]
-    for k in set(x for x in key if x is not None):
-        mem = [i for i in range(nd) if key[i] == k]
-        fs, fc = _ksum(ho[mem])
-        if k[0] < 0:
-            continue
-        for i in mem:
-            den = fc - hl[i].astype(int)
-            with np.errstate(invalid="ignore", divide="ignore"):
-                same[i] = (fs - np.nan_to_num(ho[i], nan=0.0)) / np.where(den > 0, den, np.nan)
+    isf = np.array([isinstance(f, str) for f in fn], bool)
+    r = isf & (ph >= 0)
+    if r.any():
+        codes = {f: i for i, f in enumerate(sorted({f for f in fn[isf]}))}
+        key = np.array([ph[i] * 16 + codes[fn[i]] if isf[i] else -1.0 for i in range(nd)])
+        fs, fc = ksum_groups(ho[isf], key[isf])
+        fsr, fcr = np.zeros((nd, nb)), np.zeros((nd, nb), np.int64)
+        fsr[isf], fcr[isf] = fs, fc
+        den = fcr[r] - hl[r].astype(int)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            same[r] = (fsr[r] - np.nan_to_num(ho[r], nan=0.0)) / np.where(den > 0, den, np.nan)
 
     def corr(a, b):
         m = ~np.isnan(a) & ~np.isnan(b)
@@ -252,11 +274,9 @@ def like_corr(M, m30):
     out = []
     with _quiet():
         for i, d in enumerate(M["dets_i"]):
-            out.append((int(d), corr(occ[i], same[i]), corr(occ[i], peer[i])))
-    C = pd.DataFrame(out, columns=["detector", "c_occ_same", "c_occ_all"]).astype(
-        {"detector": "int64", "c_occ_same": "float64", "c_occ_all": "float64"})
-    C["c_occ_like"] = C.c_occ_same.fillna(C.c_occ_all)
-    return C[["detector", "c_occ_like"]]
+            c = corr(occ[i], same[i])                 # the all-mates correlation only where this one is missing
+            out.append((int(d), c if c == c else corr(occ[i], peer[i])))
+    return pd.DataFrame(out, columns=["detector", "c_occ_like"]).astype({"detector": "int64", "c_occ_like": "float64"})
 
 
 GREEN_GRACE_S, GREEN_SHARE, GREEN_MIN_S = 5.0, 0.20, 60.0     # note 135
@@ -303,10 +323,9 @@ def _isect(a0, a1, b0, b1):
 def _green_after_grace(P, T, p):
     """green intervals of phase p after their first GREEN_GRACE_S seconds (the colour_bins timeline: events 1 / 8 /
     9 / 10, state changes only; a green with a comms gap in it is not used)."""
-    m = np.isin(P.eid, (1, 8, 9, 10)) & (P.par == int(p))
-    tc, ec = P.t[m], P.eid[m]
-    o = np.lexsort((ec, tc))
-    tc, ec = tc[o], ec[o]
+    CE = hc.colour_events(P)
+    a, b = CE["pos"].get(int(p), (0, 0))
+    tc, ec = CE["t"][a:b], CE["e"][a:b]                     # in (time, code) order
     if not len(tc):
         return np.zeros(0), np.zeros(0)
     st = _COL[ec]
@@ -315,9 +334,7 @@ def _green_after_grace(P, T, p):
     a, z = tc, np.r_[tc[1:], T]
     g = st == 0
     if len(P.g0):
-        k = np.searchsorted(P.g0, a)
-        kk = np.minimum(k, len(P.g0) - 1)
-        g &= ~((k < len(P.g0)) & (P.g0[kk] < z))
+        g &= ~hc.spans_gap(P, np.full(len(a), int(p) // PB if P.S > 1 else 0), a, z)
     a, z = a[g] + GREEN_GRACE_S, z[g]
     k = z > a
     return a[k], z[k]
@@ -329,8 +346,8 @@ def _on_intervals(P, T, ch):
     i = V["idx"].get(int(ch))
     if i is None:
         return np.zeros(0), np.zeros(0)
-    m = V["ci"] == i
-    s, f = V["s"][m], V["f"][m]
+    a, b = np.searchsorted(V["ci"], i, "left"), np.searchsorted(V["ci"], i, "right")
+    s, f = V["s"][a:b], V["f"][a:b]
     lead = V["lead"].get(int(ch))
     if lead is not None:
         s, f = np.r_[0.0, s], np.r_[lead, f]
@@ -339,8 +356,8 @@ def _on_intervals(P, T, ch):
 
 
 def _on_view_all(P, T):
-    dets = np.unique(P.pd_).astype(int)
-    V = hc._on_view(P, T, dets)
+    V = hc.on_view(P, T)
+    dets = hc._memo(P, "chans", lambda: hc.sorted_unique(P.pd_)).astype(int)
     fin = np.isfinite(V["dur"])
     return dict(idx={int(d): i for i, d in enumerate(dets)}, ci=V["ci"][fin], s=V["ton"][fin],
                 f=np.minimum(V["ton"][fin] + V["dur"][fin], T),
@@ -380,12 +397,7 @@ def occ_hi(M, cmode, refs, P=None, T=None, bins: dict | None = None):
     for t in range(5):
         lp[tl == t] = refs._occ_p.get((bs, t), np.nan)
     tp = refs._tp.get(bs, np.nan)
-    ps = np.full(occ.shape, np.nan)
-    pc = np.zeros(occ.shape, np.int64)
-    for p in np.unique(ph):
-        mem = np.flatnonzero(ph == p)
-        s_, k_ = _ksum(occ[mem])
-        ps[mem], pc[mem] = s_, k_
+    ps, pc = ksum_groups(occ, ph)
     with np.errstate(invalid="ignore", divide="ignore"):
         pocc = (ps - np.nan_to_num(occ, nan=0.0)) / np.where(pc > 1, pc - 1, np.nan)
         pocc = np.where(ph[:, None] >= 0, pocc, np.nan)
@@ -402,9 +414,10 @@ def occ_hi(M, cmode, refs, P=None, T=None, bins: dict | None = None):
             gav, gon = green_on(P, T, int(dets[idx[r]]), int(p), bs, hi_c.shape[1])
             hi_c[r] &= (gav >= GREEN_MIN_S) & (gon >= GREEN_SHARE * gav)
     hic = hi_c.sum(1)
-    mx = np.array([occ[r][hi_c[r]].max() if hi_c[r].any() else np.nan for r in range(len(idx))], float)
+    anyh = hi_c.any(1)
+    mx = np.where(anyh, np.where(hi_c, occ, -np.inf).max(1) if hi_c.shape[1] else np.nan, np.nan)
     if bins is not None:
-        bins.update({int(dets[idx[r]]): hi_c[r] for r in np.flatnonzero(hi_c.any(1))})
+        bins.update({int(dets[idx[r]]): hi_c[r] for r in np.flatnonzero(anyh)})
     return pd.DataFrame({"detector": dets[idx].astype("int64"), "hi_min_c": hic * bs / 60, "hi_occ_max": mx})
 
 
@@ -425,10 +438,9 @@ def act_stats(P):
     Channels with no ON have no row."""
     cols = ["detector", "rep_frac", "max_on_s", "rep_time_s", "dur_p50"]
     td, ed, pd_ = P.td, P.ed, P.pd_
-    g0 = P.g0
     if not len(td):
         return pd.DataFrame(columns=cols)
-    chans, first = np.unique(pd_, return_index=True)
+    chans, first = hc.sorted_unique(pd_, return_index=True)
     nch = len(chans)
     ci = np.repeat(np.arange(nch), np.diff(np.r_[first, len(pd_)]))
     same_prev = np.r_[False, pd_[1:] == pd_[:-1]]
@@ -441,20 +453,18 @@ def act_stats(P):
     clean = on & (prev_e != 82) & (next_e == 81)
     ic = np.flatnonzero(clean)
     dur = next_t[ic] - td[ic]
-    keep = ~_spans_gap(g0, td[ic], td[ic] + dur)
+    keep = ~hc.spans_gap(P, pd_[ic] // BASE, td[ic], td[ic] + dur)
     ic, dur = ic[keep], dur[keep]
     n_on = np.bincount(ci[on], minlength=nch)
     # continuous ONs: start = an ON after a non-ON; it ends at the channel's next OFF
     st = np.flatnonzero(on & (prev_e != 82))
-    offs = np.flatnonzero(ed == 81)
-    kk = np.searchsorted(offs, st)
-    okk = kk < len(offs)
-    st, kk = st[okk], kk[okk]
-    oi = offs[kk]
+    nxt = hc._next_off(ed)[st]                     # the first OFF after the start (searchsorted in the OFFs)
+    okk = nxt < len(td)
+    st, oi = st[okk], nxt[okk]
     same = pd_[oi] == pd_[st]
     st, oi = st[same], oi[same]
     cl = td[oi] - td[st]
-    cl = np.where(_spans_gap(g0, td[st], td[oi]), 0.0, cl)
+    cl = np.where(hc.spans_gap(P, pd_[st] // BASE, td[st], td[oi]), 0.0, cl)
     cr = np.cumsum(rep)
     nrep = cr[oi - 1] - cr[st]
     cst = ci[st]
@@ -462,18 +472,20 @@ def act_stats(P):
     sel = nrep > 0
     if sel.any():                                  # np.sum per channel (its own pairwise order), rows in channel order
         ks = cst[sel]
-        u, f0 = np.unique(ks, return_index=True)
+        u, f0 = hc.sorted_unique(ks, return_index=True)
         rep_time[u] = [float(x.sum()) for x in np.split(cl[sel], f0[1:])]
     max_on = np.full(nch, np.nan)
     if len(cl):
-        u, f0 = np.unique(cst, return_index=True)
+        u, f0 = hc.sorted_unique(cst, return_index=True)
         max_on[u] = np.maximum.reduceat(cl, f0)
     p50 = np.full(nch, np.nan)
-    if len(dur):                                   # the clean ONs are in channel order: sort each channel's own
-        u, f0, m = np.unique(ci[ic], return_index=True, return_counts=True)
-        for k, a0, mm in zip(u, f0, m):
+    if len(dur):                                   # each channel's middle clean ON(s), as from its sorted ONs
+        u, f0, m = hc.sorted_unique(ci[ic], return_index=True, return_counts=True)
+        for k, a0, mm in zip(u.tolist(), f0.tolist(), m.tolist()):
             if mm >= 5:
-                v = np.sort(dur[a0:a0 + mm])
+                lo = (mm - 1) // 2
+                hi = min(lo + 1, mm - 1)
+                v = np.partition(dur[a0:a0 + mm], [lo, hi] if hi > lo else [lo])
                 p50[k] = _median_sorted(v, np.array([0]), np.array([mm]))[0]
     has = n_on > 0
     out = pd.DataFrame({"detector": chans[has].astype(np.int64),
@@ -495,15 +507,16 @@ def act118(P, T):
     end, start = hc.cont_on(P, T)
     si = np.where(start)[0]
     cdur = end[si] - td[si]
-    cdur = np.where(_spans_gap(P.g0, td[si], end[si]), np.nan, cdur)
+    cdur = np.where(hc.spans_gap(P, pd_[si] // BASE, td[si], end[si]), np.nan, cdur)
     sch = pd_[si]
-    chans, first, cnt = np.unique(sch, return_index=True, return_counts=True)
+    chans, first, cnt = hc.sorted_unique(sch, return_index=True, return_counts=True)
     if not len(chans):
         return pd.DataFrame(columns=cols)
     k = np.repeat(np.arange(len(chans)), cnt)
     fin = np.isfinite(cdur)
-    n_on_c = np.bincount(pd_[on], minlength=65)
-    n_rep_c = np.bincount(pd_[rep], minlength=65)
+    nk = max(65, int(pd_.max()) + 1)
+    n_on_c = np.bincount(pd_[on], minlength=nk)
+    n_rep_c = np.bincount(pd_[rep], minlength=nk)
     mx = np.full(len(chans), -np.inf)
     np.maximum.at(mx, k[fin], cdur[fin])
     return pd.DataFrame({"detector": chans.astype(np.int64), "n_on_a": n_on_c[chans].astype(np.int64),
@@ -519,15 +532,15 @@ R1_FULL, R1_LIGHT = 0.90, 0.30
 
 
 def episode_overlap(E):
-    """co5: other detectors held ON (>= 300 s episodes) through at least half of the episode."""
+    """co5: other detectors (same signal) held ON (>= 300 s episodes) through at least half of the episode."""
     if not len(E):
         return np.zeros(0, int)
     s = E.t0.astype("int64").to_numpy() / 1e9          # epoch seconds, as the research (same float rounding)
     f = E.t1.astype("int64").to_numpy() / 1e9
     c = E.detector.to_numpy()
-    ov = np.minimum(f[:, None], f[None]) - np.maximum(s[:, None], s[None])
-    m = (ov >= 0.5 * (f - s)[:, None]) & (c[:, None] != c[None])
-    return np.array([len(set(c[row].tolist())) for row in m], int)
+    ii, jj = hc.pairs_in_signal(c // BASE)
+    ov = np.minimum(f[ii], f[jj]) - np.maximum(s[ii], s[jj])
+    return hc.distinct_count(ii, c[jj], (ov >= 0.5 * (f - s)[ii]) & (c[ii] != c[jj]), len(E))
 
 
 BUSY_MIN, BUSY_OCC = 60.0, 0.5      # note 135: a held ON >= 1 h is a queue only if the same traffic holds it elsewhere
@@ -576,9 +589,13 @@ def episodes_ctx(E, M, phase_x, qtype, typ):
     qt_all = np.array([qtype.get(typ.get(int(d)), np.nan) if typ.get(int(d)) is not None else np.nan for d in dets],
                       float)
     piv = {}
-    for p in np.unique(M["ph"]):
-        mem = np.flatnonzero(M["ph"] == p)
-        piv[float(p)] = (dets[mem], M["occ"][mem], M["n"][mem], M["st"][mem], M["fn"][mem], qt_all[mem], mem)
+
+    def pv(p):
+        if p not in piv:
+            mem = np.flatnonzero(M["ph"] == p)
+            piv[p] = (dets[mem], M["occ"][mem], M["n"][mem], M["st"][mem], M["fn"][mem], qt_all[mem], mem)
+        return piv[p]
+    phs = set(np.unique(M["ph"]).tolist())
     bo = np.arange(nb)
     pm_cache, out = {}, []
     for r in E.itertuples():
@@ -593,8 +610,8 @@ def episodes_ctx(E, M, phase_x, qtype, typ):
         o, ref = M["occ"][i0], M["ref"][i0]
         keep = []
         phx_h, corr_h, cover = np.nan, np.nan, np.nan
-        if np.isfinite(p) and p in piv:
-            dl, occ, n, st, fn, qt, mem = piv[p]
+        if np.isfinite(p) and p in phs:
+            dl, occ, n, st, fn, qt, mem = pv(p)
             a0, a1 = max(ia, 0), max(min(iz, nb), 0)
             cand = (dl != r.detector) & np.array([x != "bad" for x in st])
             for j in np.flatnonzero(cand):
@@ -632,10 +649,10 @@ def episodes_ctx(E, M, phase_x, qtype, typ):
         if "ref_mem" in M:
             res["ref_held_e"] = ref_held(M["occ"], M["ref_mem"][i0], ia, iz)
         # traffic evidence: the phase's Advance / Count detectors (else its other mates) during the ON
-        if np.isfinite(p) and p in piv:
-            dl, occ, n, st, fn, qt, mem = piv[p]
+        if np.isfinite(p) and p in phs:
+            dl, occ, n, st, fn, qt, mem = pv(p)
             oth = dl != r.detector
-            tr = oth & np.isin(fn.astype(str), TRAF) & np.array([f is not None for f in fn])
+            tr = oth & np.isin(fn.astype(str), TRAF) & np.array([f is not None for f in fn], bool)
             if not tr.any():
                 tr = oth
             if tr.any():
@@ -695,7 +712,7 @@ def start_view(P, T):
 def _start_view(P, T):
     td, ed, pd_ = P.td, P.ed, P.pd_
     nb = int(np.ceil(T / BIN5))
-    chans = np.unique(pd_)
+    chans = hc.sorted_unique(pd_)
     same_prev = np.r_[False, pd_[1:] == pd_[:-1]]
     prev_e = np.r_[0, ed[:-1]]
     prev_t = np.r_[np.nan, td[:-1]]
@@ -713,6 +730,11 @@ def _start_view(P, T):
     return dict(chans=chans, nb=nb, x=x, ci=ci, cell=cell, f1=f1, chat=chat)
 
 
+def _gaps_of(P, s):
+    gs = P.gsig
+    return P.g0[np.searchsorted(gs, s, "left"):np.searchsorted(gs, s, "right")]
+
+
 def q5_stats(P, T, phase, lanes, bins: dict | None = None):
     """too many for the traffic: per detector the busiest 5 min in vehicles per hour per lane -- vehicle starts in
     green + yellow of its predicted phase per green + yellow second (q5_gy; >= 60 s of it in the bin) and all starts
@@ -724,20 +746,16 @@ def q5_stats(P, T, phase, lanes, bins: dict | None = None):
     nd = len(chans)
     if not nd:
         return pd.DataFrame(columns=cols), np.zeros(0, np.int8)
-    t, eid, par = P.t, P.eid, P.par
     edges = np.minimum(np.arange(nb + 1) * BIN5, T)
-    g0 = P.g0
+    # color events of each phase in time order (ties: as the research file order after its (time, code, param) sort)
+    CE = hc.colour_events(P)
+    ts_, es_, up, f0, cnt = CE["t"], CE["e"], CE["up"], CE["f0"], CE["cnt"]
+    nbg = np.add.reduceat((es_ == 1).astype(np.int64), f0) if len(f0) else np.zeros(0, np.int64)
     tl = {}
-    # color events in time order (ties: as the research file order after its (time, code, param) sort)
-    cm = np.isin(eid, (1, 8, 9, 10))
-    tc, ec, pc = t[cm], eid[cm], par[cm]
-    o = np.lexsort((pc, ec, tc))
-    ts_, es_, ps_ = tc[o], ec[o], pc[o]
-    for p in np.unique(ps_[es_ == 1]):
-        mm = ps_ == p
-        if (es_[mm] == 1).sum() < 3:
+    for p, a, m_, g in zip(up.tolist(), f0.tolist(), cnt.tolist(), nbg.tolist()):
+        if g < 3:
             continue
-        b, s_, v = _phase_timeline(ts_[mm], es_[mm], T, g0)
+        b, s_, v = _phase_timeline(ts_[a:a + m_], es_[a:a + m_], T, _gaps_of(P, int(p) // PB if P.S > 1 else 0))
         d = np.diff(b)
         cg = np.r_[0.0, np.cumsum(d * ((s_ == G_) & v))]
         cy = np.r_[0.0, np.cumsum(d * ((s_ == Y_) & v))]
@@ -745,18 +763,26 @@ def q5_stats(P, T, phase, lanes, bins: dict | None = None):
     x, ci = V["x"], V["ci"]
     state = np.full(len(x), U_, np.int8)
     sGY = np.zeros((nd, nb))
+    keys = list(tl)
+    tid = {k: i for i, k in enumerate(keys)}
+    rt = np.full(nd, -1, np.int64)
     for k, c in enumerate(chans):
         p = phase.get(int(c), np.nan)
-        Tl = tl.get(int(p)) if p is not None and np.isfinite(p) else None
-        if Tl is None:
-            continue
-        b, s_, v, secs = Tl
-        m = ci == k
-        j = np.searchsorted(b, x[m], "right") - 1
-        okj = (j >= 0) & (j < len(s_))
-        jj = np.clip(j, 0, len(s_) - 1)
-        state[m] = np.where(okj & v[jj], s_[jj], U_).astype(np.int8)
-        sGY[k] = secs
+        if p is not None and np.isfinite(p) and int(p) in tid:
+            rt[k] = tid[int(p)]
+            sGY[k] = tl[int(p)][3]
+    st_t = rt[ci]
+    sel = np.flatnonzero(st_t >= 0)
+    if len(sel):
+        o2 = sel[np.argsort(st_t[sel], kind="stable")]
+        u2, a2, m2 = hc.sorted_unique(st_t[o2], return_index=True, return_counts=True)
+        for q, a, m_ in zip(u2.tolist(), a2.tolist(), m2.tolist()):
+            b, s_, v, _ = tl[keys[q]]
+            ii = o2[a:a + m_]
+            j = np.searchsorted(b, x[ii], "right") - 1
+            okj = (j >= 0) & (j < len(s_))
+            jj = np.clip(j, 0, len(s_) - 1)
+            state[ii] = np.where(okj & v[jj], s_[jj], U_).astype(np.int8)
     gyst = (state == G_) | (state == Y_)
     cell = V["cell"]
     n = np.bincount(cell, minlength=nd * nb).astype(np.float32).reshape(nd, nb)
@@ -827,7 +853,7 @@ def too_fast(P, fn, lanes, gap_sb=0.8, gap_other=0.6, bins: dict | None = None):
     x, ch = td[on], pd_[on]
     if not len(x):
         return pd.DataFrame(columns=cols)
-    chans, N = np.unique(ch, return_counts=True)
+    chans, f0, N = hc.sorted_unique(ch, return_index=True, return_counts=True)
     ci = np.repeat(np.arange(len(chans)), N)
     lim = np.array([(gap_sb if fn.get(int(c)) in STOPBAR else gap_other) / max(lanes.get(int(c), 1.0), 1.0)
                     for c in chans], float)
@@ -844,8 +870,8 @@ def too_fast(P, fn, lanes, gap_sb=0.8, gap_other=0.6, bins: dict | None = None):
     if bins is not None:
         hb = (x // 3600).astype(np.int64)
         for k in np.flatnonzero(nf):
-            m = ci == k
-            bins[int(chans[k])] = (hb[m & f], hb[m])
+            a, b = f0[k], f0[k] + N[k]
+            bins[int(chans[k])] = (hb[a:b][f[a:b]], hb[a:b])
     return pd.DataFrame({"detector": chans.astype(np.int64), "N": N.astype(np.int64), "n_fast": nf.astype(np.int64),
                          "fast_rate": 1000.0 * nf / np.maximum(N, 1), "gap_lim": lim,
                          "pair_share": np.where(ng > 0, npair / np.maximum(ng, 1), np.nan)})
@@ -939,7 +965,6 @@ def phase_delta(r, phase, tot, ok):
     return r - mate_r, mate_r
 
 
-
 def night_day(N, O, fn, span, phase, ok_day, ref_own, ref_alt, alts):
     """note-116 night check for ONE signal-day with the model-unsure rule (h118c_band.build): z = own type's z, the
     smallest over the plausible functions when the model is unsure; phase-mate layer dph; level."""
@@ -951,7 +976,7 @@ def night_day(N, O, fn, span, phase, ok_day, ref_own, ref_alt, alts):
     dph, mate_r = phase_delta(X[:, 0], phase, tot, ok & np.isfinite(z))
     z_eff = z.copy()
     for f in FNS:
-        m = np.array([f in a for a in alts]) & (np.asarray(fn) != f)
+        m = np.array([f in a for a in alts], bool) & (np.asarray(fn) != f)
         if not m.any():
             continue
         za, _ = tod_z(X, [f] * len(X), span, band, ok, ref_alt)
@@ -994,36 +1019,42 @@ def _best_run(n, occ, cov, i, S):
 def dropout_clean(B5, cands, phase_x, flagged):
     """h118c_dropout for the candidate detectors (drop_lam >= 30): the silent-run expectation with phase mates that
     carry a (non-silence) finding left out.  Returns {detector: dict}."""
-    n, occ, cov = B5["n_on"].astype(float), B5["occ"].astype(float), B5["cov"]
+    L = hc.layout(B5)
+    n, occ = B5["n_on"].astype(float), B5["occ"].astype(float)
     dets = np.array([int(d) for d in B5["dets"]])
-    live = n[:, cov].sum(1) > 0
-    phase = {int(d): phase_x.get(int(d), np.nan) for d in dets}
-    ref, kind, _ = hc._refs(dets, live, phase, hc.twins_of(B5))
-    fl = np.array([bool(flagged.get(int(d), False)) for d in dets])
-    tot = n.sum(0)
+    covr = B5["cov"][L["rs"]]
+    live = (n * covr).sum(1) > 0
+    phv = np.array([phase_x.get(int(d), np.nan) for d in dets], float)
+    phv = np.where(np.isfinite(phv), phv, np.nan)
+    ref, kind = hc.refs_rows(B5, live, phv)
+    fl = np.array([bool(flagged.get(int(d), False)) for d in dets], bool)
+    pos = {int(d): i for i, d in enumerate(dets)}
     out = {}
     for d in cands:
-        if int(d) not in set(dets.tolist()):
+        if int(d) not in pos:
             continue
-        i = int(np.flatnonzero(dets == int(d))[0])
+        i = pos[int(d)]
+        sr = hc._rows_of_signal(L, L["rs"][i])
+        cov = covr[i]
         if kind[i] == "phase":
-            S0 = n[ref[i]].sum(0)
-            cand = np.array(ref[i])
+            rf = hc.ref_list(L, ref, i)
+            S0 = n[rf].sum(0)
+            cand = rf
         else:
-            S0 = tot - n[i]
-            cand = np.flatnonzero(np.arange(len(dets)) != i)
+            S0 = n[sr].sum(0) - n[i]
+            cand = sr[sr != i]
         lam0 = _best_run(n, occ, cov, i, S0)
         dropped = [int(dets[j]) for j in cand if fl[j]]
         if kind[i] == "phase":
-            keep = [j for j in ref[i] if not fl[j]]
+            keep = [j for j in rf if not fl[j]]
             if len(keep) >= 2:
                 S1 = n[keep].sum(0)
             else:
-                oth = [j for j in range(len(dets)) if j != i and not fl[j]]
+                oth = [j for j in sr if j != i and not fl[j]]
                 S1 = n[oth].sum(0)
-                dropped = [int(dets[j]) for j in range(len(dets)) if j != i and fl[j]]
+                dropped = [int(dets[j]) for j in sr if j != i and fl[j]]
         else:
-            oth = [j for j in range(len(dets)) if j != i and not fl[j]]
+            oth = [j for j in sr if j != i and not fl[j]]
             S1 = n[oth].sum(0)
         lam1 = _best_run(n, occ, cov, i, S1)
         out[int(d)] = dict(drop_lam_chk=lam0[0], drop_lam_c=lam1[0], drop_b0_c=lam1[1], drop_b1_c=lam1[2],

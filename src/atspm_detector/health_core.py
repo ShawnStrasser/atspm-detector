@@ -1,10 +1,15 @@
 """Detector health, stage 1: the per-detector rule checks from the hi-res log that the health output builds on
-(notes 38-47, slimmed in 1.1.0 / note 144).  numpy + pandas only.
+(notes 38-47, slimmed in 1.1.0 / note 144; computed for many signals at once since note 152).  numpy + pandas only.
 
     health(events_df, start, end, detectors=None, phase=None, function=None) -> one row per detector
 
 `events_df`: columns Timestamp, EventId, Parameter (the controller log, local time), or a `Prep` of the window
 (`prep_arrays`: predict passes its de-duplicated event arrays directly; every check reads the same prepared arrays).
+A `Prep` may hold several signals sharing the window [start, end) (`prep_group`, note 152): signal s's channel c is
+then the detector key s * BASE + c and its phase p the phase key s * PB + p, so every per-detector and per-phase
+computation runs for all signals of the batch at once; every signal-wide quantity (references 'the rest of the
+signal', comms coverage and gaps, twins, holds at the same time) stays inside its own signal.  One signal = keys equal
+to the channel / phase numbers.
 `detectors` is ignored (health is judged from the log only); a channel with no actuation in the window has no row.
 `phase` / `function` (optional): {detector: predicted phase} and {detector: predicted function label, or a dict of
 class probabilities} from the phase / function model run first -- predictions only, never a wiring table or a print.
@@ -29,7 +34,10 @@ from .common import timedelta as _td
 BIN_S = 300                     # 5-min bins
 AGG = 3                         # 3 x 5 min = 15-min bins
 ALLOWED = (1, 7, 8, 9, 10, 11, 43, 44, 81, 82, 131, 150, 173)   # no fault events 83-88
+COLOUR = (1, 8, 9, 10)
 MAXCH = 64
+BASE = 128                      # detector key of a batch: signal * BASE + channel
+PB = 1 << 16                    # phase key of a batch: signal * PB + phase (event parameters are < 65536)
 GAP_S = 120.0                   # no event of any code for this long = comms gap
 TICK_S = 0.1                    # the hi-res log clock
 CHAT_TICKS = 3                  # chatter = OFF -> next ON gap < 3 ticks (compared in whole ticks)
@@ -60,10 +68,13 @@ DAY_NS = 86_400_000_000_000
 
 
 class Prep:
-    """The cleaned events of one signal window, prepared ONCE per health() call and shared by every check: times in
-    seconds from the window start (t), codes (eid), parameters (par), the comms gaps (g0 / g1: no event of any code
-    for > GAP_S) and the detector events sorted by (channel, time, ON before OFF) (td / ed / pd_)."""
-    __slots__ = ("t", "eid", "par", "ut", "g0", "g1", "td", "ed", "pd_", "empty", "cache")
+    """The cleaned events of one signal window (or of several signals sharing the window, `prep_group`), prepared ONCE
+    and shared by every check: times in seconds from the window start (t, with the signal of each event tsig), codes
+    (eid), parameters (par; colour events carry the phase key), the comms gaps (g0 / g1: no event of any code for
+    > GAP_S, signal gsig, sorted by signal and time) and the detector events sorted by (detector key, time, ON before
+    OFF) (td / ed / pd_ = the detector key)."""
+    __slots__ = ("t", "eid", "par", "ut", "usig", "g0", "g1", "td", "ed", "pd_", "empty", "cache", "S", "tsig",
+                 "gsig", "names", "covs", "csorted")
 
 
 def rows_of(df: pd.DataFrame) -> list:
@@ -114,6 +125,11 @@ def _memo(P_, key, fn):
     return c[key]
 
 
+def _gaps(ut):
+    gi = np.diff(ut) > GAP_S
+    return ut[:-1][gi], ut[1:][gi]
+
+
 def prep_arrays(t, eid, par) -> Prep:
     """`Prep` from already-cleaned arrays (allowed codes only, no detector channel > 64, no duplicate rows, times in
     seconds from the window start, all inside the window) -- predict passes them straight from its event table."""
@@ -124,13 +140,52 @@ def prep_arrays(t, eid, par) -> Prep:
     P_.empty = len(P_.t) == 0
     P_.cache = {}
     P_.ut = np.unique(P_.t)
-    gi = np.diff(P_.ut) > GAP_S
-    P_.g0, P_.g1 = P_.ut[:-1][gi], P_.ut[1:][gi]
+    P_.g0, P_.g1 = _gaps(P_.ut)
     dm = np.isin(P_.eid, (81, 82))
     td, ed, pd_ = P_.t[dm], P_.eid[dm], P_.par[dm]
     o = np.lexsort((ed != 82, td, pd_))
     P_.td, P_.ed, P_.pd_ = td[o], ed[o], pd_[o]
+    P_.S = 1
+    P_.tsig = np.zeros(len(P_.t), np.int64)
+    P_.usig = np.zeros(len(P_.ut), np.int64)
+    P_.gsig = np.zeros(len(P_.g0), np.int64)
+    P_.names = None
+    P_.covs = None
+    P_.csorted = False
     return P_
+
+
+def prep_group(preps: list, names=None) -> Prep:
+    """one `Prep` for several signals sharing the window: signal s's detector events get the key s * BASE + channel and
+    its colour events the phase key s * PB + phase; arrays stacked in signal order (each signal's own order kept)."""
+    if len(preps) == 1 and names is None:
+        return preps[0]
+    G = Prep()
+    S = len(preps)
+    G.S = S
+    G.names = names
+    ns = [len(p.t) for p in preps]
+    G.t = np.concatenate([p.t for p in preps]) if S else np.zeros(0)
+    G.tsig = np.repeat(np.arange(S, dtype=np.int64), ns)
+    G.eid = np.concatenate([p.eid for p in preps]) if S else np.zeros(0, int)
+    par = np.concatenate([p.par for p in preps]) if S else np.zeros(0, int)
+    G.par = np.where(np.isin(G.eid, COLOUR), G.tsig * PB + par,
+                     np.where(np.isin(G.eid, (81, 82)), G.tsig * BASE + par, par))
+    G.empty = len(G.t) == 0
+    G.cache = {}
+    G.ut = np.concatenate([p.ut for p in preps]) if S else np.zeros(0)
+    G.usig = np.repeat(np.arange(S, dtype=np.int64), [len(p.ut) for p in preps])
+    G.covs = None
+    G.csorted = False
+    G.g0 = np.concatenate([p.g0 for p in preps]) if S else np.zeros(0)
+    G.g1 = np.concatenate([p.g1 for p in preps]) if S else np.zeros(0)
+    G.gsig = np.repeat(np.arange(S, dtype=np.int64), [len(p.g0) for p in preps])
+    nd = [len(p.td) for p in preps]
+    G.td = np.concatenate([p.td for p in preps]) if S else np.zeros(0)
+    G.ed = np.concatenate([p.ed for p in preps]) if S else np.zeros(0, int)
+    G.pd_ = (np.concatenate([p.pd_ for p in preps]) + np.repeat(np.arange(S, dtype=np.int64) * BASE, nd)) if S \
+        else np.zeros(0, int)
+    return G
 
 
 def _prep(ev, start, end) -> Prep:
@@ -144,10 +199,72 @@ def _prep(ev, start, end) -> Prep:
                        e.Parameter.to_numpy())
 
 
+def spans_gap(P_, sig, a, b):
+    """per interval [a, b) of signal sig (sig ascending): a comms gap of that signal starts in it (k = the first gap
+    start >= a, g0[k] < b), as the one-signal searchsorted test."""
+    out = np.zeros(len(a), bool)
+    g0, gs = P_.g0, P_.gsig
+    if not len(g0) or not len(a):
+        return out
+    sig = np.asarray(sig)
+    for s in np.unique(gs):
+        q0, q1 = np.searchsorted(sig, s, "left"), np.searchsorted(sig, s, "right")
+        if q1 <= q0:
+            continue
+        g = g0[np.searchsorted(gs, s, "left"):np.searchsorted(gs, s, "right")]
+        k = np.searchsorted(g, a[q0:q1])
+        kk = np.minimum(k, len(g) - 1)
+        out[q0:q1] = (k < len(g)) & (g[kk] < b[q0:q1])
+    return out
+
+
+def sorted_unique(a, return_index=False, return_counts=False):
+    """np.unique of an already sorted array (same values, first indices and counts) without sorting it again."""
+    a = np.asarray(a)
+    first = np.flatnonzero(np.r_[True, a[1:] != a[:-1]]) if len(a) else np.zeros(0, np.int64)
+    out = [a[first]]
+    if return_index:
+        out.append(first)
+    if return_counts:
+        out.append(np.diff(np.r_[first, len(a)]))
+    return out[0] if len(out) == 1 else tuple(out)
+
+
 # ============================================================================ binning
+def _next_off(ed):
+    """per detector event: index of the first OFF at or after it (any channel; len = none) -- the searchsorted of the
+    event index in the OFF positions, by one backward running minimum."""
+    n = len(ed)
+    idx = np.where(np.asarray(ed) == 81, np.arange(n), n)
+    return np.minimum.accumulate(idx[::-1])[::-1] if n else idx
+
+
+def _cont_all(P_, T):
+    """(end, start, index of the ending OFF or -1) of every detector event, computed once per window."""
+    def f():
+        return _continuous(P_.td, P_.ed, P_.pd_, T, _next_off(P_.ed))
+    return _memo(P_, ("cont", float(T)), f)
+
+
 def cont_on(P_, T):
     """continuous_on of a Prep's detector events, computed once per window (read only)."""
-    return _memo(P_, ("cont", float(T)), lambda: continuous_on(P_.td, P_.ed, P_.pd_, T))
+    end, start, _ = _cont_all(P_, T)
+    return end, start
+
+
+def _cont_off(P_, T):
+    """per detector event: index of the OFF that ends its continuous ON (-1: still ON at the window end)."""
+    return _cont_all(P_, T)[2]
+
+
+def _continuous(td, ed, pd_, T, nxt):
+    n = len(td)
+    pc = np.minimum(nxt, max(n - 1, 0))
+    ok = (nxt < n) & (pd_[pc] == pd_) if n else np.zeros(0, bool)
+    end = np.where(ok, td[pc] if n else T, T)
+    prev_on = np.r_[False, (pd_[1:] == pd_[:-1]) & (ed[:-1] == 82)]
+    start = (ed == 82) & ~prev_on
+    return end, start, np.where(ok, pc, -1)
 
 
 def continuous_on(td, ed, pd_, T):
@@ -155,14 +272,7 @@ def continuous_on(td, ed, pd_, T):
     next OFF of the same channel (T = still ON at the window end) and whether the event is an ON that
     STARTS a continuous ON (its previous event on the channel is not an ON).  ONs inside a continuous
     ON (ON -> ON, no OFF between) are normal with extension and belong to the ON that started it."""
-    n = len(td)
-    offs = np.where(ed == 81)[0]
-    k = np.searchsorted(offs, np.arange(n), "left")
-    p = offs[np.minimum(k, max(len(offs) - 1, 0))] if len(offs) else np.zeros(n, int)
-    ok = (k < len(offs)) & (pd_[p] == pd_) if len(offs) else np.zeros(n, bool)
-    end = np.where(ok, td[p] if len(offs) else T, T)
-    prev_on = np.r_[False, (pd_[1:] == pd_[:-1]) & (ed[:-1] == 82)]
-    start = (ed == 82) & ~prev_on
+    end, start, _ = _continuous(td, ed, pd_, T, _next_off(ed))
     return end, start
 
 
@@ -174,17 +284,22 @@ def events_to_bins(ev: pd.DataFrame, start, end, detectors=None, bin_s: int = BI
 
 
 def twins_of(B: dict):
-    """twins() of a bins dict, computed once per bins dict."""
+    """twins() of a bins dict (row x row, only inside a signal), computed once per bins dict."""
     if "_tw" not in B:
-        B["_tw"] = twins(B["n_on"].astype(float), B["cov"])
+        B["_tw"] = twins_rows(B)
     return B["_tw"]
 
 
-def _on_view(P_, T, dets):
+def on_view(P_, T):
+    """_on_view over every detector key of the Prep, computed once per window."""
+    return _memo(P_, ("onview", float(T)), lambda: _on_view(P_, T, _memo(P_, "chans", lambda: sorted_unique(P_.pd_)),
+                                                             True))
+
+
+def _on_view(P_, T, dets, all_keys=False):
     """the per-ON view behind events_to_bins (independent of the bin size): ON times, channel rows, continuous-ON
     durations (NaN inside a continuous ON or over a comms gap), chatter flags, the longest ON per channel and the
     channels that were ON when the window opened."""
-    gaps0 = P_.g0                             # comms-gap start times
     td, ed, pd_ = P_.td, P_.ed, P_.pd_
     same_prev = np.r_[False, pd_[1:] == pd_[:-1]]
     prv_t, prv_e = np.r_[np.nan, td[:-1]], np.r_[0, ed[:-1]]
@@ -194,52 +309,90 @@ def _on_view(P_, T, dets):
     c_end, c_start = cont_on(P_, T)
     dur = np.where(c_start, c_end - td, np.nan)[on]
     gap = np.where(same_prev & (prv_e == 81), td - prv_t, np.nan)[on]
-    ton, ci = td[on], np.searchsorted(dets, pd_[on]).astype(int)
+    if all_keys:                                          # dets = every key, sorted: the row is the key's rank
+        rank = np.cumsum(np.r_[True, pd_[1:] != pd_[:-1]]) - 1 if len(pd_) else np.zeros(0, np.int64)
+        ton, ci = td[on], rank[on].astype(int)
+    else:
+        ton, ci = td[on], np.searchsorted(dets, pd_[on]).astype(int)
     nd = len(dets)
     dur_max = np.zeros(nd)
     chat = np.zeros(0)
     if len(ton):
         long_ = np.where(dur > 60)[0]                     # an ON over a comms gap is not "stuck"
-        if len(long_) and len(gaps0):
-            k = np.searchsorted(gaps0, ton[long_])
-            hit = (k < len(gaps0)) & (gaps0[np.minimum(k, len(gaps0) - 1)] < ton[long_] + dur[long_])
+        if len(long_) and len(P_.g0):
+            hit = spans_gap(P_, pd_[on][long_] // BASE, ton[long_], ton[long_] + dur[long_])
             dur[long_[hit]] = np.nan
         with np.errstate(invalid="ignore"):
             chat = (_ticks(gap) < CHAT_TICKS).astype(float)
         # longest ON per channel (ci is sorted: the events are ordered by channel)
         dd = np.nan_to_num(dur, nan=0.0)
-        u, first = np.unique(ci, return_index=True)
+        u, first = sorted_unique(ci, return_index=True)
         dur_max[u] = np.maximum(np.maximum.reduceat(dd, first), 0.0)
     first = np.r_[True, pd_[1:] != pd_[:-1]]
     lead = first & (ed == 81)
     return dict(ton=ton, ci=ci, dur=dur, chat=chat, dur_max=dur_max, lead_t=td[lead], lead_c=pd_[lead])
 
 
+def _on_bins(V, T):
+    """5-min bin index of every ON and the start / end of every continuous ON (the occupancy intervals), computed once
+    per window for every bin size that is a multiple of 5 min."""
+    ton, ci, dur = V["ton"], V["ci"], V["dur"]
+    fin = np.isfinite(dur)
+    s, f = ton[fin], np.minimum(ton[fin] + dur[fin], T)
+    on = (ton // BIN_S).astype(np.int64)
+    return dict(on=on, s=s, f=f, c=ci[fin], s5=on[fin], f5=(f // BIN_S).astype(np.int64))
+
+
+def coverage(P_, nb, bin_s):
+    """bins of bin_s seconds with any event of the signal (signals x bins): a bin [k bin_s, (k + 1) bin_s) is covered
+    when one of the signal's event times falls in it (the bin index t // bin_s, compared exactly)."""
+    def f():
+        if getattr(P_, "covs", None) is not None:
+            return P_.covs(nb, bin_s)
+        if getattr(P_, "ut", None) is not None:
+            edges = np.arange(nb + 1, dtype=np.float64) * bin_s
+            us = P_.usig
+            out = np.zeros((P_.S, nb), bool)
+            for s_ in range(P_.S):
+                u = P_.ut[np.searchsorted(us, s_, "left"):np.searchsorted(us, s_, "right")]
+                out[s_] = np.diff(np.searchsorted(u, edges, "left")) > 0
+            return out
+        idx = (P_.t // bin_s).astype(int)
+        ok = idx < nb
+        return (np.bincount(P_.tsig[ok] * nb + idx[ok], minlength=P_.S * nb)[:P_.S * nb] > 0).reshape(P_.S, nb)
+    return _memo(P_, ("cov", int(nb), int(bin_s)), f)
+
+
 def _events_to_bins(ev, start, end, detectors=None, bin_s: int = BIN_S) -> dict:
     T = (end - start).total_seconds()
     nb = int(np.ceil(T / bin_s))
     P_ = _prep(ev, start, end)
-    t, eid, par = P_.t, P_.eid, P_.par
-    cov = np.bincount((t // bin_s).astype(int), minlength=nb)[:nb] > 0
-    chans = set(_memo(P_, "chans", lambda: np.unique(P_.pd_).tolist()))   # pd_ = the 81 / 82 parameters
+    cov = coverage(P_, nb, bin_s)
+    chans = _memo(P_, "chans", lambda: sorted_unique(P_.pd_))   # pd_ = the 81 / 82 detector keys, sorted
     if detectors is not None:
-        chans |= {int(x) for x in detectors}
-    dets = np.array(sorted(chans), dtype=int)
+        chans = sorted(set(chans.tolist()) | {int(x) for x in detectors})
+    dets = np.asarray(chans, dtype=int)
     nd = len(dets)
-    idx = {c: i for i, c in enumerate(dets)}
+    idx = {int(c): i for i, c in enumerate(dets)}
     out = {k: np.zeros((nd, nb), np.float32) for k in ("n_on", "occ", "n_chat")}
-    V = (_memo(P_, ("onview", start, end), lambda: _on_view(P_, T, dets)) if detectors is None
-         else _on_view(P_, T, dets))
+    V = on_view(P_, T) if detectors is None else _on_view(P_, T, dets)
     ton, ci, dur = V["ton"], V["ci"], V["dur"]
     if len(ton):
-        b0 = np.minimum((ton // bin_s).astype(int), nb - 1)
+        # bin indices: t // bin_s; for a multiple of 5 min from the 5-min index (floor(floor(t / 300) / k) is exact)
+        k5 = int(bin_s) // BIN_S if int(bin_s) % BIN_S == 0 and detectors is None else 0
+        Q = _memo(P_, ("onbins", float(T)), lambda: _on_bins(V, T)) if k5 else None
+        b0 = np.minimum(Q["on"] // k5 if k5 else (ton // bin_s).astype(int), nb - 1)
         cell = ci * nb + b0
         out["n_on"] = np.bincount(cell, minlength=nd * nb).reshape(nd, nb).astype(np.float32)
         out["n_chat"] = np.bincount(cell, weights=V["chat"], minlength=nd * nb).reshape(nd, nb).astype(np.float32)
         # occupancy, split across bins
-        fin = np.isfinite(dur)
-        s, f, c = ton[fin], np.minimum(ton[fin] + dur[fin], T), ci[fin]
-        bs, bf = (s // bin_s).astype(int), np.minimum((f // bin_s).astype(int), nb - 1)
+        if k5:
+            s, f, c = Q["s"], Q["f"], Q["c"]
+            bs, bf = Q["s5"] // k5, np.minimum(Q["f5"] // k5, nb - 1)
+        else:
+            fin = np.isfinite(dur)
+            s, f, c = ton[fin], np.minimum(ton[fin] + dur[fin], T), ci[fin]
+            bs, bf = (s // bin_s).astype(int), np.minimum((f // bin_s).astype(int), nb - 1)
         nspan = bf - bs + 1
         rep = np.repeat(np.arange(len(s)), nspan)
         bb = bs[rep] + (np.arange(len(rep)) - np.repeat(np.cumsum(nspan) - nspan, nspan))
@@ -254,9 +407,120 @@ def _events_to_bins(ev, start, end, detectors=None, bin_s: int = BIN_S) -> dict:
     # clock hour of each bin start (integer nanoseconds: = (start + k * bin_s seconds).hour)
     hrs = ((int(start.value) + np.arange(nb, dtype=np.int64) * (int(bin_s) * 1_000_000_000))
            // 3_600_000_000_000) % 24
-    out.update(dets=dets, cov=cov, hour=hrs.astype(np.int32), dur_max=V["dur_max"].copy(), start=start, bin_s=bin_s,
-               listed=None if detectors is None else np.isin(dets, [int(x) for x in detectors]))
+    out.update(dets=dets, cov=cov, rsig=dets // BASE, S=P_.S, hour=hrs.astype(np.int32), dur_max=V["dur_max"].copy(),
+               start=start, bin_s=bin_s, listed=None if detectors is None else np.isin(dets, [int(x) for x in detectors]))
     return out
+
+
+def colour_events(P_):
+    """the colour events (1 / 8 / 9 / 10) sorted by (phase key, time, code), with each phase key's slice; computed
+    once per window."""
+    def f():
+        if getattr(P_, "csorted", False):             # colour events only, already in this order (the health query)
+            ts, es, ps = P_.t, P_.eid, P_.par
+        else:
+            cm = np.isin(P_.eid, COLOUR)
+            tc, ec, pc = P_.t[cm], P_.eid[cm], P_.par[cm]
+            o = np.lexsort((ec, tc, pc))
+            ts, es, ps = tc[o], ec[o], pc[o]
+        up, f0, cnt = sorted_unique(ps, return_index=True, return_counts=True)
+        return dict(t=ts, e=es, p=ps, up=up, f0=f0, cnt=cnt,
+                    pos={int(p): (int(a), int(a + m)) for p, a, m in zip(up, f0, cnt)})
+    return _memo(P_, "colour", f)
+
+
+# ============================================================================ batch layout helpers
+def norm_bins(B: dict) -> dict:
+    """a bins dict made by hand for one signal (1-D cov, no rsig) -> the batch form (cov signals x bins, rsig)."""
+    if "rsig" not in B:
+        B["rsig"] = np.zeros(len(B["dets"]), np.int64)
+        B["cov"] = np.atleast_2d(np.asarray(B["cov"], bool))
+        B["S"] = 1
+    return B
+
+
+def layout(B: dict) -> dict:
+    """rows of a bins dict per signal: rows of signal s = ptr[s]:ptr[s + 1] (rows are ordered by signal), local row
+    index li, the largest signal's row count m; pad(x) puts row values into a signals x m (x ...) array."""
+    if "_lay" in B:
+        return B["_lay"]
+    norm_bins(B)
+    rs = np.asarray(B["rsig"], np.int64)
+    S = int(B["cov"].shape[0])
+    cnt = np.bincount(rs, minlength=S)
+    ptr = np.r_[0, np.cumsum(cnt)]
+    li = np.arange(len(rs)) - ptr[rs]
+    m = int(cnt.max()) if len(cnt) and len(rs) else 0
+    valid = np.zeros((S, max(m, 1)), bool)
+    valid[rs, li] = True
+    B["_lay"] = dict(rs=rs, li=li, ptr=ptr, cnt=cnt, S=S, m=max(m, 1), valid=valid)
+    return B["_lay"]
+
+
+def pad(L, x, fill=0.0):
+    x = np.asarray(x)
+    out = np.full((L["S"], L["m"]) + x.shape[1:], fill, dtype=np.result_type(x.dtype, np.asarray(fill).dtype))
+    out[L["rs"], L["li"]] = x
+    return out
+
+
+def _rows_of_signal(L, s):
+    return np.arange(L["ptr"][s], L["ptr"][s + 1])
+
+
+def twins_rows(B, tol=0.1):
+    """pairs of channels of the same signal carrying (almost) the same actuations = one zone wired to two inputs:
+    5-min counts (covered bins) differ by < tol of their sum.  Returns signals x m x m bool (local rows)."""
+    L = layout(B)
+    n = B["n_on"].astype(float)
+    x = np.where(B["cov"][L["rs"]], n, 0.0)
+    tot = x.sum(1)
+    xp, tp = pad(L, x), pad(L, tot)
+    S, m = L["S"], L["m"]
+    tw = np.zeros((S, m, m), bool)
+    for i in range(m):                                  # all signals' i-th rows at once
+        dd = np.abs(xp - xp[:, i:i + 1, :]).sum(2) / np.maximum(tp + tp[:, i:i + 1], 1)
+        tw[:, i, :] = (dd < tol) & (tp > 0) & (tp[:, i:i + 1] > 0) & L["valid"]
+    tw &= L["valid"][:, :, None]
+    idx = np.arange(m)
+    tw[:, idx, idx] = False
+    return tw
+
+
+def twins(n, cov, tol=0.1):
+    """pairs of channels carrying (almost) the same actuations = one zone wired to two inputs (one signal):
+    5-min counts differ by < tol of their sum.  Returns a bool matrix."""
+    B = dict(dets=np.arange(len(n)), n_on=np.asarray(n), cov=np.asarray(cov, bool))
+    return twins_rows(B, tol)[0][:len(n), :len(n)]
+
+
+def refs_rows(B, live, phase_r):
+    """reference of each detector (padded signals x m x m, local rows): the other live detectors on its (predicted)
+    phase when there are >= 2 of them, else the rest of the signal's live detectors; a twin (same zone on another
+    input) is never a reference.  phase_r: phase key per row (NaN = none).  Also the kind per row."""
+    L = layout(B)
+    m = L["m"]
+    lp = pad(L, live, False) & L["valid"]
+    pp = pad(L, np.asarray(phase_r, float), np.nan)
+    eye = np.eye(m, dtype=bool)[None]
+    ok = lp[:, None, :] & ~eye & ~twins_of(B)
+    same = ok & (pp[:, :, None] == pp[:, None, :]) & np.isfinite(pp)[:, :, None]
+    isph = same.sum(2) >= 2                     # one sibling is too fragile: if it fails, this one looks bad
+    ref = np.where(isph[:, :, None], same, ok)
+    kind = np.where(isph[L["rs"], L["li"]], "phase", "signal")
+    return ref, kind
+
+
+def ref_list(L, ref, i):
+    """global row indices of row i's reference rows (padded ref)."""
+    s = L["rs"][i]
+    return L["ptr"][s] + np.flatnonzero(ref[s, L["li"][i]])
+
+
+def ref_sum(L, ref, X):
+    """sum over each row's reference rows of X (rows x k; integer-valued: exact in any order) -> rows x k."""
+    Xp = pad(L, X)
+    return np.matmul(ref.astype(float), Xp)[L["rs"], L["li"]]
 
 
 # ======================================================================== statistics
@@ -273,43 +537,75 @@ def _runs(mask):
     return np.where(d == 1)[0], np.where(d == -1)[0]
 
 
-def _silent(n, occ, cov, active, i, S, n_on) -> dict:
-    """silent runs: bins with no ON and (almost) no occupancy, on covered bins; expected ONs in the run = the
-    detector's share outside the run x the reference S inside it; and the other live detectors silent with it."""
-    nb = n.shape[1]
-    r = {}
-    x = n[i]
-    quiet = (x == 0) & (occ[i] < 1) & cov
-    s0, s1 = _runs(quiet)
-    best = (0.0, -1, -1)
-    if len(s0) and n_on > 0:
-        cS = np.r_[0, np.cumsum(np.where(cov, S, 0))]
-        for a, b in zip(s0, s1):
-            s_in = cS[b] - cS[a]
-            s_out = cS[-1] - s_in
-            lam = n_on / max(s_out, 1) * s_in
-            if lam > best[0]:
-                best = (lam, a, b)
-    r["drop_lam"], r["drop_b0"], r["drop_b1"] = best
-    r["drop_to_end"] = best[2] == nb or (best[2] > 0 and not cov[best[2]:].any())
-    # other live detectors that were silent through the same run (shared unit / comms?)
-    r["co_silent"] = 0
-    if best[2] - best[1] >= 3:
-        q = ((n[:, best[1]:best[2]] == 0) & (occ[:, best[1]:best[2]] < 1)).mean(1) >= 0.8
-        r["co_silent"] = int((q & active).sum() - 1)
-    return r
+def best_runs(quiet, covr, S, n_on):
+    """per row: the silent run (True run of `quiet`) with the most expected ONs lam = n_on / max(ONs of the reference
+    outside the run, 1) x reference ONs inside it (reference S counted on covered bins only); the first run with the
+    largest lam > 0 -> (lam, start, end), else (0, -1, -1).  Rows with n_on = 0 have none."""
+    R, nb = quiet.shape
+    lam = np.zeros(R)
+    b0 = np.full(R, -1, np.int64)
+    b1 = np.full(R, -1, np.int64)
+    if not R:
+        return lam, b0, b1
+    d = np.diff(np.c_[np.zeros((R, 1), np.int8), quiet.astype(np.int8), np.zeros((R, 1), np.int8)], axis=1)
+    r0, a = np.nonzero(d == 1)
+    r1, b = np.nonzero(d == -1)
+    keep = n_on[r0] > 0
+    r0, a, b = r0[keep], a[keep], b[keep]
+    if not len(r0):
+        return lam, b0, b1
+    cS = np.c_[np.zeros(R), np.cumsum(np.where(covr, S, 0), 1)]
+    s_in = cS[r0, b] - cS[r0, a]
+    s_out = cS[r0, -1] - s_in
+    lr = n_on[r0] / np.maximum(s_out, 1) * s_in
+    pos = lr > 0
+    r0, a, b, lr = r0[pos], a[pos], b[pos], lr[pos]
+    if not len(r0):
+        return lam, b0, b1
+    mx = np.full(R, -np.inf)
+    np.maximum.at(mx, r0, lr)
+    hit = lr == mx[r0]
+    rr, first = np.unique(r0[hit], return_index=True)
+    j = np.flatnonzero(hit)[first]
+    lam[rr], b0[rr], b1[rr] = lr[j], a[j], b[j]
+    return lam, b0, b1
 
 
-def drop_stats(B: dict, refs: dict) -> pd.DataFrame:
-    """the silent-run columns of det_stats (drop_lam, drop_b0, drop_b1, drop_to_end, co_silent) for the detectors in
-    `refs` ({row: reference rows}) only, indexed by row (note 128: the phase-reference pass needs nothing else)."""
+def _silent_rows(B, L, rows, S, n_on):
+    """_silent for the given rows at once: drop_lam, drop_b0, drop_b1, drop_to_end, co_silent."""
     n, occ, cov = B["n_on"].astype(float), B["occ"].astype(float), B["cov"]
-    active = (n.sum(1) > 0) | (occ.sum(1) > 0)
-    rows = []
-    for i, rf in refs.items():
-        x, S = n[i], n[rf].sum(0)
-        rows.append(_silent(n, occ, cov, active, i, S, x[cov].sum()))
-    return pd.DataFrame(rows, index=list(refs))
+    nb = n.shape[1]
+    rs = L["rs"][rows]
+    covr = cov[rs]
+    quiet = (n[rows] == 0) & (occ[rows] < 1) & covr
+    lam, b0, b1 = best_runs(quiet, covr, S, n_on)
+    # drop_to_end: the run reaches the last bin, or no covered bin after it
+    last = np.array([np.flatnonzero(c)[-1] if c.any() else -1 for c in cov])
+    to_end = (b1 == nb) | ((b1 > 0) & (last[rs] < b1))
+    co = np.zeros(len(rows), np.int64)
+    sel = np.flatnonzero(b1 - b0 >= 3)
+    if len(sel):
+        active = (n.sum(1) > 0) | (occ.sum(1) > 0)
+        Q = (n == 0) & (occ < 1)
+        Qc = pad(L, np.c_[np.zeros(len(n), np.int64), np.cumsum(Q, 1)])
+        ap = pad(L, active, False)
+        s_ = rs[sel]
+        cnt = Qc[s_, :, b1[sel]] - Qc[s_, :, b0[sel]]
+        q = cnt / (b1[sel] - b0[sel])[:, None] >= 0.8
+        co[sel] = (q & ap[s_]).sum(1) - 1
+    return dict(drop_lam=lam, drop_b0=b0, drop_b1=b1, drop_to_end=to_end, co_silent=co)
+
+
+def drop_stats(B: dict, refs) -> pd.DataFrame:
+    """the silent-run columns of det_stats (drop_lam, drop_b0, drop_b1, drop_to_end, co_silent) for the rows `rows`
+    against their reference rows `ref` (padded), indexed by row (note 128: the phase-reference pass needs nothing
+    else).  refs = (rows, ref)."""
+    rows, ref = refs
+    L = layout(B)
+    n = B["n_on"].astype(float)
+    S = ref_sum(L, ref, n)[rows]
+    n_on = (n[rows] * B["cov"][L["rs"][rows]]).sum(1)
+    return pd.DataFrame(_silent_rows(B, L, rows, S, n_on), index=rows)
 
 
 def det_stats(B: dict) -> pd.DataFrame:
@@ -320,41 +616,66 @@ def det_stats(B: dict) -> pd.DataFrame:
     return B["_ds"].copy()
 
 
+def _sig_sum(L, X):
+    """per row: the sum of X over all rows of its signal (integer-valued: exact)."""
+    return np.add.reduceat(X, L["ptr"][:-1][L["cnt"] > 0], axis=0)[np.cumsum(L["cnt"] > 0)[L["rs"]] - 1] \
+        if len(X) else X
+
+
 def _det_stats(B: dict) -> pd.DataFrame:
+    L = layout(B)
     n, occ, cov = B["n_on"].astype(float), B["occ"].astype(float), B["cov"]
     nd, nb = n.shape
-    cov_h = cov.sum() * B["bin_s"] / 3600
-    tot = n.sum(0)
-    rows = []
-    n15, cov15 = _agg(n), _agg(cov[None].astype(float))[0] == AGG
+    rs = L["rs"]
+    covr = cov[rs]
+    cov_h = (cov.sum(1) * B["bin_s"] / 3600)[rs]
     active = (n.sum(1) > 0) | (occ.sum(1) > 0)
-    for i in range(nd):
-        r = {"detector": int(B["dets"][i])}
-        x, S = n[i], tot - n[i]
-        r["n_on"] = x[cov].sum()
-        r["cov_h"] = cov_h
-        r["n_sib"] = int(active.sum() - active[i])
-        r["dur_max"] = B["dur_max"][i]
-        r.update(_silent(n, occ, cov, active, i, S, r["n_on"]))
-        r["level_ratio"], r["level_llr"] = np.nan, 0.0
-        xs, Ss = n15[i][cov15], (n15.sum(0) - n15[i])[cov15]
-        if len(xs) >= 8 and xs.sum() >= 20:
-            cx, cs = np.cumsum(xs), np.cumsum(Ss)
-            X, SS = cx[-1], cs[-1]
-            k = np.arange(2, len(xs) - 1)
-            x1, s1_, x2, s2 = cx[k - 1], cs[k - 1], X - cx[k - 1], SS - cs[k - 1]
-            p0 = X / max(SS, 1)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                def ll(xx, ss):
-                    p = np.where(ss > 0, xx / np.maximum(ss, 1e-9), 0)
-                    return np.where(xx > 0, xx * np.log(np.maximum(p, 1e-12)), 0) - p * ss
-                llr = ll(x1, s1_) + ll(x2, s2) - (np.where(True, X * np.log(max(p0, 1e-12)), 0) - p0 * SS)
-            j = int(np.nanargmax(llr))
-            r["level_llr"] = float(llr[j])
-            r["level_ratio"] = float(((x2[j] + .5) / max(s2[j], 1)) / ((x1[j] + .5) / max(s1_[j], 1)))
-            r["level_b"] = int(k[j]) * AGG
-        rows.append(r)
-    return pd.DataFrame(rows)
+    n_on = (n * covr).sum(1)
+    S = _sig_sum(L, n) - n
+    out = {"detector": B["dets"].astype(int), "n_on": n_on, "cov_h": cov_h,
+           "n_sib": (_sig_sum(L, active.astype(np.int64)) - active).astype(int), "dur_max": B["dur_max"]}
+    out.update(_silent_rows(B, L, np.arange(nd), S, n_on))
+    out["level_ratio"], out["level_llr"] = np.full(nd, np.nan), np.zeros(nd)
+    lb = np.full(nd, np.nan)
+    n15 = _agg(n)
+    cov15 = _agg(cov.astype(float)) == AGG                       # signals x 15-min bins
+    S15 = _sig_sum(L, n15) - n15
+    c15 = cov15[rs]
+    ln = c15.sum(1)
+    pos = np.cumsum(c15, 1) - 1                                  # compacted position of each covered bin
+    W = int(ln.max()) if nd else 0
+    xs = np.zeros((nd, max(W, 1)))
+    ss = np.zeros((nd, max(W, 1)))
+    r_, b_ = np.nonzero(c15)
+    xs[r_, pos[r_, b_]] = n15[r_, b_]
+    ss[r_, pos[r_, b_]] = S15[r_, b_]
+    xsum = np.where(np.arange(xs.shape[1])[None] < ln[:, None], xs, 0).sum(1)
+    ok = (ln >= 8) & (xsum >= 20)
+    if ok.any():
+        rr = np.flatnonzero(ok)
+        cx, cs = np.cumsum(xs[rr], 1), np.cumsum(ss[rr], 1)
+        X, SS = cx[np.arange(len(rr)), ln[rr] - 1], cs[np.arange(len(rr)), ln[rr] - 1]
+        k = np.arange(2, xs.shape[1] - 1) if xs.shape[1] > 3 else np.zeros(0, int)
+        valid = k[None, :] < (ln[rr] - 1)[:, None]
+        x1, s1_ = cx[:, k - 1], cs[:, k - 1]
+        x2, s2 = X[:, None] - x1, SS[:, None] - s1_
+        p0 = X / np.maximum(SS, 1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            def ll(xx, ss_):
+                p = np.where(ss_ > 0, xx / np.maximum(ss_, 1e-9), 0)
+                return np.where(xx > 0, xx * np.log(np.maximum(p, 1e-12)), 0) - p * ss_
+            llr = ll(x1, s1_) + ll(x2, s2) - (X * np.log(np.maximum(p0, 1e-12)) - p0 * SS)[:, None]
+        llr = np.where(valid, llr, -np.inf)
+        j = np.argmax(llr, 1)
+        ar = np.arange(len(rr))
+        out["level_llr"][rr] = llr[ar, j]
+        out["level_ratio"][rr] = ((x2[ar, j] + .5) / np.maximum(s2[ar, j], 1)) / ((x1[ar, j] + .5) /
+                                                                                 np.maximum(s1_[ar, j], 1))
+        lb[rr] = k[j] * AGG
+    df = pd.DataFrame(out)
+    if np.isfinite(lb).any():
+        df["level_b"] = lb.astype(np.int64) if np.isfinite(lb).all() else lb
+    return df
 
 
 # ============================================================================= rules
@@ -472,57 +793,6 @@ def rules(st: pd.DataFrame, B: dict) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
-def twins(n, cov, tol=0.1):
-    """pairs of channels carrying (almost) the same actuations = one zone wired to two inputs:
-    5-min counts differ by < tol of their sum.  Returns a bool matrix."""
-    x = n[:, cov]
-    tot = x.sum(1)
-    tw = np.zeros((len(n), len(n)), bool)
-    for i in np.where(tot > 0)[0]:
-        dd = np.abs(x - x[i]).sum(1) / np.maximum(tot + tot[i], 1)
-        tw[i] = (dd < tol) & (tot > 0)
-    np.fill_diagonal(tw, False)
-    return tw
-
-
-def _refs(dets, live, phase, tw):
-    """reference of each detector: the other live detectors on its (predicted) phase when there are
-    >= 2 of them, else the rest of the signal's live detectors; a twin (same zone on another input)
-    is never a reference."""
-    ph = np.array([phase.get(int(d), np.nan) if phase else np.nan for d in dets], float)
-    idx = np.arange(len(dets))
-    ref, kind = [], []
-    for i in range(len(dets)):
-        ok = live & (idx != i) & ~tw[i]
-        same = np.where(ok & (ph == ph[i]))[0] if np.isfinite(ph[i]) else []
-        if len(same) >= 2:              # one sibling is too fragile: if it fails, this one looks bad
-            ref.append(same)
-            kind.append("phase")
-        else:
-            ref.append(np.where(ok)[0])
-            kind.append("signal")
-    return ref, kind, ph
-
-
-def _refs(dets, live, phase, tw):
-    """reference of each detector: the other live detectors on its (predicted) phase when there are
-    >= 2 of them, else the rest of the signal's live detectors; a twin (same zone on another input)
-    is never a reference."""
-    ph = np.array([phase.get(int(d), np.nan) if phase else np.nan for d in dets], float)
-    idx = np.arange(len(dets))
-    ref, kind = [], []
-    for i in range(len(dets)):
-        ok = live & (idx != i) & ~tw[i]
-        same = np.where(ok & (ph == ph[i]))[0] if np.isfinite(ph[i]) else []
-        if len(same) >= 2:              # one sibling is too fragile: if it fails, this one looks bad
-            ref.append(same)
-            kind.append("phase")
-        else:
-            ref.append(np.where(ok)[0])
-            kind.append("signal")
-    return ref, kind, ph
-
-
 def on_episodes(ev: pd.DataFrame, start, end, min_s: float = 900.0) -> pd.DataFrame:
     """Continuous ONs held >= min_s (stuck-on), with start / end.  A continuous ON runs from the ON that
     starts it to the next OFF; further ONs inside it (no OFF between) are normal extension re-calls and
@@ -536,27 +806,68 @@ def on_episodes(ev: pd.DataFrame, start, end, min_s: float = 900.0) -> pd.DataFr
     return _on_episodes(ev, start, end, min_s)
 
 
+def pairs_in_signal(sig):
+    """all ordered pairs (i, j), i != j, of items of the same signal (sig ascending), i-major."""
+    sig = np.asarray(sig)
+    n = len(sig)
+    if not n:
+        return np.zeros(0, np.int64), np.zeros(0, np.int64)
+    u, first, cnt = sorted_unique(sig, return_index=True, return_counts=True)
+    k = np.repeat(np.arange(len(u)), cnt)
+    m = cnt[k]
+    ii = np.repeat(np.arange(n), m)
+    jj = np.repeat(first[k], m) + (np.arange(len(ii)) - np.repeat(np.cumsum(m) - m, m))
+    keep = ii != jj
+    return ii[keep], jj[keep]
+
+
+def distinct_count(ii, vals, mask, n):
+    """per item i: the number of distinct vals[j] over its pairs (i, j) with mask."""
+    if not len(ii) or not mask.any():
+        return np.zeros(n, int)
+    a, v = ii[mask], vals[mask]
+    u = np.unique(a * (int(v.max()) + 1) + v)
+    return np.bincount(u // (int(v.max()) + 1), minlength=n)[:n].astype(int)
+
+
 def _on_episodes(ev, start, end, min_s: float = 900.0) -> pd.DataFrame:
     T = (end - start).total_seconds()
     P_ = _prep(ev, start, end)
-    g0 = P_.g0
     td, ed, pd_ = P_.td, P_.ed, P_.pd_
-    end_t, start_ = cont_on(P_, T) if isinstance(ev, Prep) else continuous_on(td, ed, pd_, T)
-    oe_all = end_t >= T                                   # still ON when the window closed
-    # ONs inside each continuous ON: ON count between its start and its OFF on the same channel
-    ci = np.cumsum(ed == 82)
-    offp = np.searchsorted(td + pd_ * 1e7, end_t + pd_ * 1e7, "left")      # position of the ending OFF
-    nin = ci[np.minimum(offp, len(td)) - 1] - ci + 1 if len(td) else np.zeros(0, int)
-    m = start_ & (end_t - td >= min(CO_MIN_S, min_s))
-    s, f, c, nf, oe = td[m], end_t[m], pd_[m], nin[m], oe_all[m]
-    if len(g0) and len(s):
-        k = np.searchsorted(g0, s)
-        hit = (k < len(g0)) & (g0[np.minimum(k, len(g0) - 1)] < f)
+    if isinstance(ev, Prep):
+        end_t, start_ = cont_on(P_, T)
+        po = _cont_off(P_, T)
+    else:
+        end_t, start_ = continuous_on(td, ed, pd_, T)
+        P_.cache = {}
+        po = _cont_off(P_, T)
+    # continuous ONs held >= the base length; ONs inside each: ON count between its start and its OFF on the same
+    # channel (the position of the ending OFF = the first event of its channel at that time; still ON = the end of
+    # the channel's events)
+    n = len(td)
+    m = np.flatnonzero(start_ & (end_t - td >= min(CO_MIN_S, min_s)))
+    if len(m):
+        ci = np.cumsum(ed == 82)
+        p = po[m]
+        gp = np.maximum(p, 0)
+        while True:                                       # step back over events of the channel at the same time
+            back = (p >= 0) & (gp > 0)
+            back[back] &= (pd_[gp[back] - 1] == pd_[gp[back]]) & (td[gp[back] - 1] == td[gp[back]])
+            if not back.any():
+                break
+            gp = np.where(back, gp - 1, gp)
+        offp = np.where(p >= 0, gp, np.searchsorted(pd_, pd_[m], "right"))
+        nin = ci[np.minimum(offp, n) - 1] - ci[m] + 1
+    else:
+        nin = np.zeros(0, int)
+    s, f, c, nf, oe = td[m], end_t[m], pd_[m], nin, end_t[m] >= T
+    if len(P_.g0) and len(s):
+        hit = spans_gap(P_, c // BASE, s, f)
         s, f, c, nf, oe = s[~hit], f[~hit], c[~hit], nf[~hit], oe[~hit]
-    # other detectors held ON (>= 5 min) through at least half of the same time: a shared event
-    ov = np.minimum(f[:, None], f[None]) - np.maximum(s[:, None], s[None])
-    co = ((ov >= 0.5 * (f - s)[:, None]) & (c[:, None] != c[None]))
-    co = np.array([len(set(c[row].tolist())) for row in co], dtype=int)
+    # other detectors (same signal) held ON (>= 5 min) through at least half of the same time: a shared event
+    ii, jj = pairs_in_signal(c // BASE)
+    ov = np.minimum(f[ii], f[jj]) - np.maximum(s[ii], s[jj])
+    co = distinct_count(ii, c[jj], (ov >= 0.5 * (f - s)[ii]) & (c[ii] != c[jj]), len(s))
     k = (f - s) >= min_s
     return pd.DataFrame({"detector": c[k].astype(int), "t0": start + pd.to_timedelta(s[k], unit="s"),
                          "t1": start + pd.to_timedelta(f[k], unit="s"), "dur_s": (f - s)[k], "n_on": nf[k],
@@ -565,14 +876,16 @@ def _on_episodes(ev, start, end, min_s: float = 900.0) -> pd.DataFrame:
 
 def _recovery(B: dict, i: int, a: int, b: int, ref) -> float:
     """share of the reference in the 6 h after bins [a, b) / in the 6 h before; NaN when either
-    side has < 3 h of data."""
-    n, cov = B["n_on"], B["cov"]
+    side has < 3 h of data.  ref None = the rest of the signal."""
+    L = layout(B)
+    n, cov = B["n_on"], B["cov"][L["rs"][i]]
+    rows = _rows_of_signal(L, L["rs"][i])
     nb = n.shape[1]
 
     def sh(lo, hi):
         c = cov[lo:hi]
         x = n[i, lo:hi][c].sum()
-        S = (n[:, lo:hi].sum(0) - n[i, lo:hi] if ref is None else n[ref, lo:hi].sum(0))[c].sum()
+        S = (n[rows, lo:hi].sum(0) - n[i, lo:hi] if ref is None else n[ref, lo:hi].sum(0))[c].sum()
         return (x + 0.5) / max(S, 1.0), int(c.sum())
 
     if a < REC_MIN_BINS or nb - b < REC_MIN_BINS:
@@ -583,12 +896,22 @@ def _recovery(B: dict, i: int, a: int, b: int, ref) -> float:
 
 
 def _counts15(B: dict):
-    """15-min counts of every detector and the fully covered 15-min bins, computed once per window (cached in B; the
-    coverage mask is returned as a copy because callers edit it)."""
+    """15-min counts of every detector and the fully covered 15-min bins of every signal (signals x bins), computed
+    once per window (cached in B; the coverage mask is returned as a copy because callers edit it)."""
     if "_n15" not in B:
+        norm_bins(B)
         B["_n15"] = _agg(B["n_on"].astype(float))
-        B["_ok15"] = _agg(B["cov"][None].astype(float))[0] == AGG
+        B["_ok15"] = _agg(B["cov"].astype(float)) == AGG
     return B["_n15"], B["_ok15"].copy()
+
+
+def _corr2(B, i, j, okkey, x, y):
+    """np.corrcoef(x, y)[0, 1], cached per (row, row, mask) in B (both passes ask the same pairs)."""
+    c = B.setdefault("_corr", {})
+    k = (i, j, okkey)
+    if k not in c:
+        c[k] = float(np.corrcoef(x, y)[0, 1])
+    return c[k]
 
 
 def _partner(B: dict, i: int, cand, a: int, b: int):
@@ -597,15 +920,18 @@ def _partner(B: dict, i: int, cand, a: int, b: int):
     if cand is None or not len(cand):
         return None, np.nan
     n15, ok = _counts15(B)
+    ok = ok[layout(B)["rs"][i]]
     ok[a // AGG: -(-b // AGG)] = False
     if ok.sum() < 16:
         return None, np.nan
     best, bc, bk = None, -1.0, None
     w = np.arange(1, int(ok.sum()) + 1, dtype=float)
+    x = n15[i][ok]
+    xsd = x.max() != x.min()
     for j in cand:
-        y, x = n15[j][ok], n15[i][ok]
-        if y.std() > 0 and x.std() > 0:
-            c = float(np.corrcoef(x, y)[0, 1])
+        y = n15[j][ok]
+        if xsd and y.max() != y.min():
+            c = _corr2(B, int(i), int(j), (a // AGG, -(-b // AGG)), x, y)
             # note 77: equal correlations are broken by the sibling's own counts, never by its channel order
             k = (round(c, 12), float(y.sum()), float((y * w).sum()))
             if bk is None or k > bk:
@@ -649,26 +975,34 @@ def _add_cols(df: pd.DataFrame, cols: dict) -> pd.DataFrame:
 
 def health(events_df: pd.DataFrame, start, end, detectors=None, phase: dict | None = None,
            function: dict | None = None, lanes: dict | None = None,
-           phase_conf: dict | None = None) -> pd.DataFrame:
-    """Per-detector stage-1 health table for one signal over [start, end).  Columns: detector, health_score, status,
-    reason, bad_periods (list of {start, end, what, recovered}), the rule scores s_* and the statistics behind them.
-    `lanes` / `phase_conf` are accepted for compatibility and not used."""
+           phase_conf: dict | None = None, signals=None) -> pd.DataFrame:
+    """Per-detector stage-1 health table over [start, end) for every signal of the Prep (keys: see the module text).
+    Columns: detector, health_score, status, reason, bad_periods (list of {start, end, what, recovered}), the rule
+    scores s_* and the statistics behind them.  `signals` (optional): only these signals' rows are returned (the
+    others are not computed beyond the shared bins).  `lanes` / `phase_conf` are accepted for compatibility and not
+    used."""
     start, end = pd.Timestamp(start), pd.Timestamp(end)
     events_df = _prep(events_df, start, end)
     B = events_to_bins(events_df, start, end, None)
     if len(B["dets"]) == 0:
         return pd.DataFrame(columns=["detector", "health_score", "status", "reason", "bad_periods"])
+    L = layout(B)
     dets = B["dets"]
+    rs, rch = L["rs"], dets % BASE
+    nr = len(dets)
     n, cov = B["n_on"].astype(float), B["cov"]
-    live = n[:, cov].sum(1) > 0
+    covr = cov[rs]
+    live = (n * covr).sum(1) > 0
     phase = {int(k): v for k, v in (phase or {}).items() if v is not None and np.isfinite(v)}
-    ref, kind, _ = _refs(dets, live, phase, twins_of(B))
+    phv = np.array([phase.get(int(d), np.nan) for d in dets], float)
+    keep = np.ones(nr, bool) if signals is None else np.isin(rs, list(signals))
+    ref, kind = refs_rows(B, live, phv)
     # silence is expected from the other detectors on the predicted phase when there are >= 2
-    ph2 = [i for i in range(len(dets)) if kind[i] == "phase" and len(ref[i]) >= 2]
+    ph2 = np.flatnonzero(kind == "phase")
     st = det_stats(B)
     st["drop_ref"] = "signal"
-    if ph2:
-        sp = drop_stats(B, {i: ref[i] for i in ph2})
+    if len(ph2):
+        sp = drop_stats(B, (ph2, ref))
         for c in ["drop_lam", "drop_b0", "drop_b1", "drop_to_end", "co_silent"]:
             v = st[c].to_numpy().copy()
             v[ph2] = sp[c].to_numpy()
@@ -679,42 +1013,44 @@ def health(events_df: pd.DataFrame, start, end, detectors=None, phase: dict | No
     fl = _labels(function)
     st["pred_function"] = st.detector.map(fl)
     st["pred_phase"] = st.detector.map(phase) if phase else np.nan
-    idx = {int(d): i for i, d in enumerate(dets)}
-    rref = [ref[i] if kind[i] == "phase" and len(ref[i]) >= 2 else None for i in range(len(dets))]
+    isref = kind == "phase"
+    rref = [ref_list(L, ref, i) if isref[i] else None for i in range(nr)]
     # recovery partner candidates: every other live detector on the predicted phase, twins included
-    phv = np.array([phase.get(int(d), np.nan) for d in dets], float)
-    pcand = [list(np.where(live & (np.arange(len(dets)) != i) & (phv == phv[i]))[0]) if np.isfinite(phv[i]) else []
-             for i in range(len(dets))]
+    lp = pad(L, live, False)
+    pp = pad(L, phv, np.nan)
+    eye = np.eye(L["m"], dtype=bool)[None]
+    pc_m = lp[:, None, :] & ~eye & (pp[:, :, None] == pp[:, None, :]) & np.isfinite(pp)[:, :, None]
+    pcand = [list(ref_list(L, pc_m, i)) if np.isfinite(phv[i]) else [] for i in range(nr)]
     # night count against the detector it tracks (best 15-min correlation >= .7 with a same-phase sibling, twins
     # included), else the other detectors on its phase (>= 2), else the signal
     hr = B["hour"]
-    nt = cov & ((hr >= NIGHT_H[0]) | (hr < NIGHT_H[1]))
-    dy = cov & (hr >= DAY[0]) & (hr < DAY[1])
+    ntm = cov & ((hr >= NIGHT_H[0]) | (hr < NIGHT_H[1]))[None]
+    dym = cov & ((hr >= DAY[0]) & (hr < DAY[1]))[None]
+    dy_r, nt_r = (n * dym[rs]).sum(1), (n * ntm[rs]).sum(1)
+    sig_ok = (ntm.sum(1) >= 24) & (dym.sum(1) >= 24)
+    rdy, rnt = ref_sum(L, ref, np.c_[dy_r, nt_r]).T
+    sdy, snt = _sig_sum(L, np.c_[dy_r, nt_r]).T
     nd = {c: {} for c in ("night_ratio", "night_n", "night_exp", "night_ref")}
-    if nt.sum() >= 24 and dy.sum() >= 24:
-        for j, r in zip(st.index, rows_of(st)):
-            d = int(r.detector)
-            i = idx[d]
-            if n[i, dy].sum() < 20:
-                continue
-            pref, _ = _partner(B, i, pcand[i], 0, 0)
-            if pref is not None:
-                R, who = n[pref].sum(0), f"d{int(dets[pref[0]])}, which it tracks"
-            elif rref[i] is not None:
-                R, who = n[rref[i]].sum(0), "the other detectors on its phase"
-            else:
-                R, who = n.sum(0) - n[i], "the rest of the signal"
-            exp_n = n[i, dy].sum() / max(R[dy].sum(), 1) * R[nt].sum()
-            if exp_n < NIGHT_MIN_EXP:
-                continue
-            xn = n[i, nt].sum()
-            nd["night_ratio"][j], nd["night_n"][j], nd["night_exp"][j] = (xn + .5) / (exp_n + .5), xn, exp_n
-            nd["night_ref"][j] = who
+    for i in np.flatnonzero(keep & sig_ok[rs] & (dy_r >= 20)):
+        pref, _ = _partner(B, i, pcand[i], 0, 0)
+        if pref is not None:
+            Rd, Rn, who = dy_r[pref[0]], nt_r[pref[0]], f"d{int(rch[pref[0]])}, which it tracks"
+        elif rref[i] is not None:
+            Rd, Rn, who = rdy[i], rnt[i], "the other detectors on its phase"
+        else:
+            Rd, Rn, who = sdy[i] - dy_r[i], snt[i] - nt_r[i], "the rest of the signal"
+        exp_n = dy_r[i] / max(Rd, 1) * Rn
+        if exp_n < NIGHT_MIN_EXP:
+            continue
+        xn = nt_r[i]
+        nd["night_ratio"][i], nd["night_n"][i], nd["night_exp"][i] = (xn + .5) / (exp_n + .5), xn, exp_n
+        nd["night_ref"][i] = who
     st = _add_cols(st, {c: pd.Series(v, dtype=object if c == "night_ref" else float).reindex(st.index)
                         for c, v in nd.items()})
     # ---- episodes: stuck-on (incl. ON with no OFF) and silent runs -> bad periods + recovery
     per = {int(d): [] for d in dets}
     ep = on_episodes(events_df, start, end)
+    idx = {int(d): i for i, d in enumerate(dets)}
     nb = n.shape[1]
     best = {}
     held = {}
@@ -722,7 +1058,7 @@ def health(events_df: pd.DataFrame, start, end, detectors=None, phase: dict | No
         held.setdefault(int(r.detector), []).append((r.t0, r.t1))
     for r in ep.itertuples():
         i = idx.get(int(r.detector))
-        if i is None:
+        if i is None or not keep[i]:
             continue
         a0 = int((r.t0 - start).total_seconds() // B["bin_s"])
         b0 = min(int(np.ceil((r.t1 - start).total_seconds() / B["bin_s"])), nb)
@@ -735,27 +1071,26 @@ def health(events_df: pd.DataFrame, start, end, detectors=None, phase: dict | No
             best[int(r.detector)] = (r.dur_s, r.t0, r.t1, float(r.co_stuck), rec)
     epc = {c: st.detector.map({d: v[k] for d, v in best.items()})
            for c, k in (("ep_dur", 0), ("ep_t0", 1), ("ep_t1", 2), ("ep_co", 3), ("ep_rec", 4))}
-    nst = len(st)
-    d_rec, d_in = np.full(nst, np.nan), np.zeros(nst, bool)
-    for j, r in enumerate(rows_of(st)):
-        if r.n_on > 0 and r.drop_lam >= LIM["drop_lam"][0] and r.drop_b1 > r.drop_b0:
-            i = idx[int(r.detector)]
-            r0 = start + _td(seconds=int(r.drop_b0) * B["bin_s"])
-            r1 = start + _td(seconds=int(r.drop_b1) * B["bin_s"])
-            ov = sum(max((min(p["end"], r1) - max(p["start"], r0)).total_seconds(), 0)
-                     for p in per[int(r.detector)])
-            if ov >= 0.5 * (r1 - r0).total_seconds():
-                d_in[j] = True
-                continue
-            pref, _ = _partner(B, i, pcand[i], int(r.drop_b0), int(r.drop_b1))
-            rec = np.nan if r.drop_to_end else _recovery(B, i, int(r.drop_b0), int(r.drop_b1),
-                                                          pref if pref is not None else rref[i])
-            d_rec[j] = rec
-            per[int(r.detector)].append(dict(
-                start=r0, end=r1, what="silent",
-                recovered=None if not np.isfinite(rec) else bool(REC_RATIO[0] <= rec <= REC_RATIO[1])))
+    d_rec, d_in = np.full(nr, np.nan), np.zeros(nr, bool)
+    dl, db0, db1, dn = (st[c].to_numpy() for c in ("drop_lam", "drop_b0", "drop_b1", "n_on"))
+    dte = st.drop_to_end.to_numpy()
+    for j in np.flatnonzero(keep & (dn > 0) & (dl >= LIM["drop_lam"][0]) & (db1 > db0)):
+        d = int(dets[j])
+        r0 = start + _td(seconds=int(db0[j]) * B["bin_s"])
+        r1 = start + _td(seconds=int(db1[j]) * B["bin_s"])
+        ov = sum(max((min(p["end"], r1) - max(p["start"], r0)).total_seconds(), 0) for p in per[d])
+        if ov >= 0.5 * (r1 - r0).total_seconds():
+            d_in[j] = True
+            continue
+        pref, _ = _partner(B, j, pcand[j], int(db0[j]), int(db1[j]))
+        rec = np.nan if dte[j] else _recovery(B, j, int(db0[j]), int(db1[j]), pref if pref is not None else rref[j])
+        d_rec[j] = rec
+        per[d].append(dict(start=r0, end=r1, what="silent",
+                           recovered=None if not np.isfinite(rec) else bool(REC_RATIO[0] <= rec <= REC_RATIO[1])))
     epc.update(drop_rec=d_rec, drop_in_stuck=d_in)
     st = _add_cols(st, epc)
+    if not keep.all():
+        st = st[keep].reset_index(drop=True)
     h = rules(st, B)
     h["bad_periods"] = h.detector.map(lambda d: sorted(per.get(int(d), []), key=lambda x: x["start"]))
     return _merge_same(h, st, how="inner")

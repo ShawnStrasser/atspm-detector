@@ -476,21 +476,37 @@ def config_notes(X):
 
 
 # ============================================================================ main entry
-def _stage1(P, start, end, phase, fprob, lanes, pconf, stage1=None):
-    """stage-1 rules (health_core), two passes: detectors pass 1 calls bad are nobody's yardstick in pass 2."""
+def _stage1(P, start, end, phase, fprob, lanes, pconf, stage1=None, sig_phase=None):
+    """stage-1 rules (health_core), two passes: detectors pass 1 calls bad are nobody's yardstick in pass 2 (run for
+    the signals with a bad detector and a predicted phase; sig_phase: the signals with any predicted phase)."""
     f = stage1 or hc.health
     h1 = f(P, start, end, None, phase or None, fprob or None, lanes or None, pconf or None)
     if not len(h1):
         return h1, {}
-    bad = set(h1.loc[h1.status == "bad", "detector"].astype(int))
-    st1 = dict(zip(h1.detector.astype(int), h1.status))
-    sc1 = dict(zip(h1.detector.astype(int), h1.health_score))
+    det = h1.detector.astype(int).to_numpy()
+    sig = det // hc.BASE
+    badm = (h1.status == "bad").to_numpy()
+    bad = set(det[badm].tolist())
+    st1 = dict(zip(det.tolist(), h1.status))
+    sc1 = dict(zip(det.tolist(), h1.health_score))
+    if sig_phase is None:
+        sig_phase = {0} if phase else set()
+    p2 = sorted(set(sig[badm].tolist()) & set(sig_phase))
     x = h1
-    if bad and phase:
+    if p2:
         ph2 = {k: (np.nan if k in bad else v) for k, v in phase.items()}
-        y = f(P, start, end, None, ph2, fprob or None, lanes or None, pconf or None)
+        if stage1 is None:
+            y = f(P, start, end, None, ph2, fprob or None, lanes or None, pconf or None, signals=p2)
+        else:
+            y = f(P, start, end, None, ph2, fprob or None, lanes or None, pconf or None)
+            y = y[np.isin(y.detector.astype(int).to_numpy() // hc.BASE, p2)]
         y = y[~y.detector.isin(bad)]
-        x = pd.concat([h1[h1.detector.isin(bad)], y], ignore_index=True)
+        ins = np.isin(sig, p2)
+        parts = [h1[~ins], h1[ins & badm], y]
+        x = pd.concat(parts, ignore_index=True)
+        xs = x.detector.astype(int).to_numpy() // hc.BASE
+        sub = np.r_[np.zeros(len(parts[0]) + len(parts[1]), int), np.ones(len(y), int)]
+        x = x.iloc[np.lexsort((sub, xs))].reset_index(drop=True)
     x = x.copy()
     x["status1"] = x.detector.astype(int).map(st1)
     x["score1"] = x.detector.astype(int).map(sc1)
@@ -533,21 +549,63 @@ def assess(P, start, end, phase: dict, fn_label: dict, fn_prob: dict, lanes: dic
     phase / fn_label / fn_prob / lanes / phase_conf: the classifier's answers per detector (raw predicted phase,
     final function label, class probabilities, lane span, phase probability).  Returns (table, signal note).
     `keep_all` also returns every internal column and the episode table (research comparison)."""
+    res, X, E = assess_group(P, start, end, [dict(phase=phase, fn_label=fn_label, fn_prob=fn_prob, lanes=lanes,
+                                                  phase_conf=phase_conf)], refs, stage1, True, limits_json)
+    out, note = res[0]
+    return (out, note, X, E) if keep_all else (out, note)
+
+
+def _keyed(items):
+    """the classifier's answers of every signal of a batch, keyed by detector key (signal * BASE + detector) with the
+    phase as phase key (signal * PB + phase); signal 0 keeps the numbers as they are."""
+    ph, fl, fp, ln, pc, sig_phase = {}, {}, {}, {}, {}, set()
+    for s, it in enumerate(items):
+        kb, pb = s * hc.BASE, s * hc.PB
+        p = {int(k): float(v) for k, v in (it.get("phase") or {}).items() if v is not None and np.isfinite(v)}
+        if p:
+            sig_phase.add(s)
+        ph.update({kb + k: pb + v for k, v in p.items()})
+        fl.update({kb + int(k): v for k, v in (it.get("fn_label") or {}).items() if isinstance(v, str)})
+        fp.update({kb + int(k): v for k, v in (it.get("fn_prob") or {}).items() if isinstance(v, dict) and v})
+        ln.update({kb + int(k): float(v) for k, v in (it.get("lanes") or {}).items()
+                   if v is not None and np.isfinite(v)})
+        pc.update({kb + int(k): v for k, v in (it.get("phase_conf") or {}).items()})
+    return ph, fl, fp, ln, pc, sig_phase
+
+
+def _split(out: pd.DataFrame, S: int) -> list:
+    """the batch's per-detector table -> one table per signal (real detector numbers, sorted)."""
+    res = []
+    if not len(out):
+        return [pd.DataFrame(columns=OUT_COLS) for _ in range(S)]
+    sig = out.detector.to_numpy(np.int64) // hc.BASE
+    for s in range(S):
+        o = out[sig == s].copy()
+        o["detector"] = o.detector.astype(np.int64) - s * hc.BASE
+        res.append(o.sort_values("detector").reset_index(drop=True) if len(o) else pd.DataFrame(columns=OUT_COLS))
+    return res
+
+
+def assess_group(P, start, end, items: list, refs: Refs | None = None, stage1=None, keep_all: bool = False,
+                 limits_json: dict | None = None):
+    """Health for every signal of a batch sharing the window [start, end) (note 152): P = health_core.Prep of the
+    window (prep_group of the signals' Preps, or one signal's Prep), items = one dict per signal (phase, fn_label,
+    fn_prob, lanes, phase_conf as for `assess`).  Every check runs for all signals at once; a signal's answers are
+    the ones it gets alone.  Returns [(table, signal note)] per signal (and the internal X / E tables with keep_all)."""
     refs = refs or _load_refs()
     LJ = limits_json or _load_limits()
     start, end = pd.Timestamp(start), pd.Timestamp(end)
+    S = len(items)
     T = (end - start).total_seconds()
     hours = T / 3600.0
     wg = window_group(hours)
     m30 = wg == "m30"
     bs = 300 if m30 else 900
-    phase = {int(k): float(v) for k, v in (phase or {}).items() if v is not None and np.isfinite(v)}
-    fn_label = {int(k): v for k, v in (fn_label or {}).items() if isinstance(v, str)}
-    fn_prob = {int(k): v for k, v in (fn_prob or {}).items() if isinstance(v, dict) and v}
-    lanes = {int(k): float(v) for k, v in (lanes or {}).items() if v is not None and np.isfinite(v)}
-    H, st1 = _stage1(P, start, end, phase, fn_prob, lanes, phase_conf, stage1)
+    phase, fn_label, fn_prob, lanes, phase_conf, sig_phase = _keyed(items)
+    empty = [(pd.DataFrame(columns=OUT_COLS), "") for _ in range(S)]
+    H, st1 = _stage1(P, start, end, phase, fn_prob, lanes, phase_conf, stage1, sig_phase)
     if not len(H):
-        return (pd.DataFrame(columns=OUT_COLS), "") if not keep_all else (pd.DataFrame(columns=OUT_COLS), "", None, None)
+        return (empty, None, None) if keep_all else empty
     H = H.rename(columns={"status": "status2", "status1": "status"})
     H["detector"] = H.detector.astype(int)
     for c in ("s_dropout", "s_stuck", "s_night_drop", "ep_dur", "drop_lam", "drop_b0", "drop_b1", "night_ratio",
@@ -560,18 +618,19 @@ def assess(P, start, end, phase: dict, fn_label: dict, fn_prob: dict, lanes: dic
     X = H[H.detector.map(fn_label).isin(FNS)].copy().reset_index(drop=True)
     rest = H[~H.detector.isin(X.detector)].copy()
     if not len(X):
-        out = _fallback(rest)
-        return (out, "") if not keep_all else (out, "", None, None)
+        res = list(zip(_split(_fallback(rest), S), [""] * S))
+        return (res, None, None) if keep_all else res
     Pm = np.array([[fn_prob.get(int(d), {}).get(c, np.nan) for c in C7] for d in X.detector], float)
     top = np.nanmax(np.where(np.isfinite(Pm), Pm, -1), 1)
     alts = _alts(Pm)
     O = hs.occ_bins(P, start, end, bs, fn_label, phase)
     dmap = {int(d): i for i, d in enumerate(O["dets"])}
+    sigx = X.detector.to_numpy(np.int64) // hc.BASE
     cols = {"fn": X.detector.map(fn_label), "phase": X.detector.map(phase).astype(float),
             "lanes": X.detector.map(lanes).astype(float)}
     cols.update(f_top=np.where(top >= 0, top, np.nan), alt_set=alts,
                 alt_fns=[",".join(c for c in C7 if c in a) for a in alts], hours=hours, wg=wg, t_start=start,
-                occ=[O["mocc"][dmap[d]] if d in dmap else np.nan for d in X.detector])
+                occ=[O["mocc"][dmap[d]] if d in dmap else np.nan for d in X.detector], sig=sigx)
     X = _add(X, cols)
     # ---- bins, context
     M = hs.bins_ctx(O, st1)
@@ -607,21 +666,21 @@ def assess(P, start, end, phase: dict, fn_label: dict, fn_prob: dict, lanes: dic
     E["ts"] = (E.t0 - start).dt.total_seconds()
     E["tf"] = (E.t1 - start).dt.total_seconds()
     E["co5"] = hs.episode_overlap(E)
-    TW = hk.twin_matrix(B5)
+    TW = hk.twin_pairs(B5)
     E["n_ov_any"], E["common"] = hk.common_holds(E.ts.to_numpy(float), E.tf.to_numpy(float), E.detector.to_numpy(int),
                                                  LJ["common_hold_s"], twin=TW)
     E = E.join(hs.episodes_ctx(E, M, dict(zip(X.detector, X.phase)), refs.qtype, dict(zip(X.detector, X.type))))
     E["fn"] = E.detector.map(dict(zip(X.detector, X.fn)))
     # ---- limits, time of day (a whole day in the sample)
     L, Bl = limits(X, refs, LJ)
-    X, sig_note, day_info = _time_of_day(X, O, start, end, refs, L["prof"], LJ["busy"])
+    X, tod_notes, day_info = _time_of_day(X, O, start, end, refs, L["prof"], LJ["busy"])
     # ---- Count zone held ON / extension; the queue excuse is never for a counting zone
     cfg = config_notes(X)
     c1 = cfg == "C1"
-    sure_count = np.array([(not a) or a <= {"Count"} for a in alts])
+    sure_count = np.array([(not a) or a <= {"Count"} for a in alts], bool)
     X["count_on_ok"] = X.fn.eq("Count").to_numpy() & sure_count & ~c1
     X["c1_pre"] = c1
-    noq = X.fn.isin(NO_SHARED).to_numpy() & np.array([not (a & QUEUE_OK) for a in alts])
+    noq = X.fn.isin(NO_SHARED).to_numpy() & np.array([not (a & QUEUE_OK) for a in alts], bool)
     if len(E):
         E["noq"] = E.detector.map(dict(zip(X.detector, noq))).fillna(False).astype(bool)
         E.loc[E.noq, "n_hpeer_e"] = 0
@@ -654,9 +713,9 @@ def assess(P, start, end, phase: dict, fn_label: dict, fn_prob: dict, lanes: dic
                     for v in X.drop_lam.astype(float)])
     X["s_dropout"] = np.where(m, new, sd)
     # ---- the checks, status, severity, outputs
-    S, C = scores(X, E, F, L, Bl, LJ)
-    R = status(X, S, C)
-    X = _add(X, {**{f"s8_{k}": np.asarray(v, float) for k, v in S.items()},
+    S_, C = scores(X, E, F, L, Bl, LJ)
+    R = status(X, S_, C)
+    X = _add(X, {**{f"s8_{k}": np.asarray(v, float) for k, v in S_.items()},
                  **{f"lim_{k}": np.asarray(v, float) for k, v in L.items()},
                  **{f"bad_{k}": np.asarray(v, float) for k, v in Bl.items()}, **C,
                  "health_st": R["st"], "left": R["left"], "border": R["border"], "sev_rule": R["rule"],
@@ -665,13 +724,11 @@ def assess(P, start, end, phase: dict, fn_label: dict, fn_prob: dict, lanes: dic
                  "cfg": cfg})
     out = _outputs(X, E, F, start, end, per_bins)
     held = _common_note(X, E, F)
-    sig_note = "; ".join(x for x in (sig_note, held) if x)
     if len(rest):
         out = pd.concat([out, _fallback(rest)], ignore_index=True)
-    out = out.sort_values("detector").reset_index(drop=True)
-    if keep_all:
-        return out, sig_note, X, E
-    return out, sig_note
+    outs = _split(out, S)
+    res = [(o, "; ".join(x for x in (tod_notes.get(s, ""), held.get(s, "")) if x)) for s, o in enumerate(outs)]
+    return (res, X, E) if keep_all else res
 
 
 # ============================================================================ time of day (24-h samples)
@@ -690,21 +747,26 @@ def _full_days(start, end):
 
 
 def _time_of_day(X, O, start, end, refs, zlim, busy=None):
-    """busy at night per whole day of the sample (the day with the strongest finding is kept); signal note when many
-    detectors had an unusual night (a signal-wide event)."""
+    """busy at night per whole day of the sample (the day with the strongest finding is kept); per signal a note when
+    many of its detectors had an unusual night (a signal-wide event)."""
     num = ("tod_z", "tod_dph", "tod_n_night", "tod_r", "tod_mate_r")
     n = len(X)
     V = {c: np.full(n, np.nan) for c in num}
-    tod_day = [pd.NaT] * n
-    note, info = "", {}
+    tod_day = np.full(n, np.datetime64("NaT", "ns"))
+    notes, info = {}, {}
     days = _full_days(start, end) if (n and X.wg.iloc[0] == "h24" and O["bs"] == 900) else []
     dmap = {int(d): i for i, d in enumerate(O["dets"])}
     idx = np.array([dmap.get(int(d), -1) for d in X.detector])
-    best = {}
-    sig = []
-    for d0 in days:
+    sigx = X.sig.to_numpy(np.int64)
+    us = np.unique(sigx)
+    bk = np.full(n, -np.inf)
+    bday = np.full(n, -1)
+    nds = []
+    sig = {}
+    for di, d0 in enumerate(days):
         j0 = int(round((d0 - start).total_seconds() / 900))
         if j0 < 0 or j0 + 96 > O["nb"]:
+            nds.append(None)
             continue
         n15 = np.full((n, 96), np.nan)
         o15 = np.full((n, 96), np.nan)
@@ -719,25 +781,32 @@ def _time_of_day(X, O, start, end, refs, zlim, busy=None):
         ok = np.isfinite(N).all(1) & np.isfinite(Od).all(1) & (tot >= hs.MIN_N)
         nd = hs.night_day(N, Od, X.fn.to_numpy(object), X.span.to_numpy(object), X.phase.to_numpy(float), ok,
                           refs.tod_own, refs.tod_alt, list(X.alt_set))
+        nds.append(nd)
         odd = ok & nd.tod_odd.to_numpy()
-        if odd.sum() >= hs.SIG_MIN and odd.sum() >= hs.SIG_SHARE * ok.sum():
-            sig.append((d0, int(odd.sum()), int(ok.sum())))
+        n_odd = np.bincount(sigx, weights=odd, minlength=us.max() + 1)
+        n_ok = np.bincount(sigx, weights=ok, minlength=us.max() + 1)
+        for s in us:
+            if n_odd[s] >= hs.SIG_MIN and n_odd[s] >= hs.SIG_SHARE * n_ok[s]:
+                sig.setdefault(int(s), []).append((d0, int(n_odd[s]), int(n_ok[s])))
         lvl = hs.busy_level(nd.tod_z, nd.tod_dph, nd.tod_n_night, zlim, busy)
         key = np.where(np.isfinite(lvl), lvl, -1.0)
-        for i in range(n):
-            if i not in best or key[i] > best[i][0]:
-                best[i] = (key[i], d0, nd.iloc[i])
-                info[int(X.detector.iat[i])] = dict(day=d0)
-    for i, (_, d0, ndr) in best.items():
+        upd = (bday < 0) | (key > bk)
+        bk[upd], bday[upd] = key[upd], di
+    for di, nd in enumerate(nds):
+        r = np.flatnonzero(bday == di)
+        if nd is None or not len(r):
+            continue
         for c in num:
-            V[c][i] = float(ndr[c])
-        tod_day[i] = d0
+            V[c][r] = nd[c].to_numpy(float)[r]
+        tod_day[r] = days[di].to_datetime64()
+    for i in np.flatnonzero(bday >= 0):
+        info[int(X.detector.iat[i])] = dict(day=days[bday[i]])
     X = _add(X, {**V, "tod_day": pd.Series(tod_day, index=X.index, dtype="datetime64[ns]")})
-    if sig:
-        d0, k, m = max(sig, key=lambda s: s[1] / max(s[2], 1))
-        note = (f"{k} of {m} detectors at this signal had an unusual night on {d0:%a %d %b}: "
-                "a signal-wide event or an input change, not one bad detector")
-    return X, note, info
+    for s, sg in sig.items():
+        d0, k, m = max(sg, key=lambda x: x[1] / max(x[2], 1))
+        notes[s] = (f"{k} of {m} detectors at this signal had an unusual night on {d0:%a %d %b}: "
+                    "a signal-wide event or an input change, not one bad detector")
+    return X, notes, info
 
 
 # ============================================================================ plain outputs
@@ -762,8 +831,8 @@ def _hm(t):
 
 
 def _label(r):
-    p = f"P{int(r.phase)} " if np.isfinite(r.phase) else ""
-    return f"det {int(r.detector)}: {p}{str(r.fn).replace('Yellow_Red', 'Yellow-red')}"
+    p = f"P{int(r.phase) - int(r.sig) * hc.PB} " if np.isfinite(r.phase) else ""
+    return f"det {int(r.detector) - int(r.sig) * hc.BASE}: {p}{str(r.fn).replace('Yellow_Red', 'Yellow-red')}"
 
 
 def _evidence(k, r, eps):
@@ -779,7 +848,7 @@ def _evidence(k, r, eps):
                    "of the time")
         tog = [x for x in cnt if x["label"] == "together"]
         if tog:                                   # note 147e: one common failure with other detectors
-            mates = ", ".join(str(m) for m in sorted({m for x in tog for m in x["mates"]}))
+            mates = ", ".join(str(m % hc.BASE) for m in sorted({m for x in tog for m in x["mates"]}))
             when = (f"{_dur(tog[0]['dur_s'])} from {tog[0]['t0']:%a %H:%M}" if len(tog) == 1 else
                     f"{len(tog)} times from {tog[0]['t0']:%a %H:%M}, {_dur(sum(x['dur_s'] for x in tog))} in total")
             return f"held ON {when} together with det {mates} (same start and end: a common failure)"
@@ -855,29 +924,30 @@ def _stuck_eps(X, E, F):
 
 
 def _common_note(X, E, F):
-    """signal note for holds shared by several detectors with the same start and end (a common failure)."""
+    """per signal: the note for holds shared by several detectors with the same start and end (a common failure)."""
     if not len(E) or not F["common"].any():
-        return ""
+        return {}
     lim = dict(zip(X.detector.astype(int), X.lim_stuck))
     Le = E.detector.astype(int).map(lim).to_numpy(float)
     with np.errstate(invalid="ignore"):
         ii = np.flatnonzero(F["common"] & (F["dur"] >= Le))
     if not len(ii):
-        return ""
+        return {}
     s_, f_, c_ = E.ts.to_numpy(float), E.tf.to_numpy(float), E.detector.to_numpy(int)
     groups = {}
     for i in ii[np.argsort(s_[ii], kind="stable")]:
         g = tuple(sorted(set(hk.common_mates(s_, f_, c_, i, F.get("twin"))) | {int(c_[i])}))
         t = groups.setdefault(g, [i, set()])
         t[1].add(round(s_[i] / 60))                            # one event per start minute
-    parts = []
+    parts = {}
     for g, (i, ev) in sorted(groups.items(), key=lambda x: s_[x[1][0]]):
         k = len(ev)
-        parts.append(f"{len(g)} detectors (det {', '.join(map(str, g))}) held ON together "
-                     + (f"from {E.t0.iat[i]:%a %H:%M} for {_dur(F['dur'][i])}" if k == 1 else
-                        f"{k} times from {E.t0.iat[i]:%a %H:%M}")
-                     + " (same start and end): one common failure, check the cabinet first")
-    return "; ".join(parts)
+        parts.setdefault(int(c_[i]) // hc.BASE, []).append(
+            f"{len(g)} detectors (det {', '.join(str(x % hc.BASE) for x in g)}) held ON together "
+            + (f"from {E.t0.iat[i]:%a %H:%M} for {_dur(F['dur'][i])}" if k == 1 else
+               f"{k} times from {E.t0.iat[i]:%a %H:%M}")
+            + " (same start and end): one common failure, check the cabinet first")
+    return {s: "; ".join(v) for s, v in parts.items()}
 
 
 def _runs_to_periods(mask, t0, bin_s, end, what):
@@ -990,7 +1060,8 @@ def _fallback(H):
     """detectors without a known predicted function: the stage-1 rule checks as they are."""
     return pd.DataFrame({"detector": H.detector.astype(int), "health_status": H.status2 if "status2" in H else H.status,
                          "health_score": H.health_score,
-                         "health_reason": [f"det {int(d)}: " + str(x) for d, x in zip(H.detector, H.reason.fillna(""))],
+                         "health_reason": [f"det {int(d) % hc.BASE}: " + str(x) for d, x in
+                                           zip(H.detector, H.reason.fillna(""))],
                          "health_bad_periods": [[dict(start=str(p["start"]), end=str(p["end"]), what=p["what"],
                                                       recovered=p.get("recovered")) for p in (L or [])]
                                                 if isinstance(L, list) else [] for L in H.bad_periods],
