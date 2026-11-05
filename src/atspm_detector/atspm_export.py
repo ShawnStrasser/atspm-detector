@@ -14,7 +14,7 @@ detector channel) and `Function` (text, matched exactly and case-sensitively). E
     Function 'Advance'    -> arrival_on_green, platoon_ratio
     Function 'Presence'   -> split_failures
     Function 'Yellow_Red' -> yellow_red
-    any other Function    -> carried, never read (we write Count as 'Stopbar Count'; atspm's own sample config
+    any other Function    -> carried, never read (atspm's own sample config
                              spells it 'stop bar count' -- neither is read)
 
 atspm's other measures (actuations, has_data, timeline, detector_health, ...) read the raw events only.
@@ -35,7 +35,7 @@ DEFAULT_FUNCTION_NAMES = {
     "Advance": "Advance",
     "Presence": "Presence",
     "Yellow_Red": "Yellow_Red",
-    "Count": "Stopbar Count",
+    "Count": "Count",
     "Mid": "Mid",
     "Bike": "Bike",
     "Other": "Other",
@@ -49,7 +49,7 @@ ATSPM_CLASSES = ("Advance", "Presence", "Count", "Yellow_Red")      # at most on
 DEFAULT_INCLUDE = ("Advance", "Presence", "Yellow_Red", "Count")
 
 _NEEDED = ["DeviceId", "Detector", "phase_pred", "function_pred"]
-EXTRA_OUT = ["Lanes", "DistanceFromStopBar", "PhaseProb", "FunctionProb", "HealthStatus"]
+EXTRA_OUT = ["Lanes", "PhaseProb", "FunctionProb", "HealthStatus"]
 REPORT_COLS = ["DeviceId", "Detector", "phase_pred", "function_pred", "Function", "exported", "reason"]
 COVERAGE_COLS = ["DeviceId", "Phase", "arrival_on_green", "split_failures", "yellow_red"]
 
@@ -91,15 +91,17 @@ def to_atspm_config(results, *,
                     device_id_dtype=None,
                     extra_columns: bool = False,
                     return_report: bool = False):
-    """predict() output -> atspm `detector_config` (columns DeviceId, Phase, Parameter, Function).
+    """predict() output -> atspm `detector_config` (columns DeviceId, Phase, Parameter, Function, DistanceFromStopBar).
+
+    DistanceFromStopBar is the distance found in feet, empty where none was.  atspm 3 uses it on Advance rows for arrival on
+    green and platoon ratio, and its own default where it is empty.
 
     results            the DataFrame returned by predict(), or a CSV / parquet path to one.
-    include            function classes to export.  Default: the four ATSPM classes.  atspm reads only Advance,
-                       Presence and Yellow_Red; Count rows are exported as 'Stopbar Count' for your own joins (e.g.
-                       stop-bar volume per phase from atspm's `actuations` table).  Add "Mid", "Bike", "Other" for a
-                       full inventory (atspm ignores them).
+    include            function classes to export.  Default: the four ATSPM classes.  atspm's measures read Advance,
+                       Presence, Yellow_Red and Count (left_turn_gaps).  Add "Mid", "Bike", "Other" for a full inventory
+                       (atspm ignores them).
     function_names     override the class -> atspm Function text map (DEFAULT_FUNCTION_NAMES), e.g.
-                       {"Count": "Stop Bar Count"}.
+                       {"Count": "Stopbar Count"}.
     exclude_health     health_status values left out (default "bad": a stuck or dead detector would corrupt
                        occupancy and arrival measures).  () keeps every detector.  Health never changes a phase or
                        function answer, only whether the detector is exported.
@@ -112,8 +114,7 @@ def to_atspm_config(results, *,
     device_id_dtype    cast DeviceId (e.g. "int64") to the type of the events you give atspm.  predict() returns
                        DeviceId as text; atspm's joins work either way, but its output tables then carry text ids.
                        None = keep as returned.
-    extra_columns      also return Lanes, DistanceFromStopBar (ft), PhaseProb, FunctionProb, HealthStatus.  atspm 3.0
-                       uses the distance for arrival on green and platoon ratio, and ignores the rest.
+    extra_columns      also return Lanes, PhaseProb, FunctionProb, HealthStatus.  atspm ignores them.
     return_report      also return one row per input detector: exported or not, and why (column `reason`).
 
     Returns the config (sorted by DeviceId, Phase, Function, Parameter; no duplicate rows), or (config, report).
@@ -189,10 +190,10 @@ def to_atspm_config(results, *,
         "Phase": pd.to_numeric(k["phase_pred"]).astype("int16"),
         "Parameter": pd.to_numeric(k["Detector"]).astype("int16"),
         "Function": function[keep].astype(str),
+        "DistanceFromStopBar": pd.to_numeric(k["distance_ft"], errors="coerce").astype(float),
     })
     if extra_columns:
         cfg["Lanes"] = k["lanes"].astype(object).where(k["lanes"].notna(), None)
-        cfg["DistanceFromStopBar"] = pd.to_numeric(k["distance_ft"], errors="coerce").astype(float)
         cfg["PhaseProb"] = pd.to_numeric(k["phase_prob"], errors="coerce").astype(float)
         cfg["FunctionProb"] = fprob[keep].astype(float)
         cfg["HealthStatus"] = k["health_status"]

@@ -1379,7 +1379,7 @@ def main(argv=None) -> None:
                          "Start, End, Label, Confidence, Detail)")
     ap.add_argument("--out-atspm", default=None,
                     help="optional CSV of the detector configuration for the atspm package (DeviceId, Phase, "
-                         "Parameter, Function: Advance / Presence / Yellow_Red / 'Stopbar Count'; detectors with "
+                         "Parameter, Function: Advance / Presence / Yellow_Red / Count; detectors with "
                          "health 'bad' left out, at most one detector per phase, function and lane)")
     ap.add_argument("--device-ids", default=None, help="comma separated DeviceId filter")
     ap.add_argument("--start", default=None)

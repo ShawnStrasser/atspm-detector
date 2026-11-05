@@ -24,7 +24,7 @@ ROW_TABLES = ("health_signal_5min", "health_detector_5min", "health_phase_5min",
 RELEASED = "released"
 Q = pd.Timedelta(minutes=15)
 DAY = pd.Timedelta(days=1)
-LIMIT_CODES = {"lim_stuck": 9501, "bad_stuck": 9502, "lim_rapid": 9505, "bad_rapid": 9506, "lim_volume": 9507, "bad_volume": 9508, "fast_known": 9511}
+LIMIT_CODES = {"lim_stuck": 9501, "bad_stuck": 9502, "lim_rapid": 9505, "bad_rapid": 9506, "lim_volume": 9507, "bad_volume": 9508}
 BINS_THROUGH, LAST_CHECK, FIRST_DAY, TRIMMED, RUN_ID, VERSION, PEND = 9602, 9603, 9604, 9601, 9605, 9606, 9700
 PON_WALKS, PON_GREENS, INPUT_PHASE, INPUT_FLAGS = 9233, 9234, 9520, 9521
 TS9, I4, I8, I2, F8, TXT = "TIMESTAMP_NS", "INTEGER", "BIGINT", "SMALLINT", "DOUBLE", "VARCHAR"
@@ -91,7 +91,7 @@ def _load_state(con, state, device_type):
     con.execute(f"INSERT INTO {s}health_carry SELECT TimeStamp, DeviceId, EventId::SMALLINT, Parameter, true FROM hl_s WHERE EventId BETWEEN 9200 AND 9232 OR EventId BETWEEN 9300 AND 9403")
     con.execute(f"INSERT INTO {s}health_detector_phase SELECT DeviceId, Parameter::SMALLINT, Value::INTEGER, TimeStamp FROM hl_s WHERE EventId = 9404")
     wide = ", ".join(f"max(Value) FILTER (EventId = {c}) AS {k}" for k, c in LIMIT_CODES.items())
-    con.execute(f"CREATE OR REPLACE TEMP TABLE hl_limits AS SELECT DeviceId, Parameter AS det, {wide} FROM hl_s WHERE EventId BETWEEN 9501 AND 9511 GROUP BY DeviceId, Parameter")
+    con.execute(f"CREATE OR REPLACE TEMP TABLE hl_limits AS SELECT DeviceId, Parameter AS det, {wide} FROM hl_s WHERE EventId BETWEEN 9501 AND 9508 GROUP BY DeviceId, Parameter")
     con.execute(f"""CREATE OR REPLACE TEMP TABLE hl_pon AS SELECT DeviceId, Parameter AS ch, TimeStamp AS t_on, max(Value) FILTER (EventId = {PON_WALKS}) AS walks, max(Value) FILTER (EventId = {PON_GREENS}) AS greens
                     FROM hl_s WHERE EventId IN ({PON_WALKS}, {PON_GREENS}) GROUP BY ALL""")
     con.execute(f"""CREATE OR REPLACE TEMP TABLE hl_inputs AS SELECT DeviceId, Parameter AS ch, max(Value) FILTER (EventId = {INPUT_PHASE}) AS ph, max(Value) FILTER (EventId = {INPUT_FLAGS}) AS flags
@@ -128,17 +128,6 @@ def _live_step(con, T, detectors):
             JOIN (SELECT DISTINCT DeviceId FROM {s}health_signal_5min WHERE TimeStamp >= {A} AND TimeStamp < {Z} AND Events > 0) USING (DeviceId)
             JOIN hl_limits l ON l.DeviceId = h.DeviceId AND l.det = h.det
             WHERE {x} >= l.lim_stuck AND least(h.f, {Z}) > greatest(h.s, {A}) GROUP BY ALL""")
-        # too fast: a detector the last check rated too fast, at its limit in this bin
-        vf = _sc("xr", "1.0", "bx")
-        cf = _conf(vf, "0.35", "0.75")
-        parts.append(f"""SELECT DeviceId, 'Vehicle', det::BIGINT, 'too-fast actuations', least(1.0, {cf} / 0.87) FROM (
-              SELECT t.DeviceId, t.det, t.cf, 1000.0 * t.cf / greatest(o.ca, 1) / l.lim_rapid AS xr, l.bad_rapid / l.lim_rapid AS bx
-              FROM (SELECT k.DeviceId, k.Detector::INT AS det, sum(k.Count) AS cf FROM {s}health_tick_counts k
-                    JOIN (SELECT DeviceId, Detector, (CASE WHEN function IN ('Count', 'Presence', 'Yellow_Red') THEN 0.8 ELSE 0.6 END) / greatest(coalesce(lanes, 1), 1) AS gap_lim FROM {detectors}) f ON f.DeviceId = k.DeviceId AND f.Detector = k.Detector
-                    WHERE k.Kind = 'gap_pair' AND k.TimeStamp = {A} AND k.A < f.gap_lim * 10 GROUP BY ALL) t
-              JOIN (SELECT DeviceId, Detector::INT AS det, sum(coalesce(Starts, 0) + coalesce(Relogged_Ons, 0)) AS ca FROM {s}health_detector_5min WHERE TimeStamp >= {A} AND TimeStamp < {Z} GROUP BY ALL) o USING (DeviceId, det)
-              JOIN hl_limits l USING (DeviceId, det) WHERE t.cf >= 3 AND l.fast_known = 1)
-            WHERE {vf} >= 0.35""")
         # too many: the bin's busiest 5 minutes against the limit
         parts.append(f"""SELECT DeviceId, 'Vehicle', det::BIGINT, 'too many for the traffic', count(*) / 3.0 FROM (
               SELECT r.DeviceId, r.det, r.b, l.lim_volume, CASE WHEN f.function = 'Advance' THEN r.nst * 12.0 / f.ln1 WHEN p.sgy >= 60 THEN r.ngy / p.sgy * 3600.0 / f.ln1 END AS q5
@@ -238,14 +227,9 @@ def _whole_day(con, M, detectors, history, params, temp_dir):
         for t, d, code, par in add:
             con.execute(f"INSERT INTO {STORE}.health_carry VALUES (?, ?, ?, ?, true)", [t, d, code, par])
         if r.limits is not None and len(r.limits):
-            flag = s[s.Status.isin(["suspect", "bad"])][["DeviceId", "DetectorType", "Detector"]].drop_duplicates()
-            fast = f[(f.Label == "too-fast actuations") & (f.DetectorType == "Vehicle") & (f.Confidence >= 0.5)].merge(flag, on=["DeviceId", "DetectorType", "Detector"])[["DeviceId", "Detector"]].drop_duplicates()
-            fast["Detector"] = fast.Detector.astype("int64")
             con.register("hl_lim_in", r.limits)
-            con.register("hl_fast_in", fast)
-            con.execute("""CREATE OR REPLACE TEMP TABLE hl_limits AS SELECT l.DeviceId, l.det::INT AS det, l.lim_stuck, l.bad_stuck, l.lim_rapid, l.bad_rapid, l.lim_volume, l.bad_volume, (k.Detector IS NOT NULL)::INT::DOUBLE AS fast_known
-                           FROM hl_lim_in l LEFT JOIN hl_fast_in k ON k.DeviceId = l.DeviceId AND k.Detector = l.det""")
-            con.unregister("hl_lim_in"); con.unregister("hl_fast_in")
+            con.execute("CREATE OR REPLACE TEMP TABLE hl_limits AS SELECT DeviceId, det::INT AS det, lim_stuck, bad_stuck, lim_rapid, bad_rapid, lim_volume, bad_volume FROM hl_lim_in")
+            con.unregister("hl_lim_in")
         if r.ped is not None and len(r.ped):
             p = r.ped[["DeviceId", "Input", "Phase", "Type", "config"]].copy()
             con.register("hl_ped_in", p)

@@ -20,7 +20,7 @@ import atspm_detector as dc
 from atspm_detector.atspm_export import ATSPM_COLUMNS, COVERAGE_COLS, EXTRA_OUT, REPORT_COLS
 from atspm_detector.check import SAMPLE, read_parquet
 
-ATSPM_FUNCTIONS = {"Advance", "Presence", "Yellow_Red", "Stopbar Count"}
+ATSPM_FUNCTIONS = {"Advance", "Presence", "Yellow_Red", "Count"}
 
 
 @pytest.fixture(scope="module")
@@ -129,8 +129,8 @@ def test_options(sample_pred):
     hp = dc.to_atspm_config(sample_pred, min_phase_prob=0.999)
     assert (sample_pred.set_index("Detector").phase_prob.reindex(hp.Parameter.astype(int)) >= 0.999).all()
     allc = dc.to_atspm_config(sample_pred, include=("Advance", "Presence", "Yellow_Red", "Count", "Mid", "Bike",
-                                                    "Other"), function_names={"Count": "Count"})
-    assert {"Mid", "Bike"} <= set(allc.Function) and "Stopbar Count" not in set(allc.Function)
+                                                    "Other"), function_names={"Count": "Stopbar Count"})
+    assert {"Mid", "Bike"} <= set(allc.Function) and "Count" not in set(allc.Function)
     with pytest.raises(ValueError):
         dc.to_atspm_config(sample_pred, include=("Advance", "Ped"))
     off = dc.to_atspm_config(sample_pred, one_per_lane=False)
@@ -219,12 +219,39 @@ def test_end_to_end_bundled(sample_pred, atspm):
 
 def test_end_to_end_options(sample_pred, atspm):
     ev = atspm_events(SAMPLE)
-    t = run_atspm(ev, dc.to_atspm_config(sample_pred, extra_columns=True))       # atspm 3.0 reads DistanceFromStopBar, ignores the rest
+    t = run_atspm(ev, dc.to_atspm_config(sample_pred, extra_columns=True))       # atspm ignores the extras
     assert len(t["arrival_on_green"]) > 0
     t = run_atspm(ev, dc.to_atspm_config(sample_pred, device_id_dtype="string"))
     assert len(t["arrival_on_green"]) > 0
     t = run_atspm(ev, dc.to_atspm_config(sample_pred.iloc[0:0]))                 # empty config: measures empty
     assert len(t["arrival_on_green"]) == 0 and len(t["actuations"]) > 0
+
+
+def test_atspm_reads_distance_and_count_zones(atspm):
+    """arrival_on_green moves an arrival by the distance; left_turn_gaps reads a zone named Count."""
+    t0 = pd.Timestamp("2026-09-01 08:00:00")
+    pred = pd.DataFrame({"DeviceId": ["A", "A", "A"], "Detector": [1, 2, 3], "phase_pred": [2, 2, 4], "function_pred": ["Advance", "Count", "Advance"],
+                         "phase_prob": 0.9, "function_prob": 0.9, "distance_ft": [513.45, 0.0, np.nan]})
+    cfg = dc.to_atspm_config(pred)
+    assert list(cfg.columns) == ["DeviceId", "Phase", "Parameter", "Function", "DistanceFromStopBar"]
+    assert cfg.set_index("Parameter").Function.to_dict() == {1: "Advance", 2: "Count", 3: "Advance"}
+    assert cfg.set_index("Parameter").DistanceFromStopBar.iloc[0] == 513.45 and np.isnan(cfg.set_index("Parameter").DistanceFromStopBar[3])
+    rows = []
+    for m in range(0, 60):
+        t = t0 + pd.Timedelta(minutes=m)
+        # Phase 2 green from 30 to 50 s. The on at 25 s reaches the stop bar 10 s later, at 35 s, on green, with 513.45 ft at 35 MPH
+        rows += [(t, 10, 2), (t + pd.Timedelta(seconds=25), 82, 1), (t + pd.Timedelta(seconds=26), 81, 1), (t + pd.Timedelta(seconds=30), 1, 2),
+                 (t + pd.Timedelta(seconds=32), 82, 2), (t + pd.Timedelta(seconds=33), 81, 2), (t + pd.Timedelta(seconds=50), 8, 2), (t + pd.Timedelta(seconds=54), 10, 2),
+                 (t + pd.Timedelta(seconds=55), 1, 1), (t + pd.Timedelta(seconds=56), 8, 1), (t + pd.Timedelta(seconds=57), 10, 1), (t + pd.Timedelta(seconds=58), 82, 2), (t + pd.Timedelta(seconds=58.5), 81, 2)]
+    ev = pd.DataFrame(rows, columns=["TimeStamp", "EventId", "Parameter"]).assign(DeviceId="A")[["TimeStamp", "DeviceId", "EventId", "Parameter"]]
+    with atspm.SignalDataProcessor(raw_data=ev, detector_config=cfg, bin_size=15, verbose=0,
+                                   aggregations=[{"name": "has_data", "params": {}}, {"name": "arrival_on_green", "params": {}}, {"name": "left_turn_gaps", "params": {}}]) as p:
+        p.load()
+        p.aggregate()
+        aog = p.conn.execute("SELECT Phase, SUM(Percent_AOG * Total_Actuations) / SUM(Total_Actuations) FROM arrival_on_green GROUP BY 1").fetchall()
+        gaps = p.conn.execute("SELECT COUNT(*) FROM left_turn_gaps").fetchone()[0]
+    assert dict(aog)[2] == pytest.approx(1.0)  # with the default 220 ft it reaches the bar at 29.3 s, on red: 0
+    assert gaps > 0
 
 
 SAMPLES = [("src/atspm/data/sample_raw_data.parquet", "src/atspm/data/sample_config.parquet"),

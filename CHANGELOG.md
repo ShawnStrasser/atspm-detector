@@ -16,6 +16,8 @@ Phase, function, lanes, setback and night speed are unchanged.
   their content is in the findings table. New: `return_findings=True`, `--out-findings`, `health_chart(findings=)`.
 - Needs DuckDB 2.0 or newer. Python 3.11 to 3.14 (3.10 dropped: DuckDB 2.0 has no wheel for it; 3.15 waits for an onnxruntime wheel); numpy 2, pandas 2.2 or 3, onnxruntime 1.31, matplotlib 3.11 for the charts. New dependency `jinja2`. With atspm: 3.0 or newer, as older ones cannot load on DuckDB 2.
 
+**`to_atspm_config`**: every row now has `DistanceFromStopBar` where one was found (empty where not), and count zones are named `Count`, which `left_turn_gaps` reads. `Stopbar Count` was not read there.
+
 **Incremental health** (`atspm_detector.incremental`)
 
 - `attach_store`, `update` (a chunk of events into small stored rows, any cutting of the events, one transaction, late rows counted), `judge`, `rebuild` (a signal again from raw events), `trim`,

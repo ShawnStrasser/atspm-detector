@@ -286,13 +286,13 @@ def test_a_run_stops_at_midnight_until_it_fires_then_loses_nothing(tmp_path):
 
 # ---- the per-run rules, on hand-made states
 
-def marks(through=BASE, last_check=None, first_day=None, ids=("S1",), det=9, stuck=(300.0, 600.0), rapid=(1.0, 2.0), volume=(100000.0, 200000.0), fast=0.0, ped=None):
+def marks(through=BASE, last_check=None, first_day=None, ids=("S1",), det=9, stuck=(300.0, 600.0), rapid=(1.0, 2.0), volume=(100000.0, 200000.0), ped=None):
     """A state as a check leaves it: bins written through `through`, and the limits given."""
     last_check = through.normalize() if last_check is None else last_check
     first_day = through - 2 * DAY if first_day is None else first_day
     rows = [(through, None, L.BINS_THROUGH, 0, None), (last_check, None, L.LAST_CHECK, 0, None), (first_day, None, L.FIRST_DAY, 0, None)]
     for d in ids:
-        for code, v in ((9501, stuck[0]), (9502, stuck[1]), (9505, rapid[0]), (9506, rapid[1]), (9507, volume[0]), (9508, volume[1]), (9511, fast)):
+        for code, v in ((9501, stuck[0]), (9502, stuck[1]), (9505, rapid[0]), (9506, rapid[1]), (9507, volume[0]), (9508, volume[1])):
             rows.append((None, d, code, det, v))
         if ped:
             rows += [(None, d, L.INPUT_PHASE, ped[0], 2.0), (None, d, L.INPUT_FLAGS, ped[0], float(ped[1]))]
@@ -361,11 +361,10 @@ def fast_pulses(a, b, gap=0.5):
     return rows
 
 
-@pytest.mark.parametrize("known, n", [(1.0, 1), (0.0, 0)])
-def test_too_fast_only_for_a_detector_the_check_rated_too_fast(tmp_path, known, n):
+def test_too_fast_has_no_per_run_rule(tmp_path):
     ev = with_events(beat("S1", BASE, BASE + Q), "S1", *fast_pulses(BASE + pd.Timedelta(minutes=1), BASE + pd.Timedelta(minutes=2)))
-    runs = bins_in_turn(ev, marks(fast=known), tmp_path, 1)
-    assert len(of(runs[0], "Vehicle", 9, "too-fast actuations")) == n
+    runs = bins_in_turn(ev, marks(), tmp_path, 1)
+    assert len(of(runs[0], "Vehicle", 9, "too-fast actuations")) == 0
 
 
 def test_too_many_is_the_bins_busiest_5_minutes_against_the_limit(tmp_path):

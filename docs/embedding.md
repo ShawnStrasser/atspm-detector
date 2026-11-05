@@ -109,7 +109,7 @@ from atspm_detector import predict, to_atspm_config, atspm_coverage
 from atspm import SignalDataProcessor
 
 det = predict(events)
-config = to_atspm_config(det)                 # DeviceId, Phase, Parameter, Function
+config = to_atspm_config(det)                 # DeviceId, Phase, Parameter, Function, DistanceFromStopBar
 atspm_coverage(config)                        # per phase: arrival_on_green / split_failures / yellow_red enabled?
 with SignalDataProcessor(raw_data=events, detector_config=config, bin_size=15, aggregations=[
         {"name": "arrival_on_green", "params": {"latency_offset_seconds": 0}},
@@ -125,7 +125,7 @@ Command line: `atspm-detector --events events.parquet --out detectors.csv --out-
 
 - atspm is not a dependency. Install it yourself: `pip install "atspm>=3.0"` (older ones cannot load on DuckDB 2). `to_atspm_config` itself needs only numpy and pandas.
 - Columns: `DeviceId`, `Phase` (int16), `Parameter` (detector channel, int16), `Function`. atspm selects these four by name; of any others it reads only `DistanceFromStopBar`, `MPH` and `LatencyCorrection`, for arrival on green and platoon ratio. `Function` is matched exactly and case-sensitively.
-- Mapping: Advance -> `Advance` (arrival_on_green, platoon_ratio), Presence -> `Presence` (split_failures), Yellow_Red -> `Yellow_Red` (yellow_red), Count -> `Stopbar Count` (read only by atspm's detector_health, as a Count zone). Mid, Bike and Other are left out; add them with `include=(...)`. Rename with `function_names={"Count": "Stop Bar Count"}`.
+- Mapping: Advance -> `Advance` (arrival_on_green, platoon_ratio), Presence -> `Presence` (split_failures), Yellow_Red -> `Yellow_Red` (yellow_red), Count -> `Count` (read only by atspm's detector_health, as a Count zone). Mid, Bike and Other are left out; add them with `include=(...)`. Rename with `function_names={"Count": "Stop Bar Count"}`.
 - Left out by default, each with a reason in `return_report=True`: detectors without an answer, `health_status` "bad" (`exclude_health=()` keeps them), and same-phase, same-function detectors on a lane that already has one (`one_per_lane=False` keeps them). Lane-by-lane detectors win over one spanning their lanes, then the higher `function_prob`. This keeps a spanning zone stacked over lane loops from counting the same vehicles twice in arrival on green. Exact duplicate rows are never written (atspm would double-count them).
 - `min_phase_prob` / `min_function_prob` leave out low-confidence answers. `device_id_dtype="int64"` casts `DeviceId` to match integer ids in your events (`predict` returns text ids; atspm's joins work either way). `extra_columns=True` adds `Lanes`, `DistanceFromStopBar` (ft), `PhaseProb`, `FunctionProb` and `HealthStatus`; atspm 3.0 uses that distance in place of its defaults, the rest are for your own use.
 - `results` may also be the CSV written by `--out` or a parquet copy of it.
