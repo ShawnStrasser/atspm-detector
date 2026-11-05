@@ -21,10 +21,12 @@ pip install atspm-detector   # Python 3.11 or newer
 Input: `DeviceId`, `Timestamp` (local time), `EventId`, `Parameter`. Process signals one at a time or all at once.
 
 ```python
+from importlib.resources import files
 import pandas as pd
 from atspm_detector import predict
 
-events = pd.read_parquet("events.parquet")
+# 30 minutes of one signal's events, bundled with the package; use your own log in the same columns
+events = pd.read_parquet(files("atspm_detector") / "data" / "sample_events.parquet")
 results = predict(events)
 results[["Detector", "phase_pred", "phase_prob", "function_pred", "function_prob",
          "lanes", "distance_ft", "health_status"]].round(2).head()
