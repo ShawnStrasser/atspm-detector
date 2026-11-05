@@ -194,7 +194,7 @@ def _cuts(kind):
     return sorted(set(t)) + [T] if kind == "on" else sorted(set(t + pd.Timedelta(microseconds=1))) + [T]
 
 
-@pytest.mark.parametrize("kind", few_then_slow(["15min", "60min", "seed1", "on", "after", "5min", "seed2", "seed3"], 5))
+@pytest.mark.parametrize("kind", few_then_slow(["15min", "on", "after", "60min", "seed1", "5min", "seed2", "seed3"], 3))
 def test_chunk_invariance(kind):
     E = edge()
     con, T = E["con"], E["T"]

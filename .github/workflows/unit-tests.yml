@@ -64,7 +64,7 @@ jobs:
       run: atspm-detector-check
 
     - name: Run tests
-      run: pytest --junitxml=pytest-results.xml
+      run: pytest -n auto --junitxml=pytest-results.xml
 
     # End to end with the atspm package (not a dependency: installed here only).
     - name: atspm end to end

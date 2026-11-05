@@ -17,7 +17,7 @@ import pandas as pd
 import pytest
 
 import atspm_detector as dc
-from atspm_detector.atspm_export import ATSPM_COLUMNS, COVERAGE_COLS, EXTRA_OUT, REPORT_COLS
+from atspm_detector.atspm_export import ATSPM_COLUMNS, CONFIG_COLUMNS, COVERAGE_COLS, EXTRA_OUT, REPORT_COLS
 from atspm_detector.check import SAMPLE, read_parquet
 
 ATSPM_FUNCTIONS = {"Advance", "Presence", "Yellow_Red", "Count"}
@@ -64,7 +64,7 @@ def atspm_events(path) -> pd.DataFrame:
 
 def aog_by_hand(ev: pd.DataFrame, config: pd.DataFrame) -> pd.DataFrame:
     """Share of Advance ON events arriving while their phase shows green (last of events 1 / 8 / 10 before it = 1).
-    atspm 3.0 and newer moves each ON to the stop bar first (the config here has no distance or speed: its defaults, 220 ft
+    atspm 3.0 and newer moves each ON to the stop bar first (by the config's distance, else its defaults, 220 ft
     on phases 2 and 6, else 120 ft, at 35 MPH), and leaves out arrivals past the end of its results."""
     ev = ev.assign(DeviceId=ev.DeviceId.astype(str), EventId=ev.EventId.astype("int64"),
                    Parameter=ev.Parameter.astype("int64"))
@@ -73,7 +73,11 @@ def aog_by_hand(ev: pd.DataFrame, config: pd.DataFrame) -> pd.DataFrame:
     on = ev[ev.EventId.eq(82)].merge(adv, on=["DeviceId", "Parameter"])
     import atspm as _a
     if (Path(_a.__file__).parent / "queries" / "arrival_projection.sql").exists():      # atspm 3.0 and newer
-        ms = (on.Phase.astype(int).isin([2, 6]).map({True: 220.0, False: 120.0}) / (35 * 1.467) * 1000).round()
+        dist = on.Phase.astype(int).isin([2, 6]).map({True: 220.0, False: 120.0})
+        if "DistanceFromStopBar" in on:                                  # the distance found, where there is one
+            d = pd.to_numeric(on.DistanceFromStopBar, errors="coerce")
+            dist = d.where(np.isfinite(d) & (d >= 0), dist)
+        ms = (dist / (35 * 1.467) * 1000).round()
         on = on.assign(TimeStamp=pd.to_datetime(on.TimeStamp) + pd.to_timedelta(ms, unit="ms"))
         last = pd.to_datetime(ev.TimeStamp).max()
         bin_end = last.floor("15min") + pd.Timedelta(minutes=15)
@@ -95,7 +99,7 @@ def aog_by_hand(ev: pd.DataFrame, config: pd.DataFrame) -> pd.DataFrame:
 # ------------------------------------------------------------------ 1. contract (no atspm needed)
 def test_export_contract(sample_pred):
     cfg, rep = dc.to_atspm_config(sample_pred, return_report=True)
-    assert list(cfg.columns) == ATSPM_COLUMNS
+    assert list(cfg.columns) == CONFIG_COLUMNS
     assert str(cfg.Phase.dtype) == "int16" and str(cfg.Parameter.dtype) == "int16"
     assert cfg.notna().all().all() and len(cfg) > 0
     assert not cfg.duplicated(["DeviceId", "Parameter"]).any()             # one phase per detector
@@ -136,7 +140,7 @@ def test_options(sample_pred):
     off = dc.to_atspm_config(sample_pred, one_per_lane=False)
     assert len(off) >= len(base) and set(base.Parameter) <= set(off.Parameter)
     ext = dc.to_atspm_config(sample_pred, extra_columns=True)
-    assert list(ext.columns) == ATSPM_COLUMNS + EXTRA_OUT and ext[ATSPM_COLUMNS].equals(base)
+    assert list(ext.columns) == CONFIG_COLUMNS + EXTRA_OUT and ext[CONFIG_COLUMNS].equals(base)
     assert dc.to_atspm_config(sample_pred, device_id_dtype="string").DeviceId.dtype == "string"
 
 
@@ -161,7 +165,7 @@ def test_cli_out_atspm(tmp_path):
     main(["--events", str(SAMPLE), "--out", str(tmp_path / "det.csv"), "--out-atspm", str(tmp_path / "cfg.csv"),
           "--quiet"])
     cfg = pd.read_csv(tmp_path / "cfg.csv", dtype={"DeviceId": str})
-    assert list(cfg.columns) == ATSPM_COLUMNS
+    assert list(cfg.columns) == CONFIG_COLUMNS
     ref = dc.to_atspm_config(dc.predict(SAMPLE))
     assert cfg.astype({"Phase": "int16", "Parameter": "int16"}).equals(ref)
 
@@ -182,7 +186,7 @@ def test_one_per_lane_synthetic():
 
 def test_empty_and_errors(sample_pred):
     e = dc.to_atspm_config(sample_pred.iloc[0:0])
-    assert list(e.columns) == ATSPM_COLUMNS and len(e) == 0
+    assert list(e.columns) == CONFIG_COLUMNS and len(e) == 0
     assert list(dc.atspm_coverage(e).columns) == COVERAGE_COLS
     with pytest.raises(ValueError):
         dc.to_atspm_config(sample_pred.drop(columns=["phase_pred"]))

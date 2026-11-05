@@ -39,6 +39,7 @@ dependencies = [
 charts = ["matplotlib>=3.11"]
 dev = [
     "pytest>=9.2",
+    "pytest-xdist>=3.8",
     "build>=1.6",
     "pyarrow>=26.0",
 ]

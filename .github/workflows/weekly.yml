@@ -56,4 +56,4 @@ jobs:
         pip install ".[dev]"
         pip install --upgrade ${{ matrix.install }}
     - name: Run tests
-      run: pytest
+      run: pytest -n auto

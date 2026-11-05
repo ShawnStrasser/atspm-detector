@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 
 ATSPM_COLUMNS = ["DeviceId", "Phase", "Parameter", "Function"]
+CONFIG_COLUMNS = ATSPM_COLUMNS + ["DistanceFromStopBar"]
 
 # our function class -> atspm Function text.  atspm measures read only Advance, Presence and Yellow_Red.
 DEFAULT_FUNCTION_NAMES = {
