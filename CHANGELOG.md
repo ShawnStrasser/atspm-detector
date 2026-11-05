@@ -1,8 +1,79 @@
 # Changelog
 
+## 2.0.0 - one findings table, ped health, health kept up to date from chunks, time bins
+
+Phase, function, lanes, setback and night speed are unchanged.
+
+**Breaking**
+
+- `health()` returns one findings table for vehicle detectors and ped buttons together, one row per finding; no row means no finding:
+  `DeviceId`, `DetectorType` (`Vehicle` or `Ped`), `Detector`, `Start`, `End`, `Label`, `Confidence` (0.5 at a check's suspect limit, 0.8 at its bad limit), `Detail`. A finding with no time of its own gets
+  one row per calendar day of the window. Config notes, signal notes, borderline (watch) findings and `not_enough_data` are rows too.
+- `health(..., summary=True)` returns `(findings, status)`: `DeviceId`, `DetectorType`, `Detector`, `Date`, `Status`, exactly one row per detector or button and calendar day, enforced.
+- Ped runs when the log holds ped input events; `vehicle=False` or `ped=False` runs one side. `ped_health()` is a thin helper for `vehicle=False`.
+- `health_sql()` gives the vehicle findings as one query (`summary=True`: two queries). Ped has no one-query form.
+- `predict()`: the only health column left is `health_status`; `health_score`, `health_reason`, `health_watch`, `health_categories`, `health_config`, `health_signal_note` and `health_bad_periods` are gone,
+  their content is in the findings table. New: `return_findings=True`, `--out-findings`, `health_chart(findings=)`.
+- Needs DuckDB 2.0 or newer. Python 3.11 to 3.14 (3.10 dropped: DuckDB 2.0 has no wheel for it; 3.15 waits for an onnxruntime wheel); numpy 2, pandas 2.2 or 3, onnxruntime 1.31, matplotlib 3.11 for the charts. New dependency `jinja2`. With atspm: 3.0 or newer, as older ones cannot load on DuckDB 2.
+
+**Incremental health** (`atspm_detector.incremental`)
+
+- `attach_store`, `update` (a chunk of events into small stored rows, any cutting of the events, one transaction, late rows counted), `judge`, `rebuild` (a signal again from raw events), `trim`,
+  `export_store` / `import_store` (across DuckDB versions), `judge_rows` (the per-detector rows underneath).
+- `judge()` returns `HealthResult(findings, status, q15, active, bins)`. Judged at T with horizon H on events from T - H on, it equals `health(start=T - H, end=T, bin_origin="clock", summary=True)`, for any cutting of the events.
+- `outputs=("tables", "15min")` adds `q15`; `"active"` adds `active`, not yet reviewed. A store written by an incompatible version of the package is refused.
+- New `bin_origin` of `health()` / `health_sql()`: `"window"` (default) or `"clock"` (the window starts on the quarter-hour at or before its start).
+
+**Health in time bins**
+
+- `judge(outputs=("tables", "bins"), bin_minutes=15)` and `health_bins()`: one row per bin per problem, `TimeStamp`, `DeviceId`, `DetectorType`, `Detector`, `Label`, `Score`; no row = no problem found.
+  `Score` is `Confidence` scaled per rule: a complete failure scores about 1. A bin partly covered is averaged; problems at one moment share its worst value. Borderline findings and notes have
+  no rows; not enough data has one row a day with an empty `Score`.
+- Past rows never change. A later judge releases any problem it is the first to find in a bin of its window as a new row with its past `TimeStamp`, unless that bin, detector and label has a row.
+  New rows of a bin share what its existing rows leave, so a bin adds up to at most 1; a bin already full gets the row with `Score` 0. Not enough data is not a late find.
+- A button or detector rated stuck ON past the window keeps its bins until its next event, through an OFF with an ON at most 60 s after it for a button. `health()` on a window is unchanged.
+- Dashboard ranges of the plain average of `Score` (its sum over the period / the bins of the period): vehicle 3 days Good under 0.2 %, Bad from 2 %; 7 days Good under 0.1 %, Bad from 1 %; ped 3 days Good under 0.05 %, Bad from 0.5 %;
+  7 days Good under 0.02 %, Bad from 0.2 %; Suspect between. An average dilutes a short failure.
+
+**Vehicle health**
+
+- Windows from 30 minutes to 92 days, so a report can give it 2-3 days instead of a history baseline. Silences name the day, merge a quiet run broken by one near-empty bin and need an hour of data outside them; a silence under 15 min is
+  suspect at most; its expected count is capped by the detector's own count at those clock times on the other days. Count drops get an end (back to 60 % of the pre-drop share). A detector without phase mates can be rated on a count drop;
+  a long zone whose counts fall while its occupancy holds is not a count drop.
+- New findings: all inputs of a signal silent for an hour or more of daytime while it serves greens, also across a stretch with no log; a whole phase dropping together; detectors of a phase logging identical counts; **No daily pattern**; **Counts too high**.
+  Hour-by-hour drops and rises against each phase mate, by the detector's share of it at that time of day on the window's days. Busy at night is bad only at 1.5 x its limit.
+- **Lane closures and timing plans** (statuses `lane_closure`, `timing_plan`): a lane near zero for an hour or more while a detector of the same kind on its phase or NEMA-paired phase takes its vehicles is a closure, not a failure,
+  unless the detector has faults of its own before and after it that day; a silence that starts and ends with a coordination pattern change follows the timing plan.
+- **Pulse mode**: a presence detector whose calls nearly all last 0.2 s or less is suspect, never bad from this alone. An optional `configured_function` column: a zone configured as Count, Advance or Yellow_Red is never flagged.
+- Time ON is no longer imputed: an ON then an ON is still ON unless the whole signal stopped logging between them, a second OFF is ignored, a leading OFF dropped. Detectors that do not look like traffic are nobody's yardstick for
+  the night and count checks. No "counts too high" on a day when the detector nearly stopped counting on the window's other days.
+- Plain words for a rise against almost-silent phase mates: from 100 x the Detail says the counts rose far above its phase mates. Health text no longer depends on how DuckDB splits the work.
+- Every rule is an option of `health(..., options={...})` (`health_duckdb.OPTIONS`; `OPTIONS_OFF` = 1.2.0's health without its imputed time ON).
+- The health SQL moved into Jinja templates. `health()` first turns each signal's events into small 5-minute rows and judges those; a value exactly on a limit now counts as exactly on it, where rounding noise used to put it on either side.
+
+**Ped health** (new)
+
+- `ped_health(con, "events")`, and the ped side of `health()`: DuckDB SQL on the ped events. Checks: stuck on, long hold, machine-regular presses, never calls a walk, walks without presses, sustained pressing, sudden stop. Statuses ok, config_issue, suspect, bad, not_enough_data.
+  Rules in the README; `options=` (`ped_options=` in `health()`) switches them (`ped_health_duckdb.OPT`).
+- **Walks without presses**: walks jump while presses stop for an hour of log or more; finds a stuck ON whose ON was lost. Suspect, bad from 2.5 logged hours of walks at nearly every green. It counts unique presses, made inside the judge from the
+  window's own presses; all other checks stay on raw presses.
+- **Sustained pressing**: suspect; a day with 1,000 or more presses, at least 5 times the median of the window's other logged days (itself at least 20), and 5 or more 15-minute periods with 30 or more presses and at least 10 per walk.
+- **Sudden stop**: the button's longest silence against its own level at those times of day, allowing for clumps; suspect at a chance of 1 in 1,000 or at 24 logged hours from 30 presses a day, bad at 1 in 1,000 with bursts capped. A quiet button cannot flag.
+- Stuck-on periods of a button at most 60 s apart are one period (`hold_join`); a brief press between them stays in every count. A very long ON of a presence input with a log hole inside it is stuck on when its longest stretch between holes reaches 600 s.
+- A call that waited is a note, never a fault; a wait with any preemption reads "omitted during preemption". Lost data never makes a finding. A button on ped recall is never a `config_issue`; recall is read from the log alone.
+- `ped_assignments(con, "events")`: the phases and ped overlaps each ped input calls (a 23-feature LightGBM model in onnxruntime, `weights/ped_assign`). The model knows no input, phase or overlap number; a test renumbers the raw log and every answer must
+  follow. `in_recall`: no answer, no guess. Right for 99.7 % of 5,055 inputs, signal-grouped cross-validation (88 recall inputs not scored).
+- `ped_detectors(con, "events")`: the same answers in `predict()`'s columns and types, to stack under the vehicle detectors. `ped_health(..., assign=True)` turns an input with 10 presses or more that calls nothing into a `config_issue`.
+
+**Speed and other**
+
+- `health(..., workers=N)` runs the signal groups in N worker processes, same tables as `workers=1`: a network of 889 signals over 3 days, 7.3 min in one process, 1.8 min with `workers=12` (about 9 GB of memory at peak).
+- `health()` reads the events once per group of signals: store them sorted by `DeviceId`, then `Timestamp`.
+- The bundled 30-minute demo log is re-stamped to 2026-10-06, the same weekday and clock times.
+
 ## 1.2.0 - batched prediction, detector health in DuckDB SQL
 
-- Detector health is now DuckDB SQL (note 153; `health_duckdb.py`), run for all signals of a batch in one pass straight
+- Detector health is now DuckDB SQL (`health_duckdb.py`), run for all signals of a batch in one pass straight
   from the loaded events; the numpy health modules (`health_core`, `health_v4`, `health_v4_stats`, `health_counts`)
   are removed. Same checks, limits and order of decisions: on the bundled sample, 100 24-hour signals (batched and alone)
   and 4-5 day logs every status, category, reason, bad period and note equals 1.1.0's; scores within 1e-6. Health time

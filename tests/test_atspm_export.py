@@ -63,12 +63,22 @@ def atspm_events(path) -> pd.DataFrame:
 
 
 def aog_by_hand(ev: pd.DataFrame, config: pd.DataFrame) -> pd.DataFrame:
-    """Share of Advance ON events arriving while their phase shows green (last of events 1 / 8 / 10 before it = 1)."""
+    """Share of Advance ON events arriving while their phase shows green (last of events 1 / 8 / 10 before it = 1).
+    atspm 3.0 and newer moves each ON to the stop bar first (the config here has no distance or speed: its defaults, 220 ft
+    on phases 2 and 6, else 120 ft, at 35 MPH), and leaves out arrivals past the end of its results."""
     ev = ev.assign(DeviceId=ev.DeviceId.astype(str), EventId=ev.EventId.astype("int64"),
                    Parameter=ev.Parameter.astype("int64"))
     adv = config[config.Function.eq("Advance")].assign(DeviceId=lambda x: x.DeviceId.astype(str),
                                                        Parameter=lambda x: x.Parameter.astype("int64"))
     on = ev[ev.EventId.eq(82)].merge(adv, on=["DeviceId", "Parameter"])
+    import atspm as _a
+    if (Path(_a.__file__).parent / "queries" / "arrival_projection.sql").exists():      # atspm 3.0 and newer
+        ms = (on.Phase.astype(int).isin([2, 6]).map({True: 220.0, False: 120.0}) / (35 * 1.467) * 1000).round()
+        on = on.assign(TimeStamp=pd.to_datetime(on.TimeStamp) + pd.to_timedelta(ms, unit="ms"))
+        last = pd.to_datetime(ev.TimeStamp).max()
+        bin_end = last.floor("15min") + pd.Timedelta(minutes=15)
+        end = bin_end if bin_end - last <= pd.Timedelta(seconds=1) else last + pd.Timedelta(milliseconds=1)
+        on = on[on.TimeStamp < end]
     ph = ev[ev.EventId.isin([1, 8, 10])].rename(columns={"Parameter": "Phase", "EventId": "state"})
     ph = ph.assign(Phase=ph.Phase.astype(int))
     rows = []
@@ -209,7 +219,7 @@ def test_end_to_end_bundled(sample_pred, atspm):
 
 def test_end_to_end_options(sample_pred, atspm):
     ev = atspm_events(SAMPLE)
-    t = run_atspm(ev, dc.to_atspm_config(sample_pred, extra_columns=True))       # extra columns are ignored
+    t = run_atspm(ev, dc.to_atspm_config(sample_pred, extra_columns=True))       # atspm 3.0 reads DistanceFromStopBar, ignores the rest
     assert len(t["arrival_on_green"]) > 0
     t = run_atspm(ev, dc.to_atspm_config(sample_pred, device_id_dtype="string"))
     assert len(t["arrival_on_green"]) > 0

@@ -1,8 +1,8 @@
 cff-version: 1.2.0
 message: "If you use atspm-detector, please cite the software release and the associated TRB paper when available."
 title: "atspm-detector"
-version: "1.2.0"
-date-released: 2026-10-20
+version: "2.0.0"
+date-released: 2026-11-04
 type: software
 abstract: "Phase, function, lanes, setback, night speed and health of every traffic-signal vehicle detector, from the controller's high-resolution event log alone."
 authors:

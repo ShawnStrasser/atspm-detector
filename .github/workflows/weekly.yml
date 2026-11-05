@@ -1,0 +1,59 @@
+name: Weekly checks
+
+# Nothing here blocks a merge or a release: an early warning of slower code and of the next DuckDB.
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    name: benchmark
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.14'
+    - name: Install
+      run: |
+        python -m pip install --upgrade pip
+        pip install ".[dev]" psutil
+    - name: Smoke test
+      run: pytest -m bench tests/test_bench.py
+    # Shared runners are too noisy to compare with history, so the run's line is only uploaded; different outputs still fail.
+    - name: Benchmark
+      run: python benchmarks/bench_health.py --note "weekly CI" --out benchmark-line.jsonl
+    - uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-line
+        path: benchmark-line.jsonl
+      if: ${{ always() }}
+
+  duckdb:
+    name: tests on DuckDB ${{ matrix.duckdb }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - duckdb: '1.5.2'                 # the SQL also keeps running on the 1.5 line
+            install: 'duckdb==1.5.2'
+          - duckdb: 'pre-release'
+            install: '--pre duckdb'
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.14'
+    - name: Install
+      run: |
+        python -m pip install --upgrade pip
+        pip install ".[dev]"
+        pip install --upgrade ${{ matrix.install }}
+    - name: Run tests
+      run: pytest

@@ -9,7 +9,7 @@ description = "Phase, function, lanes, setback, night speed and health of traffi
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     {name = "Shawn Strasser"}
 ]
@@ -20,25 +20,27 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering",
 ]
 
 dependencies = [
-    "numpy>=1.24",
-    "pandas>=2.0",
-    "duckdb>=1.0",
-    "onnxruntime>=1.21",
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "duckdb>=2.0",
+    "onnxruntime>=1.31",
+    "jinja2>=3.1",
 ]
 
 [project.optional-dependencies]
-charts = ["matplotlib>=3.7"]
+charts = ["matplotlib>=3.11"]
 dev = [
-    "pytest>=7.0.0",
-    "build>=1.0",
+    "pytest>=9.2",
+    "build>=1.6",
+    "pyarrow>=26.0",
 ]
 
 [project.scripts]
@@ -63,7 +65,10 @@ include-package-data = false
 where = ["src"]
 
 [tool.setuptools.package-data]
-atspm_detector = ["weights/*.json", "weights/*.onnx", "weights/*/*.json", "weights/*/*.onnx", "data/*.parquet", "reference/*.parquet"]
+atspm_detector = ["weights/*.json", "weights/*.onnx", "weights/*/*.json", "weights/*/*.onnx", "data/*.parquet", "reference/*.parquet",
+                  "hq/sql/*.sql", "hq/sql/*/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not slow'"
+markers = ["slow: the long random-log runs; left out by default. Run them with pytest -m slow, or everything with pytest -m \"\""]

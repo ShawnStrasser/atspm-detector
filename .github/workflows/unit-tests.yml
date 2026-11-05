@@ -21,18 +21,22 @@ on:
 
 jobs:
   test:
-    name: tests (${{ matrix.os }}, py${{ matrix.python-version }})
+    name: tests (${{ matrix.os }}, py${{ matrix.python-version }}${{ matrix.duckdb && format(', duckdb {0}', matrix.duckdb) || '' }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ['3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.11', '3.12', '3.13', '3.14']
         include:
           - os: windows-latest
-            python-version: '3.13'
+            python-version: '3.14'
           - os: macos-latest
-            python-version: '3.13'
+            python-version: '3.14'
+          # the oldest DuckDB allowed (the others take the newest 2.x); 3.14 is the newest Python with onnxruntime wheels
+          - os: ubuntu-latest
+            python-version: '3.14'
+            duckdb: '2.0.0'
 
     steps:
     - uses: actions/checkout@v4
@@ -47,6 +51,10 @@ jobs:
         python -m pip install --upgrade pip
         pip install ".[dev]"
 
+    - name: Pin DuckDB
+      if: matrix.duckdb
+      run: pip install "duckdb==${{ matrix.duckdb }}"
+
     - name: Build package
       run: python -m build
 
@@ -56,25 +64,25 @@ jobs:
       run: atspm-detector-check
 
     - name: Run tests
-      run: pytest tests/test_check.py tests/test_atspm_export.py --junitxml=pytest-results.xml
+      run: pytest --junitxml=pytest-results.xml
 
-    # End to end with the atspm package (not a dependency: installed here only; it pins pandas < 3 through ibis).
+    # End to end with the atspm package (not a dependency: installed here only).
     - name: atspm end to end
       if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
       run: |
-        pip install atspm
+        pip install "atspm>=3.0"
         pytest tests/test_atspm_export.py -rs
 
     # Installs the wheel just built into a fresh virtual environment and runs the CLI and the check there.
     - name: Fresh-venv install of the built wheel
-      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13'
+      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.14'
       shell: bash
       run: python tests/smoke_install.py --wheel dist/*.whl
 
     - name: Upload pytest results
       uses: actions/upload-artifact@v4
       with:
-        name: pytest-results-${{ matrix.os }}-py${{ matrix.python-version }}
+        name: pytest-results-${{ matrix.os }}-py${{ matrix.python-version }}${{ matrix.duckdb && format('-duckdb{0}', matrix.duckdb) || '' }}
         path: pytest-results.xml
       if: ${{ always() }}
 
@@ -96,7 +104,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.13'
+        python-version: '3.14'
 
     - name: Install build tools
       run: |

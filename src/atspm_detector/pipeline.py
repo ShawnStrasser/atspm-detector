@@ -51,16 +51,12 @@ Output columns: DeviceId, Detector, phase_pred, phase_prob, phase_2nd, phase_2nd
 status, review_flag, n_actuations, minutes_of_data, phase_guess, phase_guess_prob, function_guess, function_guess_prob,
 phase_margin, p_advance, p_presence, p_count, p_yellow_red, p_other, p_mid, p_bike, n_candidate_phases, lanes,
 lane_conf, phase_n_lanes, phase_n_lanes_conf, distance_ft, setback_confidence, night_speed_mph, night_speed_vehicles,
-health_status, health_score, health_reason, health_bad_periods, health_watch, health_categories, health_config,
-health_signal_note, review_reason.
-Health columns: health_status ok / watch / suspect / bad / not_enough_data (bad = one finding past its bad limit, two
-independent findings, or one lasting 4 h or more of the day); health_score 0-1 (1 = healthy);
-health_reason one plain line ("det 15: P5 Presence (covers 2 lanes) - Stuck on: held ON 3 times, 2 h in total");
-health_bad_periods JSON list of {start, end, what}; health_categories "Stuck on (bad); Spiky counts (suspect)";
-health_config setup notes (extension time on a count zone, set to pulse but holds ON); health_watch information only;
-health_signal_note one line per signal when many of its detectors had an unusual day (a signal-wide event) or
-several detectors were held ON together (one common failure).
-`return_phases=True` also returns the per-phase table (n_detectors, n_lanes, n_lanes_conf, lane volumes, night speed).
+health_status, review_reason.
+health_status ok / watch / suspect / bad / not_enough_data / lane_closure / timing_plan (bad = one finding past its bad limit,
+two independent findings, or one lasting 4 h or more of the day).
+`return_phases=True` also returns the per-phase table (n_detectors, n_lanes, n_lanes_conf, lane volumes, night speed);
+`return_findings=True` the health findings table (one row per finding: DeviceId, DetectorType, Detector, Start, End, Label,
+Confidence, Detail; findings.py), with the reasons, config notes and signal notes.
 `to_atspm_config(out)` (or --out-atspm) turns the output into the detector configuration of the atspm package.
 """
 from __future__ import annotations
@@ -87,6 +83,7 @@ from . import features_lag as f3
 from . import features_partner as f2
 from . import function as fn
 from . import function_stage as fs
+from . import findings as hfind
 from . import health_duckdb as hsql
 from . import night_speed as ns_mod
 from . import setback as sb_mod
@@ -128,8 +125,7 @@ EXTRA_COLS = ["phase_guess", "phase_guess_prob", "function_guess", "function_gue
               "p_other", "p_mid", "p_bike", "n_candidate_phases",
               "lanes", "lane_conf", "phase_n_lanes", "phase_n_lanes_conf",
               "distance_ft", "setback_confidence", "night_speed_mph", "night_speed_vehicles",
-              "health_status", "health_score", "health_reason", "health_bad_periods",
-              "health_watch", "health_categories", "health_config", "health_signal_note", "review_reason"]
+              "health_status", "review_reason"]
 PHASE_COLS = ["DeviceId", "phase", "n_detectors", "n_lanes", "n_lanes_conf",
               "lane_volumes_per_hour", "night_speed_mph", "night_speed_vehicles"]
 PHASE_STEM = "phase_lgbm_v5"
@@ -291,9 +287,9 @@ def _source(con, events) -> tuple[str, str]:
             # offset keeps its own wall-clock time (the offset is dropped by the cast)
             fmt = None
             try:
-                first = con.execute("SELECT file FROM glob(?) ORDER BY file LIMIT 1", [p]).fetchone()
+                first = con.execute("SELECT file FROM glob(?) ORDER BY file LIMIT 1", [p]).fetchall()
                 if first:
-                    fmt = con.execute("SELECT TimestampFormat FROM sniff_csv(?)", [first[0]]).fetchone()[0]
+                    fmt = con.execute("SELECT TimestampFormat FROM sniff_csv(?)", [first[0][0]]).fetchall()[0][0]
             except Exception:                                      # pragma: no cover
                 fmt = None
             need = [c for c in cols if ren.get(c, c) in NEEDED]
@@ -359,7 +355,8 @@ def load_events(con, events, device_ids=None, start=None, end=None):
 
 def _window(con):
     """(w0, w1, info) of the events in `evd`: first event and one second past the last, in epoch seconds."""
-    n, nd, t0, t1 = con.sql("SELECT count(*), count(DISTINCT dev), min(Timestamp), max(Timestamp) FROM evd").fetchone()
+    n, nd, t0, t1 = con.execute(
+        "SELECT count(*), count(DISTINCT dev), min(Timestamp), max(Timestamp) FROM evd").fetchall()[0]
     if not n:
         return None, None, {"n_events": 0}
     w0 = (pd.Timestamp(t0) - pd.Timestamp("1970-01-01")).total_seconds()
@@ -776,9 +773,7 @@ def _top_phase(ph: pd.DataFrame | None) -> pd.DataFrame:
 # ------------------------------------------------------------ lanes, setback, health, night speed
 FUNC_CLASSES = ["Advance", "Presence", "Count", "Yellow_Red", "Other", "Mid", "Bike"]   # PROB_COLS order
 POST_COLS = ["lanes", "lane_conf", "phase_n_lanes", "phase_n_lanes_conf", "distance_ft",
-             "setback_confidence", "night_speed_mph", "night_speed_vehicles", "health_status", "health_score",
-             "health_reason", "health_bad_periods", "health_watch", "health_categories", "health_config",
-             "health_signal_note"]
+             "setback_confidence", "night_speed_mph", "night_speed_vehicles", "health_status"]
 FN_COLS = ["function_pred", "function_prob"] + PROB_COLS     # what _assemble takes from the function stage
 
 
@@ -792,15 +787,14 @@ def _lane_tuple(s) -> tuple:
     return tuple(int(x) for x in s.split(",") if x.strip().isdigit())
 
 
-HEALTH_COLS = ["health_status", "health_score", "health_reason", "health_bad_periods", "health_watch",
-               "health_categories", "health_config", "health_signal_note"]
+HEALTH_COLS = ["health_status"]
 
 
-def _health(con, W: pd.DataFrame, d: pd.DataFrame, notes: dict) -> pd.DataFrame:
+def _health(con, W: pd.DataFrame, d: pd.DataFrame, notes: dict) -> tuple:
     """Detector health of every signal of W in DuckDB (health_sql, note 153), straight from `evd` on this connection:
     the classifier's answers per detector (raw predicted phase, final function, class probabilities, lane span -- a
-    bike zone covers one lane) and each signal's sample window [b0, b1).  A batch that fails is retried signal by
-    signal, so a failure only marks its own signal."""
+    bike zone covers one lane) and each signal's sample window [b0, b1) -> (health columns, findings table).  A batch that
+    fails is retried signal by signal, so a failure only marks its own signal."""
     fp = d.function_pred.where(d.function_pred.map(lambda v: isinstance(v, str)))
     lanes = d.n_lanes_spanned.astype(float).where(d.n_lanes_spanned.astype(float) > 0)
     det = pd.DataFrame({"DeviceId": d.DeviceId.astype(str), "Detector": d.Detector.astype(int),
@@ -815,7 +809,8 @@ def _health(con, W: pd.DataFrame, d: pd.DataFrame, notes: dict) -> pd.DataFrame:
         con.register("hq_in_det", det[det.DeviceId.isin(ids)])
         con.register("hq_in_win", win[win.DeviceId.isin(ids)])
         try:
-            return hsql.health(con, "evd", "hq_in_det", windows_table="hq_in_win", max_events=None, distinct=False)
+            return hsql.health(con, "evd", "hq_in_det", windows_table="hq_in_win", max_events=None, distinct=False,
+                               periods=True)
         finally:
             con.unregister("hq_in_det")
             con.unregister("hq_in_win")
@@ -829,17 +824,19 @@ def _health(con, W: pd.DataFrame, d: pd.DataFrame, notes: dict) -> pd.DataFrame:
                 parts.append(run([x]))
             except Exception as exc:
                 notes.setdefault(x, []).append(f"health unavailable for {x} ({type(exc).__name__})")
-    parts = [h for h in parts if len(h)]
+    pers = [p for _, p in parts if len(p)]
+    per = pd.concat(pers, ignore_index=True) if pers else None
+    parts = [h for h, _ in parts if len(h)]
     if not parts:
-        return pd.DataFrame(columns=["DeviceId", "Detector"] + HEALTH_COLS)
+        return pd.DataFrame(columns=["DeviceId", "Detector"] + HEALTH_COLS), hfind.empty_findings()
     h = pd.concat(parts, ignore_index=True)
     h["DeviceId"] = h.DeviceId.astype(str)
     h["Detector"] = h.Detector.astype(int)
-    h["health_score"] = h.health_score.astype(float)
-    for c in HEALTH_COLS:
-        if c != "health_score":
-            h[c] = h[c].astype(object)
-    return h
+    h["health_status"] = h.health_status.astype(object)
+    if per is not None:
+        per["DeviceId"] = per.DeviceId.astype(str)
+    windows = pd.DataFrame({"DeviceId": win.DeviceId, "start": pd.to_datetime(win.s_ns), "end": pd.to_datetime(win.e_ns)})
+    return h, hfind.tables(con, h, per, windows=windows)
 
 
 def _setback(con, d: pd.DataFrame, W: pd.DataFrame, model_dir: Path, notes: dict) -> pd.DataFrame:
@@ -877,7 +874,7 @@ def post_outputs(con, W: pd.DataFrame, univ: pd.DataFrame,
                  on_iv: dict | None = None):
     """Lanes (from the function stage), setback, health and night speed for every detector, from the log still open on
     `con` and the model's own answers (the raw opinion, before any refusal).  W: one row per signal with its sample
-    window [b0, b1).  Returns (detector table with POST_COLS, phase table, {DeviceId: [notes]})."""
+    window [b0, b1).  Returns (detector table with POST_COLS, phase table, {DeviceId: [notes]}, health findings)."""
     key = ["DeviceId", "Detector"]
     d = univ[key].merge(top[key + ["phase_pred", "phase_prob"]], on=key, how="left")
     extra = ["lanes", "n_lanes_spanned", "lane_conf", "lane_phase"]
@@ -916,7 +913,7 @@ def post_outputs(con, W: pd.DataFrame, univ: pd.DataFrame,
     on_iv = on_iv if on_iv is not None else on_table(con, W)
     dg = {k: g for k, g in d.groupby("DeviceId", sort=True)}
     devs = sorted(dg)
-    hdf = _health(con, W, d, notes)
+    hdf, hper = _health(con, W, d, notes)
     for dev in devs:
         g = dg[dev]
         b0, b1 = bw[dev]
@@ -948,7 +945,6 @@ def post_outputs(con, W: pd.DataFrame, univ: pd.DataFrame,
         sdf["night_speed_mph"] = sdf.night_speed_mph.astype(float).round(1)
         out = out.merge(sdf, on=key, how="left")
     if len(hdf):
-        # a detector too quiet to judge has no score (health_sql), so filtering on health_score never keeps it
         out = out.merge(hdf[key + HEALTH_COLS], on=key, how="left")
     for c in POST_COLS:
         if c not in out.columns:
@@ -964,7 +960,7 @@ def post_outputs(con, W: pd.DataFrame, univ: pd.DataFrame,
         pt = pt[PHASE_COLS].sort_values(["DeviceId", "phase"]).reset_index(drop=True)
     else:
         pt = pd.DataFrame(columns=PHASE_COLS)
-    return out, pt, notes
+    return out, pt, notes, hper
 
 
 def _shown(v: float, d0: int) -> str:
@@ -1068,7 +1064,7 @@ def _assemble(univ, facts, gate, top, fn, post, model_note,
                 notes.append("reduced accuracy: no phase call events (43/44)")
                 rs = rs or "no 43/44 events"
             if r.health_status in ("suspect", "bad"):
-                notes.append(f"detector health {r.health_status} (see health_reason)")
+                notes.append(f"detector health {r.health_status} (see the findings table)")
                 rs = rs or f"health {r.health_status}"
             if (r.phase_prob or 0) < LOW_CONF:
                 notes.append("low confidence: phase probability below 0.5")
@@ -1148,7 +1144,7 @@ def predict(events, start=None, end=None,
             chunk_signals: int | None = None, verbose: bool = False,
             min_actuations: int = MIN_ACTUATIONS,
             min_prob: float = MIN_PROB, return_phases: bool = False, siba_filter: bool | None = None,
-            profile: str | None = None, batch_signals: int | None = None):
+            profile: str | None = None, batch_signals: int | None = None, return_findings: bool = False):
     """Raw hi-res events -> one row per detector channel.  Never raises on thin data.
 
     Parameters
@@ -1168,6 +1164,9 @@ def predict(events, start=None, end=None,
     min_prob       below this top-phase probability no answer is given (0 = off).
                    The model's raw opinion is kept in phase_guess / function_guess.
     return_phases  also return the per-phase table (n_lanes, lane volumes, night speed) as a second value.
+    return_findings also return the health findings table (findings.py: the reasons, config notes and signal notes) as the
+                   last value: predict(...) -> out; return_phases -> (out, phases); return_findings -> (out, findings);
+                   both -> (out, phases, findings).
     siba_filter    run the network's function pass only on candidates with ranker p >= .01 (None = default ON).
     profile        accepted for compatibility and ignored (one path); passing it gives a FutureWarning, nothing else.
     """
@@ -1179,7 +1178,11 @@ def predict(events, start=None, end=None,
         raise FileNotFoundError(f"no models in {model_dir}")
     if gb.config(model_dir) is None:
         raise FileNotFoundError(f"no network ({gb.CONFIG_FILE} and its weights) in {model_dir}")
-    empty = (_empty_result(), pd.DataFrame(columns=PHASE_COLS))
+    empty = (_empty_result(), pd.DataFrame(columns=PHASE_COLS), hfind.empty_findings())
+
+    def ret(r):
+        return (r[0],) + ((r[1],) if return_phases else ()) + ((r[2],) if return_findings else ()) \
+            if return_phases or return_findings else r[0]
     batch = max(1, int(batch_signals)) if batch_signals else None
 
     if chunk_signals:
@@ -1187,26 +1190,23 @@ def predict(events, start=None, end=None,
         if len(ids) > chunk_signals:
             parts = [predict(events, start, end, ids[i:i + chunk_signals],
                              model_dir, threads, memory, None, verbose, min_actuations,
-                             min_prob, True, siba_filter, None, batch)
+                             min_prob, True, siba_filter, None, batch, True)
                      for i in range(0, len(ids), chunk_signals)]
-            dets = [a for a, _ in parts if len(a)]
-            phs = [b for _, b in parts if len(b)]
-            out = (pd.concat(dets, ignore_index=True) if dets else empty[0],
-                   pd.concat(phs, ignore_index=True) if phs else empty[1])
-            return out if return_phases else out[0]
+            return ret(tuple(pd.concat(x, ignore_index=True) if x else e
+                             for x, e in zip(([p[k] for p in parts if len(p[k])] for k in range(3)), empty)))
 
     con = _connect(threads, memory)
     try:
         w0, w1, info = load_events(con, events, device_ids, start, end)
         if not info["n_events"]:
-            return empty if return_phases else empty[0]
+            return ret(empty)
         ids = [r[0] for r in con.sql("SELECT DeviceId FROM devmap ORDER BY dev").fetchall()]
         if batch is None:
             batch = auto_batch(int(info["n_events"]), len(ids))
             log(f"batch_signals {batch} (free memory)")
         if len(ids) > batch:
             con.execute("ALTER TABLE evd RENAME TO evd_all")
-        dets, phs = [], []
+        dets, phs, fnds = [], [], []
         for i in range(0, len(ids), batch):
             part = ids[i:i + batch]
             if len(ids) > batch:
@@ -1215,11 +1215,14 @@ def predict(events, start=None, end=None,
                 dets.append(r[0])
                 if len(r[1]):
                     phs.append(r[1])
+                if len(r[2]):
+                    fnds.append(r[2])
         if not dets:
-            return empty if return_phases else empty[0]
+            return ret(empty)
         res = dets[0] if len(dets) == 1 else pd.concat(dets, ignore_index=True)
         phases = (phs[0] if len(phs) == 1 else pd.concat(phs, ignore_index=True)) if phs else empty[1]
-        return (res, phases) if return_phases else res
+        found = pd.concat(fnds, ignore_index=True) if fnds else empty[2]
+        return ret((res, phases, found))
     finally:
         con.close()
 
@@ -1231,8 +1234,8 @@ class _BatchFailed(Exception):
 
 def _predict_batch(con, ids: list, start, end, model_dir: Path, siba_filter, min_actuations: int,
                    min_prob: float) -> list:
-    """The pipeline on the signals loaded in `evd` / `devmap` (= `ids`) -> [(detector table, phase table)] (empty list
-    if nothing to report).  If a batched stage fails, every signal is re-run alone."""
+    """The pipeline on the signals loaded in `evd` / `devmap` (= `ids`) -> [(detector table, phase table, health
+    findings)] (empty list if nothing to report).  If a batched stage fails, every signal is re-run alone."""
     W = _windows(con, start, end)
     try:
         r = _predict_loaded(con, W, model_dir, siba_filter, min_actuations, min_prob, strict=len(W) > 1)
@@ -1261,7 +1264,7 @@ def _predict_batch(con, ids: list, start, end, model_dir: Path, siba_filter, min
 def _predict_loaded(con, W: pd.DataFrame, model_dir: Path, siba_filter, min_actuations: int, min_prob: float,
                     strict: bool = False):
     """The whole pipeline on the signals loaded in `evd` / `devmap`, each on its own windows (W, one row per signal)
-    -> (detector table, phase table), or None.  `strict`: a failing feature / function stage raises _BatchFailed
+    -> (detector table, phase table, health findings), or None.  `strict`: a failing feature / function stage raises _BatchFailed
     (the caller re-runs the signals one at a time) instead of marking the signals."""
     build_chunk_tables(con)
     univ = detector_universe(con)
@@ -1303,13 +1306,13 @@ def _predict_loaded(con, W: pd.DataFrame, model_dir: Path, siba_filter, min_actu
         del df, sim, lead, lag
     streams = None
     top = _top_phase(ph)
-    post, phases, pnotes = post_outputs(con, W, univ, top, fnr, lph, model_dir, on_iv)
+    post, phases, pnotes, found = post_outputs(con, W, univ, top, fnr, lph, model_dir, on_iv)
     log("lanes, setback, health and night speed done")
     for dv, v in pnotes.items():
         notes.setdefault(dv, []).extend(v)
     res = _assemble(univ, facts, gate, top, fnr, post, {k: "; ".join(v) for k, v in notes.items()},
                     min_actuations, min_prob)
-    return res, phases
+    return res, phases, found
 
 
 def list_signals(events, start=None, end=None, threads: int = 2,
@@ -1336,18 +1339,22 @@ def run(events: str, out: str, device_ids=None, start=None, end=None,
         min_actuations: int = MIN_ACTUATIONS,
         min_prob: float = MIN_PROB, out_phases: str | None = None,
         siba_filter: bool | None = None, profile: str | None = None, verbose: bool = True,
-        out_atspm: str | None = None, batch_signals: int | None = None) -> pd.DataFrame:
-    """CLI helper: predict and write a CSV (and, if asked, the per-phase lane table and the atspm detector
-    configuration from `to_atspm_config` with its defaults)."""
+        out_atspm: str | None = None, batch_signals: int | None = None,
+        out_findings: str | None = None) -> pd.DataFrame:
+    """CLI helper: predict and write a CSV (and, if asked, the per-phase lane table, the health findings table and the
+    atspm detector configuration from `to_atspm_config` with its defaults)."""
     t0 = time.time()
-    res, phases = predict(events, start, end, device_ids, model_dir, threads,
-                          memory, chunk_signals, verbose, min_actuations, min_prob, True, siba_filter, profile,
-                          batch_signals)
+    res, phases, found = predict(events, start, end, device_ids, model_dir, threads,
+                                   memory, chunk_signals, verbose, min_actuations, min_prob, True, siba_filter, profile,
+                                   batch_signals, True)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     res.to_csv(out, index=False)
     if out_phases:
         Path(out_phases).parent.mkdir(parents=True, exist_ok=True)
         phases.to_csv(out_phases, index=False)
+    if out_findings:
+        Path(out_findings).parent.mkdir(parents=True, exist_ok=True)
+        found.to_csv(out_findings, index=False)
     if out_atspm:
         from .atspm_export import to_atspm_config
         Path(out_atspm).parent.mkdir(parents=True, exist_ok=True)
@@ -1367,6 +1374,9 @@ def main(argv=None) -> None:
     ap.add_argument("--out", required=True, help="output CSV")
     ap.add_argument("--out-phases", default=None,
                     help="optional CSV of the per-phase table (n_lanes per predicted phase)")
+    ap.add_argument("--out-findings", default=None,
+                    help="optional CSV of the health findings (one row per finding: DeviceId, DetectorType, Detector, "
+                         "Start, End, Label, Confidence, Detail)")
     ap.add_argument("--out-atspm", default=None,
                     help="optional CSV of the detector configuration for the atspm package (DeviceId, Phase, "
                          "Parameter, Function: Advance / Presence / Yellow_Red / 'Stopbar Count'; detectors with "
@@ -1396,7 +1406,7 @@ def main(argv=None) -> None:
     ids = [s.strip() for s in a.device_ids.split(",")] if a.device_ids else None
     run(a.events, a.out, ids, a.start, a.end, Path(a.models),
         a.threads, a.memory, a.chunk_signals, a.min_actuations, a.min_prob, a.out_phases,
-        False if a.no_siba_filter else None, a.profile, not a.quiet, a.out_atspm, a.batch_signals)
+        False if a.no_siba_filter else None, a.profile, not a.quiet, a.out_atspm, a.batch_signals, a.out_findings)
 
 
 if __name__ == "__main__":

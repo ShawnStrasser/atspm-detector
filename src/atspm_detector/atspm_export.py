@@ -112,8 +112,8 @@ def to_atspm_config(results, *,
     device_id_dtype    cast DeviceId (e.g. "int64") to the type of the events you give atspm.  predict() returns
                        DeviceId as text; atspm's joins work either way, but its output tables then carry text ids.
                        None = keep as returned.
-    extra_columns      also return Lanes, DistanceFromStopBar (ft), PhaseProb, FunctionProb, HealthStatus.  atspm
-                       ignores them.
+    extra_columns      also return Lanes, DistanceFromStopBar (ft), PhaseProb, FunctionProb, HealthStatus.  atspm 3.0
+                       uses the distance for arrival on green and platoon ratio, and ignores the rest.
     return_report      also return one row per input detector: exported or not, and why (column `reason`).
 
     Returns the config (sorted by DeviceId, Phase, Function, Parameter; no duplicate rows), or (config, report).
@@ -132,7 +132,7 @@ def to_atspm_config(results, *,
 
     d = r.reset_index(drop=True).copy()
     for c, default in (("phase_prob", np.nan), ("function_prob", np.nan), ("health_status", None),
-                       ("health_reason", None), ("lanes", None), ("distance_ft", np.nan), ("status", None)):
+                       ("lanes", None), ("distance_ft", np.nan), ("status", None)):
         if c not in d.columns:
             d[c] = default
     fn = d["function_pred"].astype(object).where(d["function_pred"].notna(), None)
@@ -150,7 +150,7 @@ def to_atspm_config(results, *,
     mark(~fn.isin(list(include)), "class not exported: " + fn.astype(str))
     if exclude_health:
         mark(d["health_status"].isin(list(exclude_health)),
-             "health " + txt("health_status") + ": " + txt("health_reason"))
+             "health " + txt("health_status"))
     fprob = pd.to_numeric(d["function_prob"], errors="coerce")
     if min_phase_prob > 0:
         mark(pd.to_numeric(d["phase_prob"], errors="coerce").fillna(0).lt(min_phase_prob),

@@ -7,7 +7,7 @@ import atspm_detector as ad
 from atspm_detector import health_duckdb as hq
 from atspm_detector.check import SAMPLE
 
-H = ["health_status", "health_score", "health_reason", "health_bad_periods", "health_categories", "health_config",
+H = ["health_status", "health_score", "health_reason", "health_categories", "health_config",
      "health_watch", "health_signal_note"]
 
 
@@ -21,10 +21,10 @@ def _detectors(out: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-def _same(a: pd.DataFrame, b: pd.DataFrame):
+def _same(a: pd.DataFrame, b: pd.DataFrame, cols=H):
     m = a.merge(b, on=["DeviceId", "Detector"], suffixes=("", "_b"))
     assert len(m) == len(a) == len(b)
-    for c in H:
+    for c in cols:
         x, y = m[c], m[c + "_b"]
         if c == "health_score":
             assert np.allclose(x.astype(float), y.astype(float), rtol=1e-9, equal_nan=True), c
@@ -40,26 +40,31 @@ def test_health_on_a_connection_equals_predict():
     con.execute("CREATE TABLE events AS SELECT * FROM ev_df")
     con.register("det_df", _detectors(out))
     con.execute("CREATE TABLE detectors AS SELECT * FROM det_df")
-    got = ad.health(con, "events", "detectors")
-    _same(got, out.dropna(subset=["health_status"])[["DeviceId", "Detector"] + H])
+    got = hq.health(con, "events", "detectors")
+    _same(got, out.dropna(subset=["health_status"])[["DeviceId", "Detector", "health_status"]], ["health_status"])
+    # predict's findings table holds the same rows as the health on the connection (its window may differ by a second)
+    _, found = ad.predict(ev, return_findings=True)
+    both = ad.health(con, "events", "detectors", ped=False)
+    assert (found[["DeviceId", "Detector", "Label", "Detail"]].reset_index(drop=True)
+            .equals(both[["DeviceId", "Detector", "Label", "Detail"]].reset_index(drop=True)))
     # the steps are temp tables of their own, all gone afterwards
     left = con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name LIKE 'hq_%'").fetchone()[0]
     assert left == 0
     # the same as one query
-    one = con.execute(ad.health_sql("events", "detectors")).df()
+    one = con.execute(hq.health_sql("events", "detectors")).df()
     _same(one, got)
     # a detectors table without class probabilities works too (the function's own limits only)
     con.execute("CREATE TABLE det2 AS SELECT DeviceId, Detector, phase, function, lanes FROM detectors")
-    two = ad.health(con, "events", "det2")
+    two = hq.health(con, "events", "det2")
     assert len(two) == len(got) and two.health_status.notna().all()
 
 
 def test_health_sql_text_and_names():
-    sql = ad.health_sql("my_events", "my_detectors", start="2024-12-03 12:00", end="2024-12-03 12:30")
+    sql = hq.health_sql("my_events", "my_detectors", start="2026-10-06 12:00", end="2026-10-06 12:30")
     assert sql.startswith("WITH ") and "my_events" in sql and "my_detectors" in sql
-    assert "TIMESTAMP '2024-12-03 12:00:00'" in sql
+    assert "TIMESTAMP '2026-10-06 12:00:00'" in sql
     # every step carries the prefix, so a caller's table called like a step is never shadowed
     for n, _, _ in hq.build("e", "d").ctes:
         assert f"{hq.PREFIX}{n} AS " in sql
     # without class probabilities: no p_* column read
-    assert "NULL::DOUBLE AS p_advance" in ad.health_sql("e", "d", probabilities=False)
+    assert "NULL::DOUBLE AS p_advance" in hq.health_sql("e", "d", probabilities=False)

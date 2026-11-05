@@ -1,0 +1,86 @@
+{
+ "model": "ped movement assignment (which phases / ped overlaps each ped input calls)",
+ "note": "number-free version",
+ "files": [
+  "ped_assign_s0.onnx"
+ ],
+ "file_sha256": {
+  "ped_assign_s0.onnx": "1d10ec7b4af752d1c2e34aec0c960112c4e6b31432e8e302221dd8873232751f"
+ },
+ "objective": "binary",
+ "threshold": 0.5,
+ "decision": "per ped input: every candidate movement with p >= threshold, after the ped recall rule; none -> in_recall when a movement of the signal is gated, else no_movement",
+ "n_features": 23,
+ "feature_names": [
+  "n_press",
+  "n_calls",
+  "n_walks",
+  "call1",
+  "call3",
+  "call_base",
+  "call_lift",
+  "lag_call_med",
+  "free_n",
+  "free_nocall",
+  "free_nowalk",
+  "served",
+  "walk_base",
+  "served_lift",
+  "cov1",
+  "walk_cov",
+  "rank_call",
+  "margin_call",
+  "rank_served",
+  "margin_served",
+  "rank_cov",
+  "n_cand",
+  "is_overlap"
+ ],
+ "number_free": "no input, phase or overlap number is a feature or breaks a tie; training rows in a canonical order; tests/test_ped_invariance.py renumbers the raw log",
+ "recall_rule": {
+  "RECALL_SHARE": 0.5,
+  "RECALL_MIN_WALKS": 5,
+  "EV_CALL1": 0.05,
+  "EV_COV1": 0.5
+ },
+ "params": {
+  "objective": "binary",
+  "learning_rate": 0.05,
+  "num_leaves": 15,
+  "min_data_in_leaf": 40,
+  "feature_fraction": 0.8,
+  "bagging_fraction": 0.8,
+  "bagging_freq": 1,
+  "lambda_l2": 1.0,
+  "verbose": -1,
+  "num_threads": 6,
+  "seed": 0
+ },
+ "num_boost_round": 300,
+ "seeds": [
+  0
+ ],
+ "candidates": "every ped input with presses (90) x every phase 1-16 with a 21 or 45 and every ped overlap 1-32 with a 67 or 68 at that signal in the window",
+ "labels": "the controllers' saved ped settings (2026-10-28): ped detector plan 1 for every signal, call phase + additional phases / call overlap; rows gated by the recall rule are not trained on",
+ "trained_on": {
+  "rows": 17921,
+  "positives": 5188,
+  "signals": 818,
+  "periods": [
+   "2026-09-18..21 (2.75 d)",
+   "2026-10-04..07 (2.3 d)"
+  ]
+ },
+ "accuracy": {
+  "pooled_oof_exact_set": 0.9968,
+  "scored": 5055,
+  "recall_not_scored": 88,
+  "source": "signal-grouped 5-fold over Sep + Oct 2026, threshold fixed at 0.5; exact = predicted set == configured set (movements with ped activity, without recall links the log cannot show)"
+ },
+ "onnx_parity": {
+  "rows": 18767,
+  "max_abs_raw": 1.7763568394002505e-14,
+  "max_abs_prob": 4.440892098500626e-16,
+  "decisions_differ": 0
+ }
+}

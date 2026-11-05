@@ -2,17 +2,16 @@
 
     from atspm_detector import predict
     from atspm_detector.charts import health_chart
-    out = predict("day.parquet")
-    health_chart("day.parquet", out, detector=15, path="det15.png")
+    out, findings = predict("day.parquet", return_findings=True)
+    health_chart("day.parquet", out, detector=15, path="det15.png", findings=findings)
 
 One chart per detector, built from the package's own outputs and the log: the detector (thick) and its phase mates
-(thin) over the sample, counts per 15 min on top and % ON per 15 min below, real units; every period the health check
-lists (health_bad_periods) is shaded.  Title = the health categories; subtitle = 'det 15: P5 Presence', signal, sample, status;
+(thin) over the sample, counts per 15 min on top and % ON per 15 min below, real units; every finding of the detector in
+`findings` (the health findings table, optional) with a time of its own is shaded.  Title = its findings; subtitle = 'det 15: P5 Presence', signal, sample, status;
 the reason line is printed under the chart.  Nothing is re-scored: the chart shows the answers as given.
 """
 from __future__ import annotations
 
-import json
 import textwrap
 
 import numpy as np
@@ -20,9 +19,10 @@ import pandas as pd
 
 THIS, BAD, MUTED, GRID, INK = "#1f4e9c", "#d32f2f", "#8a8984", "#e6e5e0", "#1a1a1a"
 SHADE = {"stuck on": "#f8c9c4", "silent": "#f3d9a4", "silent at night": "#f3d9a4", "counts dropped": "#f3d9a4",
-         "unusual daily pattern": "#e3dcf3", "count zone held ON": "#f8c9c4", "erratic time ON": "#f8c9c4",
-         "chattering": "#cfe3f3", "too-fast actuations": "#cfe3f3", "too many for the traffic": "#cfe3f3",
-         "erratic counts": "#e3dcf3", "busy at night": "#e3dcf3", "spiky counts": "#e3dcf3"}
+         "counts too high": "#e3dcf3", "count zone held ON": "#f8c9c4", "too-fast actuations": "#cfe3f3",
+         "too many for the traffic": "#cfe3f3", "busy at night": "#e3dcf3", "spiky counts": "#e3dcf3",
+         "lane closure": "#dfe8d0", "timing plan": "#dfe8d0"}
+NO_TIME_OF_ITS_OWN = ("busy at night", "no daily pattern", "misses vehicles at night")     # their rows are whole days
 MATES = ["#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7", "#7a7a75", "#008300", "#8c564b", "#17becf",
          "#bcbd22", "#9e9ac8", "#c49c94"]
 
@@ -81,8 +81,10 @@ def _bins(ev, t0, t1, bs=900):
     return out, x
 
 
-def health_chart(events, out: pd.DataFrame, detector: int, device_id=None, path=None, max_mates: int = 12):
-    """Draw the health chart of one detector; returns the matplotlib Figure (saved to `path` when given)."""
+def health_chart(events, out: pd.DataFrame, detector: int, device_id=None, path=None, max_mates: int = 12,
+                 findings: pd.DataFrame | None = None):
+    """Draw the health chart of one detector; returns the matplotlib Figure (saved to `path` when given).  `findings`:
+    the health findings table (predict(..., return_findings=True)), shaded and listed when given."""
     try:
         import matplotlib
         if path is not None:
@@ -112,17 +114,20 @@ def health_chart(events, out: pd.DataFrame, detector: int, device_id=None, path=
         ax[0].plot(x, c, color=MATES[k % len(MATES)], lw=1.1, alpha=.85, label=lab)
         ax[1].plot(x, p, color=MATES[k % len(MATES)], lw=1.1, alpha=.85)
     c, p = S.get(int(r.Detector), empty)
-    me = str(r.health_reason).split(" - ")[0] if isinstance(r.health_reason, str) else f"det {int(r.Detector)}"
+    fn = r.function_pred if isinstance(r.function_pred, str) else r.get("function_guess")
+    me = f"det {int(r.Detector)}: " + (f"P{int(ph)} " if pd.notna(ph) else "") + str(fn if isinstance(fn, str) else "").replace("Yellow_Red", "Yellow-red")
     ax[0].plot(x, c, color=THIS, lw=2.8, label=me)
     ax[1].plot(x, p, color=THIS, lw=2.8)
-    per = json.loads(r.health_bad_periods) if isinstance(r.health_bad_periods, str) and r.health_bad_periods else []
+    mine = (findings[(findings.DeviceId.astype(str) == str(r.DeviceId)) & findings.DetectorType.eq("Vehicle")
+                     & findings.Detector.eq(int(r.Detector))] if findings is not None and len(findings) else pd.DataFrame())
+    timed = mine[mine.Label.isin(SHADE) & ~mine.Label.isin(NO_TIME_OF_ITS_OWN)] if len(mine) else mine
     seen = set()
-    for q in per:
-        a, b = pd.Timestamp(q["start"]), pd.Timestamp(q["end"])
-        col = SHADE.get(q["what"], "#f8c9c4")
+    for q in timed.itertuples():
+        col = SHADE[q.Label]
         for a_ in ax:
-            a_.axvspan(a, b, color=col, alpha=.55, lw=0, label=q["what"] if (q["what"] not in seen and a_ is ax[0]) else None)
-        seen.add(q["what"])
+            a_.axvspan(pd.Timestamp(q.Start), pd.Timestamp(q.End), color=col, alpha=.55, lw=0,
+                       label=q.Label if (q.Label not in seen and a_ is ax[0]) else None)
+        seen.add(q.Label)
     ax[0].set_ylabel("actuations per 15 min")
     ax[1].set_ylabel("% ON per 15 min")
     ax[1].set_ylim(0, 100)
@@ -131,16 +136,14 @@ def health_chart(events, out: pd.DataFrame, detector: int, device_id=None, path=
         a_.spines[["top", "right"]].set_visible(False)
     ax[1].xaxis.set_major_formatter(mdates.DateFormatter("%a %H:%M"))
     ax[0].legend(loc="upper left", fontsize=9, ncol=2, frameon=False)
-    cats = r.health_categories if isinstance(r.health_categories, str) and r.health_categories else ""
-    title = cats or ("no problem found" if r.health_status == "ok" else str(r.health_status))
+    labels = list(dict.fromkeys(mine.Label)) if len(mine) else []
+    title = ", ".join(labels) or ("no problem found" if r.health_status == "ok" else str(r.health_status))
     hrs = (t1 - t0).total_seconds() / 3600
     fig.suptitle(title, x=.01, ha="left", fontsize=14, fontweight="bold", color=BAD if r.health_status in
                  ("suspect", "bad") else INK)
     ax[0].set_title(f"{me} · signal {r.DeviceId} · {t0:%a %d %b %H:%M}, {hrs:g} h · status {r.health_status}",
                     loc="left", fontsize=11, color=MUTED)
-    txt = "\n".join(textwrap.wrap(str(r.health_reason), 150))
-    if isinstance(r.get("health_config"), str) and r.health_config:
-        txt += "\nsetup: " + r.health_config
+    txt = "\n".join(textwrap.wrap("; ".join(dict.fromkeys(mine.Detail.dropna())) if len(mine) else "", 150))
     fig.text(.01, .01, txt, fontsize=10, color=INK, va="bottom")
     fig.tight_layout(rect=(0, .07, 1, .95))
     if path is not None:

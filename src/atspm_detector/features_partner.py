@@ -225,7 +225,7 @@ def build_window(con, win: str, secs: float, parts: dict, devmap: pd.DataFrame) 
     out["call43_red_lift"] = (out["call43_red_035"] /
                               (0.35 * red_rate.replace(0, np.nan))).clip(upper=200)
     out = out.rename(columns={"partner": "partner_phase"})   # a KEY, never a model input
-    out.drop(columns=["n43_tot", "sec_red", "n_on_red_c"], inplace=True, errors="ignore")
+    out = out.drop(columns=["n43_tot", "sec_red", "n_on_red_c"], errors="ignore")
     out = out.merge(devmap, on="dev", how="left").drop(columns=["dev"])
     out = out.rename(columns={"det": "Detector", "p": "cand_phase"})
     out["win"] = win

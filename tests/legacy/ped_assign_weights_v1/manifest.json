@@ -1,0 +1,79 @@
+{
+ "model": "ped movement assignment (which phases / ped overlaps each ped input calls)",
+ "note": "research note 156",
+ "files": [
+  "ped_assign_s0.onnx"
+ ],
+ "file_sha256": {
+  "ped_assign_s0.onnx": "b9aaa529f930842bdf3bd6928f329d7a8aae4ac04c873d0a53542aae5fd4c01b"
+ },
+ "objective": "binary",
+ "threshold": 0.5,
+ "decision": "per ped input: every candidate movement with p >= threshold; none -> no_movement",
+ "n_features": 24,
+ "feature_names": [
+  "n_press",
+  "n_calls",
+  "n_walks",
+  "call1",
+  "call3",
+  "call_base",
+  "call_lift",
+  "lag_call_med",
+  "free_n",
+  "free_nocall",
+  "free_nowalk",
+  "walk120",
+  "walk_base",
+  "walk_lift",
+  "cov1",
+  "walk_cov",
+  "rank_call",
+  "margin_call",
+  "rank_walk",
+  "margin_walk",
+  "rank_cov",
+  "n_cand",
+  "same_number",
+  "is_overlap"
+ ],
+ "params": {
+  "objective": "binary",
+  "learning_rate": 0.05,
+  "num_leaves": 15,
+  "min_data_in_leaf": 40,
+  "feature_fraction": 0.8,
+  "bagging_fraction": 0.8,
+  "bagging_freq": 1,
+  "lambda_l2": 1.0,
+  "verbose": -1,
+  "num_threads": 6,
+  "seed": 0
+ },
+ "num_boost_round": 300,
+ "seeds": [
+  0
+ ],
+ "augmentation": "input-renumbered copy of every training row (each signal ped input numbers permuted; only same_number changes), weight 0.1",
+ "candidates": "every ped input with presses (90) x every phase 1-16 with a 21 or 45 and every ped overlap 1-32 with a 67 or 68 at that signal in the window",
+ "labels": "Kinetic Signals stored controller databases (2026-10-28 upload): active ped detector plan (plan 1; plan 3 at 13002-13005, polled live) call phase + additional phases / call overlap",
+ "trained_on": {
+  "rows": 18326,
+  "positives": 5293,
+  "signals": 818,
+  "periods": [
+   "2026-09-18..21 (2.75 d)",
+   "2026-10-04..07 (2.3 d)"
+  ]
+ },
+ "accuracy": {
+  "pooled_oof_exact_set": 0.9932,
+  "source": "device-grouped 5-fold OOF over Sep + Oct 2026; exact = predicted set == configured set (movements with ped activity in the window)"
+ },
+ "onnx_parity": {
+  "rows": 23268,
+  "max_abs_raw": 1.7763568394002505e-14,
+  "max_abs_prob": 4.440892098500626e-16,
+  "decisions_differ": 0
+ }
+}

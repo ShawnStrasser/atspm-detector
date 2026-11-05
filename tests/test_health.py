@@ -1,15 +1,15 @@
-"""Health (DuckDB SQL, note 153): the checks, their limits and measures on small logs, batch == alone."""
-import json
-
+"""Health (DuckDB SQL, note 153): the checks, their limits and measures on small logs, batch == alone, the periods
+table (note 154aa)."""
 import duckdb
 import numpy as np
 import pandas as pd
+import synth
 
-from atspm_detector import health
+from atspm_detector.health_duckdb import health
 from atspm_detector import health_duckdb as hq
 
 CHECKS = {"Stuck on", "Counts fall", "Misses vehicles at night", "Busy at night", "Too-fast actuations",
-          "Too many for the traffic", "Spiky counts"}
+          "Too many for the traffic", "Spiky counts", "Counts too high"}   # Counts too high: option count_rise (154n)
 REMOVED = ("Chattering", "Erratic time ON", "Unusual daily pattern", "ON longer than its kind", "Goes silent",
            "Count drops", "Count zone held ON", "undercounts vs partner", "Erratic counts")
 T0 = pd.Timestamp("2026-09-28 00:00")
@@ -116,7 +116,7 @@ def test_health_batch_equals_alone_and_sample_reports_only_the_checks():
         con.register("d_df", pd.concat(d, ignore_index=True))
         con.execute("CREATE OR REPLACE TABLE events AS SELECT * FROM e_df")
         con.execute("CREATE OR REPLACE TABLE detectors AS SELECT * FROM d_df")
-        return health(con, "events", "detectors", start="2024-12-03 12:00", end="2024-12-03 12:31")
+        return health(con, "events", "detectors", start="2026-10-06 12:00", end="2026-10-06 12:31")
     batch = run(evs, dets)
     for e, d in zip(evs, dets):
         alone = run([e], [d]).reset_index(drop=True)
@@ -128,8 +128,122 @@ def test_health_batch_equals_alone_and_sample_reports_only_the_checks():
     for cat in batch.health_categories.fillna(""):
         for part in [x for x in cat.split("; ") if x]:
             assert part.rsplit(" (", 1)[0] in CHECKS, part
-    text = " ".join(batch.health_reason.fillna("")) + " " + " ".join(batch.health_bad_periods.fillna(""))
+    text = " ".join(batch.health_reason.fillna(""))
     for w in REMOVED:
         assert w not in text, w
-    json.loads(batch.health_bad_periods.dropna().iloc[0] or "[]")
+    assert "health_bad_periods" not in batch.columns
     assert np.isfinite(batch.health_score.dropna()).all()
+
+
+def test_workers_same_result():
+    """health(..., workers=N) (the groups run at once, note 154ad) returns exactly the single run's tables."""
+    evs, dets = _three()
+    con = duckdb.connect()
+    con.register("e_df", pd.concat(evs, ignore_index=True))
+    con.register("d_df", pd.concat(dets, ignore_index=True))
+    con.execute("CREATE TABLE events AS SELECT * FROM e_df ORDER BY DeviceId, Timestamp")
+    con.execute("CREATE TABLE detectors AS SELECT * FROM d_df")
+    kw = dict(start="2026-10-06 12:00", end="2026-10-06 12:31", max_events=1, periods=True)   # one signal a group
+    one, per = health(con, "events", "detectors", **kw)
+    two, per2 = health(con, "events", "detectors", workers=2, **kw)
+    assert one.DeviceId.nunique() == 3
+    pd.testing.assert_frame_equal(one, two)
+    pd.testing.assert_frame_equal(per, per2)
+
+
+def test_periods_table():
+    """health(..., periods=True): the detector table as without it, plus one row per period; a detector held ON for 12
+    minutes gets a 'stuck on' row at that time; every suspect / bad detector has a row, an ok one none; health_sql
+    gives the same two tables."""
+    evs, dets = _three()
+    ev, det = evs[0], dets[0]
+    adv = det[det.function.eq("Advance")]
+    d = int(adv.Detector.loc[adv.Detector.map(ev[ev.EventId.eq(82)].Parameter.value_counts()).idxmax()])
+    t0 = pd.Timestamp("2026-10-06 12:16")          # minutes 16-28: no comms gap (the sample has one at 10.5-15)
+    t1 = t0 + pd.Timedelta(minutes=12)
+    on = ev.EventId.isin([81, 82]) & ev.Parameter.eq(d)
+    ev = pd.concat([ev[~(on & ev.Timestamp.between(t0, t1))],
+                    pd.DataFrame({"DeviceId": "A", "Timestamp": [t0, t1], "EventId": [82, 81], "Parameter": [d, d]})
+                    .astype({"EventId": ev.EventId.dtype, "Parameter": ev.Parameter.dtype})], ignore_index=True)
+    con = duckdb.connect()
+    con.register("e_df", ev)
+    con.register("d_df", det)
+    con.execute("CREATE TABLE events AS SELECT * FROM e_df ORDER BY DeviceId, Timestamp")
+    con.execute("CREATE TABLE detectors AS SELECT * FROM d_df")
+    kw = dict(start="2026-10-06 12:00", end="2026-10-06 12:31")
+    out, per = health(con, "events", "detectors", periods=True, **kw)
+    pd.testing.assert_frame_equal(out, health(con, "events", "detectors", **kw))
+    assert list(per.columns) == hq.PERIOD_COLS == ["DeviceId", "Detector", "start", "end", "condition", "severity",
+                                                   "limit_s", "in_closure", "whole_window"]
+    assert out.loc[out.Detector.eq(d), "health_status"].iat[0] in ("suspect", "bad")
+    r = per[per.Detector.eq(d) & per.condition.eq("stuck on")]
+    assert len(r) == 1 and not r.whole_window.iat[0] and not r.in_closure.iat[0]
+    a, z = r.start.iat[0], r.end.iat[0]       # the hold (it may join the actuation just before it)
+    assert t0 - pd.Timedelta(minutes=1) <= a <= t0 and t1 <= z <= t1 + pd.Timedelta(seconds=1)
+    assert 0.5 <= r.severity.iat[0] <= 1 and r.limit_s.iat[0] > 0
+    key = ["DeviceId", "Detector"]
+    flagged = out.loc[out.health_status.isin(["suspect", "bad"]), key]
+    assert flagged.merge(per[key].drop_duplicates(), on=key, how="left", indicator=True)._merge.eq("both").all()
+    assert per.merge(out.loc[out.health_status.eq("ok"), key], on=key).empty
+    assert per.severity.dropna().between(0, 1).all() and (per.start <= per.end).all()
+    a, b = hq.health_sql("events", "detectors", periods=True, **kw)
+    assert len(con.execute(a).df()) == len(out)
+    pd.testing.assert_frame_equal(con.execute(b).df(), per, check_dtype=False)
+
+
+def test_new_option_defaults():
+    o = hq.OPTIONS
+    assert o["mate_drop"] and o["count_rise"] and o["mate_noise"] and o["rise_dead_days"]
+    assert o["clean_yardsticks"] == "all" and o["occ_strict"] is True
+    assert o["closure_1h"] is True and o["pulse_mode"] is True        # approved 2026-10-29 (note 154ac)
+    assert hq.LC_FAULT_DAY == {"sides": 2, "all": True}
+
+
+def test_pulse_mode():
+    """option pulse_mode (on by default): a Presence zone whose calls are all 0.1-s pulses is suspect (Configuration),
+    its normal neighbour is not; a Count zone may pulse (note 154ac), and so may one configured as Count where the
+    detectors table gives the configured function."""
+    rows = [(float(t), 1, 2) for t in range(0, 3600, 30)]                    # greens: a log without comms gaps
+    for d in (1, 3, 4):                                                       # pulses
+        rows += [r for k in range(400) for r in ((5.0 + d / 10 + 8 * k, 82, d), (5.1 + d / 10 + 8 * k, 81, d))]
+    rows += [r for k in range(400) for r in ((6.0 + 8 * k, 82, 2), (8.0 + 8 * k, 81, 2))]
+    dets = [(1, 2.0, "Presence", 1.0), (2, 2.0, "Presence", 1.0), (3, 2.0, "Count", 1.0), (4, 2.0, "Presence", 1.0)]
+    con = _con(rows, dets, end="2026-09-28 01:00")
+    kw = dict(start="2026-09-28 00:00", end="2026-09-28 01:00")
+    off = health(con, "events", "detectors", options={"pulse_mode": False}, **kw).set_index("Detector")
+    on, per = health(con, "events", "detectors", periods=True, **kw)
+    on = on.set_index("Detector")
+    assert "pulse mode" not in off.loc[1, "health_reason"]
+    assert on.loc[1, "health_status"] == "suspect" and "Configuration (suspect)" in on.loc[1, "health_categories"]
+    assert "looks set to pulse mode: 100 % of its 400 calls last 0.2 s or less" in on.loc[1, "health_reason"]
+    assert on.loc[2, "health_status"] == off.loc[2, "health_status"] and "pulse" not in on.loc[2, "health_reason"]
+    assert "pulse" not in on.loc[3, "health_reason"]                          # a Count zone may pulse
+    assert sorted(per[per.condition.eq("pulse mode")].Detector) == [1, 4]
+    # configured function: det 1 configured Count (not flagged), det 3 predicted Count (configured Presence: still not
+    # flagged), det 4 not known (flagged)
+    con.execute("CREATE TABLE detectors_cfg AS SELECT d.*, CASE Detector WHEN 1 THEN 'Count' WHEN 2 THEN 'Presence' "
+                "WHEN 3 THEN 'Presence' END AS configured_function FROM detectors d")
+    cf, pc = health(con, "events", "detectors_cfg", periods=True, **kw)
+    assert sorted(pc[pc.condition.eq("pulse mode")].Detector) == [4]
+    assert "pulse" not in cf.set_index("Detector").loc[1, "health_reason"]
+
+
+def test_signal_silent_run_goes_on_across_a_logging_hole():
+    """every detector silent, with a stretch of no log at all inside it: one silence from its start to its end, not the longer
+    of the two pieces either side of the hole (10075, 2026-11-01: bars stopped at a hole with the flat zero going on after it)."""
+    ev, det = synth.make(n_signals=1, days=3, seed=2)
+    day = ev.Timestamp.min().normalize() + pd.Timedelta(days=1)
+    a, h0, h1, z = (day + pd.Timedelta(hours=x) for x in (8, 13, 15, 30))
+    is_det = ev.EventId.isin([81, 82]) & (ev.Timestamp >= a) & (ev.Timestamp < z)
+    in_hole = (ev.Timestamp >= h0) & (ev.Timestamp < h1)
+    con = duckdb.connect()
+    con.register("e_df", ev[~is_det & ~in_hole])
+    con.register("d_df", det)
+    con.execute("CREATE TABLE events AS SELECT * FROM e_df; CREATE TABLE detectors AS SELECT * FROM d_df")
+    five = pd.Timedelta(minutes=5)
+    q = hq.build("events", "detectors", None, upto="sgr", probabilities=set(hq.PROB.values()) <= set(det.columns))
+    run = con.execute(q.text("SELECT a, z, nday FROM sgr")).df()
+    assert len(run) == 1
+    win = con.execute("SELECT min(Timestamp) FROM events").fetchone()[0]
+    start, end = (pd.Timestamp(win) + run[c].iloc[0] * five for c in "az")
+    assert abs(start - a) <= five and abs(end - z) <= five, (start, end)

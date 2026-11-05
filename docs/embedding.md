@@ -10,6 +10,7 @@ from atspm_detector import predict, list_signals, OUT_COLS, EXTRA_COLS, PHASE_CO
 det = predict(events, start=None, end=None, device_ids=None, threads=4, memory="4GB",
               chunk_signals=None, batch_signals=None, min_actuations=5, min_prob=0.0)
 det, phases = predict(events, ..., return_phases=True)
+det, findings = predict(events, ..., return_findings=True)        # both: det, phases, findings
 ids = list_signals(events, start=None, end=None)        # DeviceIds present, sorted
 ```
 
@@ -46,23 +47,24 @@ ids = list_signals(events, start=None, end=None)        # DeviceIds present, sor
 ## Storing results
 
 - Key rows by `(DeviceId, Detector)` plus your own run id and window. Store `__version__` with each run; answers can change between versions.
-- `health_*` columns are a separate output. They never change a phase or function answer.
-- `health_bad_periods` is JSON text: a list of `{start, end, what, recovered}` periods, or empty text when there are none. `what` is one of `stuck on`, `count zone held ON`, `silent`, `silent at night`, `counts dropped`, `busy at night`, `too-fast actuations`, `too many for the traffic`, `spiky counts` (1.1.0; `erratic counts`, `chattering`, `erratic time ON` and `unusual daily pattern` were removed). Periods are whole 5-minute, 10-minute (spiky counts), 15-minute or 1-hour bins from the sample start (counts dropped: from the start of the first clock hour after the drop to the sample end; busy at night: 01:00-05:00 of the flagged day), clipped to the sample end; consecutive bins are merged.
-- `health_signal_note` is one line per signal, or empty: many detectors had an unusual night (a signal-wide event), and/or several detectors were held ON together with the same start and end (one common failure).
+- `health_status` and the findings table are a separate output. They never change a phase or function answer.
+- Health findings: `return_findings=True` returns the findings table of the README (one row per finding: `DeviceId`, `DetectorType`, `Detector`, `Start`, `End`, `Label`, `Confidence`, `Detail`), with the reasons, set-up notes and notes about a whole signal.
 - The health limits are `[suspect, bad]` pairs in `weights/health/health_limits.json`; a single finding is bad from the second number on.
 
 ## Detector health in SQL, on your own DuckDB connection
 
-The health checks are plain DuckDB SQL (`predict` runs the same). When the events already sit in a DuckDB database (an atspm pipeline, a
-warehouse), run the health where they are instead of copying them out:
+The health checks are plain DuckDB SQL (`predict` runs the same). When the events already sit in a DuckDB database (an atspm pipeline, for
+example), run the health where they are instead of copying them out:
 
 ```python
 import duckdb
 from atspm_detector import health, health_sql
 
 con = duckdb.connect("signals.duckdb")
-h = health(con, "events", "detectors", start=None, end=None)   # DataFrame, one row per detector
-sql = health_sql("events", "detectors")                         # the same as ONE query: con.execute(sql).df()
+f = health(con, "events", "detectors", start=None, end=None)    # the findings table, vehicle and ped
+f, s = health(con, "events", "detectors", summary=True)         # + the status table
+sql = health_sql("events", "detectors")                         # the vehicle findings as ONE query: con.execute(sql).df()
+sql_f, sql_s = health_sql("events", "detectors", summary=True)  # the two queries
 ```
 
 - `events`: `DeviceId`, `Timestamp`, `EventId`, `Parameter` (the hi-res log, local clock time). Other columns and event
@@ -71,16 +73,32 @@ sql = health_sql("events", "detectors")                         # the same as ON
   `p_yellow_red`, `p_other`, `p_mid`, `p_bike`. From a `predict` output: `phase` = `phase_guess`, `function` =
   `function_guess`, `lanes` = the number of entries in `lanes` (1 for a Bike zone), the `p_*` columns as they are.
   Without the probabilities (`health_sql(..., probabilities=False)`; `health` looks for them itself) each detector is
-  judged by its own function's limits only, never the least strict of the plausible ones.
+  judged by its own function's limits only, never the least strict of the plausible ones. Optional
+  `configured_function` (the agency's configured function: `Presence`, `Count`, `Advance`, `Yellow_Red`, ...; empty =
+  not known): the pulse-mode check (a predicted Presence detector that only pulses) then never flags a zone configured
+  as Count, Advance or Yellow_Red (`health` looks for the column itself; `health_sql(..., configured=True)`).
 - `start` / `end`: the sample window (`end` exclusive); default each signal's first event to one second past its last.
-- Returns `DeviceId`, `Detector` and the eight `health_*` columns of `predict` (same values: same checks, same limits),
-  for every detector channel with actuations in the window.
+- Returns the findings table of the README; `summary=True` also the status table, one row per detector channel with
+  actuations in the window and per calendar day. `health_status` in `predict` comes from the same checks and limits.
+- Store the events sorted by `DeviceId`, then `Timestamp`: `health` reads them once per group of signals, and an
+  unsorted file makes every group scan all of it. `options={...}` switches the vehicle rules
+  (`health_duckdb.OPTIONS` lists them with their defaults), `ped_options={...}` the ped rules (`ped_health_duckdb.OPT`).
 - Nothing is copied out of the database. `health` runs the steps as temp tables named `hq_*` (each dropped as soon as it
   is no longer needed) and groups signals so a group holds at most `max_events` events (default 4 million, about 2 GB
   peak). `health_sql` is one `WITH` query whose steps are all named `hq_*`; DuckDB takes about half a second to plan it,
   so for repeated calls prefer `health`. Table names are inserted as given.
 - Cost on one desktop CPU (4 threads, events already in DuckDB): about 0.5 s for one signal-day, 1 s for 10, 7.5 s
   for 100 (about 75 ms per signal-day in large groups; a fixed half second or so per call).
+- Many signals: `health(..., workers=N)` runs the groups in N Python processes at once (one DuckDB process uses only
+  2-3 cores on this work, however many threads it has). The connection's `threads` and `memory_limit` are shared out
+  among them; `SET threads = N` gives each worker one thread, the most work per core. The window's events are first
+  copied once into a DuckDB file under the connection's `temp_directory` (else the system temp folder), so a source on
+  a network share is read once and its order no longer matters. Each worker runs `health_duckdb.py` with the same
+  Python (`sys.executable`), without importing the rest of the package. The tables must be readable with `SELECT` from the
+  connection (tables, views or files; a registered DataFrame works too, it is copied). Same answers as `workers=1`.
+  A whole network over 3 days: `SET threads = 12; SET memory_limit = '12GB'` and `workers=12`.
+- Health kept up to date from chunks of events, and health in time bins: `atspm_detector.incremental` and `health_bins()`, in the
+  [README](https://github.com/ShawnStrasser/atspm-detector/blob/main/README.md#incremental-health). A store is a DuckDB file; a short-lived machine must keep it somewhere permanent between runs.
 
 ## atspm detector configuration
 
@@ -105,14 +123,14 @@ with SignalDataProcessor(raw_data=events, detector_config=config, bin_size=15, a
 
 Command line: `atspm-detector --events events.parquet --out detectors.csv --out-atspm detector_config.csv`.
 
-- atspm is not a dependency (it pulls pyarrow and ibis-framework, which currently requires pandas < 3). Install it yourself: `pip install atspm`. `to_atspm_config` itself needs only numpy and pandas.
-- Columns: `DeviceId`, `Phase` (int16), `Parameter` (detector channel, int16), `Function`. atspm selects these four by name and ignores any others. `Function` is matched exactly and case-sensitively.
-- Mapping: Advance -> `Advance` (arrival_on_green, platoon_ratio), Presence -> `Presence` (split_failures), Yellow_Red -> `Yellow_Red` (yellow_red), Count -> `Stopbar Count` (exported for your own joins; no atspm measure reads it). Mid, Bike and Other are left out; add them with `include=(...)`. Rename with `function_names={"Count": "Stop Bar Count"}`.
+- atspm is not a dependency. Install it yourself: `pip install "atspm>=3.0"` (older ones cannot load on DuckDB 2). `to_atspm_config` itself needs only numpy and pandas.
+- Columns: `DeviceId`, `Phase` (int16), `Parameter` (detector channel, int16), `Function`. atspm selects these four by name; of any others it reads only `DistanceFromStopBar`, `MPH` and `LatencyCorrection`, for arrival on green and platoon ratio. `Function` is matched exactly and case-sensitively.
+- Mapping: Advance -> `Advance` (arrival_on_green, platoon_ratio), Presence -> `Presence` (split_failures), Yellow_Red -> `Yellow_Red` (yellow_red), Count -> `Stopbar Count` (read only by atspm's detector_health, as a Count zone). Mid, Bike and Other are left out; add them with `include=(...)`. Rename with `function_names={"Count": "Stop Bar Count"}`.
 - Left out by default, each with a reason in `return_report=True`: detectors without an answer, `health_status` "bad" (`exclude_health=()` keeps them), and same-phase, same-function detectors on a lane that already has one (`one_per_lane=False` keeps them). Lane-by-lane detectors win over one spanning their lanes, then the higher `function_prob`. This keeps a spanning zone stacked over lane loops from counting the same vehicles twice in arrival on green. Exact duplicate rows are never written (atspm would double-count them).
-- `min_phase_prob` / `min_function_prob` leave out low-confidence answers. `device_id_dtype="int64"` casts `DeviceId` to match integer ids in your events (`predict` returns text ids; atspm's joins work either way). `extra_columns=True` adds `Lanes`, `DistanceFromStopBar` (ft), `PhaseProb`, `FunctionProb` and `HealthStatus` for your own use.
+- `min_phase_prob` / `min_function_prob` leave out low-confidence answers. `device_id_dtype="int64"` casts `DeviceId` to match integer ids in your events (`predict` returns text ids; atspm's joins work either way). `extra_columns=True` adds `Lanes`, `DistanceFromStopBar` (ft), `PhaseProb`, `FunctionProb` and `HealthStatus`; atspm 3.0 uses that distance in place of its defaults, the rest are for your own use.
 - `results` may also be the CSV written by `--out` or a parquet copy of it.
 - Not available from the log, so not in the config: approach, direction and movement (atspm does not need them), and overlap assignments (the model gives the phase only).
 
 ## Charts
 
-Optional health charts need matplotlib (`pip install "atspm-detector[charts]"`): `from atspm_detector.charts import health_chart`, then `health_chart(events, det, detector=15, path="det15.png")` draws one detector with its phase mates and the periods the health check lists. `predict` never imports matplotlib. Otherwise draw from the returned columns (and your own copy of the events) in your application.
+Optional health charts need matplotlib (`pip install "atspm-detector[charts]"`): `from atspm_detector.charts import health_chart`, then `health_chart(events, det, detector=15, path="det15.png", findings=findings)` draws one detector with its phase mates and shades its findings. `predict` never imports matplotlib. Otherwise draw from the returned columns (and your own copy of the events) in your application.

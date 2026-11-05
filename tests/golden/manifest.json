@@ -1,0 +1,395 @@
+{
+ "duckdb": "2.0.0",
+ "inputs": {
+  "sample": {
+   "events": "7922f93c4d61e2fc",
+   "detectors": "ca2375d35c89e4ca",
+   "rows": 6404
+  },
+  "synth_a": {
+   "events": "efcc27298d48d835",
+   "detectors": "e7d0c8f84a0c166a",
+   "rows": 786994
+  },
+  "synth_b": {
+   "events": "f8d2cedc69663600",
+   "detectors": "273829f7f6b82a89",
+   "rows": 263905
+  }
+ },
+ "files": {
+  "sample_veh__det.parquet": {
+   "rows": 17,
+   "dtypes": {
+    "DeviceId": "object",
+    "Detector": "int32",
+    "health_status": "object",
+    "health_score": "float64",
+    "health_reason": "object",
+    "health_categories": "object",
+    "health_config": "object",
+    "health_watch": "object",
+    "health_signal_note": "object"
+   }
+  },
+  "sample_veh__per.parquet": {
+   "rows": 0,
+   "dtypes": {
+    "DeviceId": "object",
+    "Detector": "int32",
+    "start": "datetime64[us]",
+    "end": "datetime64[us]",
+    "condition": "object",
+    "severity": "float64",
+    "limit_s": "float64",
+    "in_closure": "bool",
+    "whole_window": "bool"
+   }
+  },
+  "sample_ped__inputs.parquet": {
+   "rows": 2,
+   "dtypes": {
+    "DeviceId": "object",
+    "Input": "int64",
+    "Phase": "Int64",
+    "Type": "object",
+    "presses": "int64",
+    "status": "object",
+    "reason": "object",
+    "config": "object"
+   }
+  },
+  "sample_ped__periods.parquet": {
+   "rows": 0,
+   "dtypes": {
+    "DeviceId": "object",
+    "Detector": "object",
+    "start": "datetime64[ns]",
+    "end": "datetime64[ns]",
+    "condition": "object",
+    "severity": "float64",
+    "limit_s": "float64",
+    "in_closure": "bool",
+    "whole_window": "bool"
+   }
+  },
+  "synth_a_veh__det.parquet": {
+   "rows": 42,
+   "dtypes": {
+    "DeviceId": "object",
+    "Detector": "int32",
+    "health_status": "object",
+    "health_score": "float64",
+    "health_reason": "object",
+    "health_categories": "object",
+    "health_config": "object",
+    "health_watch": "object",
+    "health_signal_note": "object"
+   }
+  },
+  "synth_a_veh__per.parquet": {
+   "rows": 31,
+   "dtypes": {
+    "DeviceId": "object",
+    "Detector": "int32",
+    "start": "datetime64[us]",
+    "end": "datetime64[us]",
+    "condition": "object",
+    "severity": "float64",
+    "limit_s": "float64",
+    "in_closure": "bool",
+    "whole_window": "bool"
+   }
+  },
+  "synth_a_veh_win__det.parquet": {
+   "rows": 42,
+   "dtypes": {
+    "DeviceId": "object",
+    "Detector": "int32",
+    "health_status": "object",
+    "health_score": "float64",
+    "health_reason": "object",
+    "health_categories": "object",
+    "health_config": "object",
+    "health_watch": "object",
+    "health_signal_note": "object"
+   }
+  },
+  "synth_a_veh_win__per.parquet": {
+   "rows": 23,
+   "dtypes": {
+    "DeviceId": "object",
+    "Detector": "int32",
+    "start": "datetime64[us]",
+    "end": "datetime64[us]",
+    "condition": "object",
+    "severity": "float64",
+    "limit_s": "float64",
+    "in_closure": "bool",
+    "whole_window": "bool"
+   }
+  },
+  "synth_a_veh_off__det.parquet": {
+   "rows": 42,
+   "dtypes": {
+    "DeviceId": "object",
+    "Detector": "int32",
+    "health_status": "object",
+    "health_score": "float64",
+    "health_reason": "object",
+    "health_categories": "object",
+    "health_config": "object",
+    "health_watch": "object",
+    "health_signal_note": "object"
+   }
+  },
+  "synth_a_veh_off__per.parquet": {
+   "rows": 28,
+   "dtypes": {
+    "DeviceId": "object",
+    "Detector": "int32",
+    "start": "datetime64[us]",
+    "end": "datetime64[us]",
+    "condition": "object",
+    "severity": "float64",
+    "limit_s": "float64",
+    "in_closure": "bool",
+    "whole_window": "bool"
+   }
+  },
+  "synth_a_ped__inputs.parquet": {
+   "rows": 15,
+   "dtypes": {
+    "DeviceId": "object",
+    "Input": "int64",
+    "Phase": "Int64",
+    "Type": "object",
+    "presses": "int64",
+    "status": "object",
+    "reason": "object",
+    "config": "object"
+   }
+  },
+  "synth_a_ped__periods.parquet": {
+   "rows": 19,
+   "dtypes": {
+    "DeviceId": "object",
+    "Detector": "int32",
+    "start": "datetime64[ns]",
+    "end": "datetime64[ns]",
+    "condition": "object",
+    "severity": "float64",
+    "limit_s": "float64",
+    "in_closure": "bool",
+    "whole_window": "bool"
+   }
+  },
+  "synth_a_ped_assign__inputs.parquet": {
+   "rows": 15,
+   "dtypes": {
+    "DeviceId": "object",
+    "Input": "int64",
+    "Phase": "Int64",
+    "Type": "object",
+    "presses": "int64",
+    "status": "object",
+    "reason": "object",
+    "config": "object",
+    "Phases": "object",
+    "Overlaps": "object",
+    "assign_confidence": "float64"
+   }
+  },
+  "synth_a_ped_assign__periods.parquet": {
+   "rows": 19,
+   "dtypes": {
+    "DeviceId": "object",
+    "Detector": "int32",
+    "start": "datetime64[ns]",
+    "end": "datetime64[ns]",
+    "condition": "object",
+    "severity": "float64",
+    "limit_s": "float64",
+    "in_closure": "bool",
+    "whole_window": "bool"
+   }
+  },
+  "synth_a_ped_off__inputs.parquet": {
+   "rows": 15,
+   "dtypes": {
+    "DeviceId": "object",
+    "Input": "int64",
+    "Phase": "Int64",
+    "Type": "object",
+    "presses": "int64",
+    "status": "object",
+    "reason": "object",
+    "config": "object"
+   }
+  },
+  "synth_a_ped_off__periods.parquet": {
+   "rows": 68,
+   "dtypes": {
+    "DeviceId": "object",
+    "Detector": "int32",
+    "start": "datetime64[ns]",
+    "end": "datetime64[ns]",
+    "condition": "object",
+    "severity": "float64",
+    "limit_s": "float64",
+    "in_closure": "bool",
+    "whole_window": "bool"
+   }
+  },
+  "synth_a_assign__pa.parquet": {
+   "rows": 15,
+   "dtypes": {
+    "DeviceId": "object",
+    "Input": "int64",
+    "Phases": "object",
+    "Overlaps": "object",
+    "no_movement": "bool",
+    "confidence": "float64",
+    "support": "int64",
+    "low_support": "bool",
+    "top_movement": "object",
+    "top_p": "float64"
+   }
+  },
+  "synth_a_assign__cand.parquet": {
+   "rows": 75,
+   "dtypes": {
+    "DeviceId": "object",
+    "Input": "int32",
+    "kind": "object",
+    "movement": "int32",
+    "n_press": "int64",
+    "n_calls": "int64",
+    "n_walks": "int64",
+    "call1": "float64",
+    "call3": "float64",
+    "call_base": "float64",
+    "call_lift": "float64",
+    "lag_call_med": "float64",
+    "free_n": "int64",
+    "free_nocall": "float64",
+    "free_nowalk": "float64",
+    "walk120": "float64",
+    "walk_base": "float64",
+    "walk_lift": "float64",
+    "cov1": "float64",
+    "walk_cov": "float64",
+    "rank_call": "Int64",
+    "margin_call": "float64",
+    "rank_walk": "int64",
+    "margin_walk": "float64",
+    "rank_cov": "int64",
+    "n_cand": "int64",
+    "same_number": "int32",
+    "is_overlap": "int32",
+    "p": "float64"
+   }
+  },
+  "synth_a_assign__pd.parquet": {
+   "rows": 15,
+   "dtypes": {
+    "DeviceId": "object",
+    "Detector": "int32",
+    "phase_pred": "Int64",
+    "phase_prob": "float64",
+    "phase_2nd": "Int64",
+    "phase_2nd_prob": "float64",
+    "function_pred": "object",
+    "function_prob": "float64",
+    "status": "object",
+    "review_flag": "bool",
+    "n_actuations": "Int64",
+    "minutes_of_data": "float64",
+    "phase_guess": "Int64",
+    "phase_guess_prob": "float64",
+    "function_guess": "object",
+    "function_guess_prob": "float64",
+    "phase_margin": "float64",
+    "p_advance": "float64",
+    "p_presence": "float64",
+    "p_count": "float64",
+    "p_yellow_red": "float64",
+    "p_other": "float64",
+    "p_mid": "float64",
+    "p_bike": "float64",
+    "n_candidate_phases": "int64",
+    "lanes": "object",
+    "lane_conf": "float64",
+    "phase_n_lanes": "Int64",
+    "phase_n_lanes_conf": "float64",
+    "distance_ft": "float64",
+    "setback_confidence": "object",
+    "night_speed_mph": "float64",
+    "night_speed_vehicles": "Int64",
+    "health_status": "object",
+    "health_score": "float64",
+    "health_reason": "object",
+    "health_watch": "object",
+    "health_categories": "object",
+    "health_config": "object",
+    "health_signal_note": "object",
+    "review_reason": "object"
+   }
+  },
+  "synth_b_veh__det.parquet": {
+   "rows": 28,
+   "dtypes": {
+    "DeviceId": "object",
+    "Detector": "int32",
+    "health_status": "object",
+    "health_score": "float64",
+    "health_reason": "object",
+    "health_categories": "object",
+    "health_config": "object",
+    "health_watch": "object",
+    "health_signal_note": "object"
+   }
+  },
+  "synth_b_veh__per.parquet": {
+   "rows": 0,
+   "dtypes": {
+    "DeviceId": "object",
+    "Detector": "int32",
+    "start": "datetime64[us]",
+    "end": "datetime64[us]",
+    "condition": "object",
+    "severity": "float64",
+    "limit_s": "float64",
+    "in_closure": "bool",
+    "whole_window": "bool"
+   }
+  },
+  "synth_b_ped__inputs.parquet": {
+   "rows": 10,
+   "dtypes": {
+    "DeviceId": "object",
+    "Input": "int64",
+    "Phase": "Int64",
+    "Type": "object",
+    "presses": "int64",
+    "status": "object",
+    "reason": "object",
+    "config": "object"
+   }
+  },
+  "synth_b_ped__periods.parquet": {
+   "rows": 0,
+   "dtypes": {
+    "DeviceId": "object",
+    "Detector": "object",
+    "start": "datetime64[ns]",
+    "end": "datetime64[ns]",
+    "condition": "object",
+    "severity": "float64",
+    "limit_s": "float64",
+    "in_closure": "bool",
+    "whole_window": "bool"
+   }
+  }
+ }
+}

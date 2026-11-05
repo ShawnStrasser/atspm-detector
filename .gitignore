@@ -30,6 +30,8 @@ research/code/download/
 !src/atspm_detector/data/
 !src/atspm_detector/data/*.parquet
 !src/atspm_detector/reference/*.parquet
+# the answers the golden tests compare with
+!tests/golden/*.parquet
 # build output
 dist/
 build/

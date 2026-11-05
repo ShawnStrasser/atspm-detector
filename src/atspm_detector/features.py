@@ -509,10 +509,8 @@ def add_derived(df: pd.DataFrame) -> pd.DataFrame:
     df["call44_fwd_lift"] = df["call44_fwd_035"] / (0.35 * call_rate)
     df["n43_per_hour"] = df["n43_win"] / hrs
     df["n_cycles_per_hour"] = df["n_cycles"] / hrs
-    df.drop(columns=["n_on_g4", "n_on_g8", "n_on_late_green", "n_long_on",
-                     "n_call43", "n43_win", "det_occ", "green_total", "n_on15"],
-            inplace=True, errors="ignore")
-    return df
+    return df.drop(columns=["n_on_g4", "n_on_g8", "n_on_late_green", "n_long_on",
+                            "n_call43", "n43_win", "det_occ", "green_total", "n_on15"], errors="ignore")
 
 
 def add_rank_features(df: pd.DataFrame) -> pd.DataFrame:

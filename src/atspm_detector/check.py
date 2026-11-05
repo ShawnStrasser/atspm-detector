@@ -61,14 +61,11 @@ KEY = ["DeviceId", "Detector", "cand_phase"]
 CLASSES = ["Advance", "Presence", "Count", "Yellow_Red", "Mid", "Bike", "Other"]
 PHASE_EVENTS = [1, 7, 8, 9, 10, 11, 43, 44]
 STOPBAR = ("Presence", "Count", "Yellow_Red")
-HEALTH = ("ok", "watch", "suspect", "bad", "not_enough_data")
+HEALTH = ("ok", "watch", "suspect", "bad", "not_enough_data", "lane_closure", "timing_plan")
 # outputs that carry no phase number and must not move at all when the phases are renumbered
 INVARIANT = ["lanes", "lane_conf", "phase_n_lanes", "phase_n_lanes_conf", "distance_ft",
-             "setback_confidence", "night_speed_mph", "night_speed_vehicles", "health_status", "health_score",
-             "health_reason", "health_bad_periods", "health_watch", "health_categories", "health_config",
-             "health_signal_note"]
-HEALTH_TEXT = ("health_reason", "health_watch", "health_bad_periods", "health_categories", "health_config",
-               "health_signal_note", "review_reason")
+             "setback_confidence", "night_speed_mph", "night_speed_vehicles", "health_status"]
+HEALTH_TEXT = ("review_reason",)
 PROB_TOL = 1e-6          # float noise only
 PERM_SEEDS = (0, 1, 2)
 OUT_PROBS = ["phase_prob", "phase_2nd_prob", "phase_guess_prob", "phase_margin", "function_prob",
@@ -158,10 +155,6 @@ def check_new_outputs(out: pd.DataFrame, phases: pd.DataFrame) -> None:
     assert not set(ALLOWED_EVENTS) & {83, 84, 85, 86, 87, 88}, "fault events must not be read"
     assert out.health_status.notna().all(), "every detector gets a health status"
     assert out.health_status.isin(HEALTH).all(), "unknown health status"
-    hs = out.health_score.dropna()
-    assert ((hs >= 0) & (hs <= 1)).all(), "health score outside [0, 1]"
-    assert out.loc[out.health_status.eq("ok"), "health_bad_periods"].fillna("").eq("").all(), \
-        "an ok detector lists bad periods"
     ans = out[out.function_pred.notna()]
     sb = ans[ans.function_pred.isin(STOPBAR)]
     assert (sb.distance_ft == 0).all(), "a stop-bar zone must be at 0 ft"
@@ -511,13 +504,12 @@ def check_profile_ignored() -> str:
     return "profile='le2h' and DC_FAST_PROFILE=le2h: answers identical to a plain call, one FutureWarning each"
 
 
-CAT_RE = re.compile(r"^[A-Z][^();]* \((?:bad|suspect|watch)\)(?:; [A-Z][^();]* \((?:bad|suspect|watch)\))*$")
 
 
 def check_health() -> str:
-    """Health smoke test -- the shipped references load; every detector gets a status and a reason
-    that starts with its label; categories / config notes parse; a detector held ON for 12 minutes is called 'Stuck
-    on' with the period listed, and nothing else in the sample turns bad."""
+    """Health smoke test -- the shipped references load; every detector gets a status; a detector held ON for 12 minutes
+    has a 'stuck on' finding at that time, and nothing else in the sample turns bad."""
+    from . import findings as hf
     from . import health_duckdb as hq
     refs = hq._json("health_v4_refs.json")
     assert str(refs.get("version", "")).startswith("health v4d"), "health references missing or wrong"
@@ -531,8 +523,6 @@ def check_health() -> str:
     ev = read_parquet(SAMPLE)
     out = predict(ev, min_actuations=1)
     assert out.health_status.isin(HEALTH).all()
-    assert all(isinstance(t, str) and re.match(r"^det \d+: ", t) for t in out.health_reason), "reason without label"
-    assert all(c == "" or CAT_RE.match(c) for c in out.health_categories.fillna("")), "unreadable categories"
     # inject a detector held ON for 12 minutes (minutes 16-28: the sample has a comms gap at 10.5-15 min, and an ON
     # over a gap is never 'stuck'): the busiest answered Advance zone
     t = pd.to_datetime(ev.Timestamp)
@@ -546,17 +536,23 @@ def check_health() -> str:
     ev2 = ev[~(det & (t >= t0) & (t <= t1))]
     add = pd.DataFrame({"DeviceId": ev.DeviceId.iloc[0], "Timestamp": [t0, t1], "EventId": [82, 81], "Parameter": [d, d]})
     ev2 = pd.concat([ev2, add.astype({c: ev.dtypes[c] for c in add.columns if c in ev.dtypes})], ignore_index=True)
-    out2 = predict(ev2, min_actuations=1)
+    out2, per2 = predict(ev2, min_actuations=1, return_findings=True)
+    assert list(per2.columns) == hf.FINDING_COLS, "findings table columns changed"
     r = out2[out2.Detector == d].iloc[0]
     assert r.health_status in ("suspect", "bad"), f"held ON 12 min: status {r.health_status}"
-    assert "Stuck on" in r.health_categories and "stuck on" in r.health_bad_periods, "stuck ON not reported"
+    pr = per2[(per2.Detector == d) & per2.Label.eq("stuck on")]
+    assert len(pr), "stuck ON not reported"
+    assert pr.Start.min() <= t0 + _td(seconds=1) and pr.End.max() >= t1 - _td(seconds=1), "stuck ON period misplaced"
+    okd = out2.loc[out2.health_status.eq("ok"), ["DeviceId", "Detector"]].astype({"Detector": "Int64"})
+    faults = per2[per2.DetectorType.eq("Vehicle") & per2.Confidence.ge(0.5)]
+    assert faults.merge(okd, on=["DeviceId", "Detector"]).empty, "an ok detector lists a fault"
     others = out2[out2.Detector != d].merge(out[["DeviceId", "Detector", "health_status"]], on=["DeviceId", "Detector"],
                                             suffixes=("", "_0"))
     worse = others[others.health_status.eq("bad") & others.health_status_0.ne("bad")]
     assert worse.empty, f"injected stuck ON turned others bad: {worse.Detector.tolist()}"
     n_f = int(out.health_status.isin(["suspect", "bad"]).sum())
     return (f"references loaded; {len(out)} detectors ({n_f} flagged on the sample); det {d} held ON 12 min -> "
-            f"{r.health_status} ({r.health_categories})")
+            f"{r.health_status} ({', '.join(sorted(set(per2[per2.Detector == d].Label)))})")
 
 
 CHECKS = [("reproduces the stored answers", check_reproduces_reference),
