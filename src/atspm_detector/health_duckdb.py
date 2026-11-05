@@ -376,7 +376,7 @@ def _run_groups(con, q, stmts: list, drops: list, groups: list, nf: int) -> list
             con.execute(f"CREATE OR REPLACE TEMP TABLE {PREFIX}wpart AS SELECT DeviceId, s_ns, e_ns FROM "
                         f"{PREFIX}wall WHERE DeviceId IN (SELECT unnest(?))", [list(g)])
             r = _run.group(con, stmts, drops, nf)
-            res.append((r[0], r[1] if nf > 1 else None))
+            res.append((r[0], r[1] if nf > 1 else None) + tuple(r[2:]))
     finally:
         for n, _, _ in q.ctes:
             con.execute(f"DROP TABLE IF EXISTS {PREFIX}{n}")

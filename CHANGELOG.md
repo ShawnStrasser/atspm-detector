@@ -23,6 +23,7 @@ Phase, function, lanes, setback and night speed are unchanged.
 - `judge()` returns `HealthResult(findings, status, q15, active, bins)`. Judged at T with horizon H on events from T - H on, it equals `health(start=T - H, end=T, bin_origin="clock", summary=True)`, for any cutting of the events.
 - `outputs=("tables", "15min")` adds `q15`; `"active"` adds `active`, not yet reviewed. A store written by an incompatible version of the package is refused.
 - New `bin_origin` of `health()` / `health_sql()`: `"window"` (default) or `"clock"` (the window starts on the quarter-hour at or before its start).
+- New `atspm_detector.live`: a run every 15 minutes writes its own bins, the first run past a midnight also runs the whole check and adds what it finds in the previous day, and state is two tables, not a store file. Midnight comes from event stamps only. `judge_rows(limits=True)` adds `r.limits`, which the per-run rules read.
 
 **Health in time bins**
 

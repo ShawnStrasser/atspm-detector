@@ -101,9 +101,15 @@ class JudgeRows:
     ped_periods: pd.DataFrame | None = None
     windows: pd.DataFrame | None = None
     ped_windows: pd.DataFrame | None = None
+    limits: pd.DataFrame | None = None
 
     def __getitem__(self, i):
         return (self.detectors, self.periods)[i]
+
+
+LIMITS_FINAL = """SELECT w.DeviceId, l.det, l.lim_stuck, l.bad_stuck, l.lim_dropout, l.bad_dropout, l.lim_rapid, l.bad_rapid, l.lim_volume, l.bad_volume,
+       1.0 AS share
+FROM limits l JOIN win w USING (dev)"""
 
 
 def _check_name(store: str) -> str:
@@ -479,7 +485,7 @@ def judge(con, detectors_table: str, *, store: str = "health_store", end=None, h
 
 def judge_rows(con, detectors_table: str, *, store: str = "health_store", end=None, horizon_days=None, options: dict | None = None,
                periods: bool = True, max_events: int | None = 4_000_000, ped: bool | None = None, ped_options: dict | None = None,
-               ped_assign: bool = False, ped_max_events: int | None = 3_000_000, workers: int = 1) -> JudgeRows:
+               ped_assign: bool = False, ped_max_events: int | None = 3_000_000, workers: int = 1, limits: bool = False) -> JudgeRows:
     """The per-detector rows judge() makes its tables from: health_duckdb.health()'s (detectors, periods; with periods=False the
     detectors only) and with ped on ped_health_duckdb.ped_health()'s (ped, ped_periods), with the windows they cover."""
     _check_name(store)
@@ -492,19 +498,23 @@ def judge_rows(con, detectors_table: str, *, store: str = "health_store", end=No
     try:
         windows = con.execute(f'SELECT DeviceId, make_timestamp(s_ns::BIGINT // 1000) AS "start", '
                               f'make_timestamp(e_ns::BIGINT // 1000) AS "end" FROM {P}wall').df()
-        stmts, drops = q.script([H.FINAL, H.PERIODS_FINAL] if periods else [H.FINAL])
-        nf = 2 if periods else 1
+        finals = ([H.FINAL, H.PERIODS_FINAL] if periods else [H.FINAL]) + ([LIMITS_FINAL] if limits else [])
+        stmts, drops = q.script(finals)
+        nf = len(finals)
         if job and len(groups) > 1:
             res = _run.parallel(con, groups, None, detectors_table, (stmts, drops), nf, workers, store=store, store_tables=JUDGE_TABLES)
         else:
             if job:     # one group: this process, on the store's own rows
                 q, groups = _judge_plan(con, detectors_table, store, start, end, opt, periods, max_events)
-                stmts, drops = q.script([H.FINAL, H.PERIODS_FINAL] if periods else [H.FINAL])
+                stmts, drops = q.script(finals)
             res = H._run_groups(con, q, stmts, drops, groups, nf)
     finally:
         con.execute(f"DROP TABLE IF EXISTS {P}wall")
     out = H._frames(res, periods)
     r = JudgeRows(*out, windows=windows) if periods else JudgeRows(out, windows=windows)
+    if limits:
+        parts = [x[-1] for x in res if len(x) > 2 and x[-1] is not None]
+        r.limits = pd.concat(parts, ignore_index=True) if parts else None
     if with_ped:
         log = f"{store}.health_ped_events"
         p = PH.judge_log(con, log, start, end, periods, ped_max_events, ped_options, ped_assign, store=f"{store}.")

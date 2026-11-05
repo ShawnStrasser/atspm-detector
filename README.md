@@ -346,6 +346,23 @@ For a dashboard, the plain average of a detector over a period is its sum of `Sc
 | Ped button, 3 days | under 0.05 % | to under 0.5 % | from 0.5 % |
 | Ped button, 7 days | under 0.02 % | to under 0.2 % | from 0.2 % |
 
+### Health every run, state as tables
+
+`atspm_detector.live` keeps a run every 15 minutes writing its own bins, with what the next run needs held in two tables and no store file. atspm's `detector_health` uses it.
+
+```python
+from atspm_detector import live
+found, checked = live.live_run(con, "raw_data", "detectors", state=last_state, history="rows_folder", horizon_days=3, workers=4, clock_ahead_minutes=60)
+# tables hl_final (rows to write), hl_state (the next run's state), hl_rows (add to history)
+```
+
+- **Each bin the run reaches** gets rows from the rules that can answer at its end: vehicle stuck on (held the detector's limit and 30 minutes), too-fast actuations (only detectors the last check rated too fast), too many for the traffic, ped stuck on and ped long hold.
+- **The first run past a midnight** also runs the whole check on the last `horizon_days` and adds what it finds in the day that just ended (`found`: its findings, `checked`: its time). The limits for the per-run rules come from this check, so first runs write nothing until the first one, at the first midnight after a complete day.
+- **Midnight is from event stamps only**: 9 in 10 of the signals heard from in the day before it are past it, or the run is `clock_ahead_minutes` past it. Until then the run stops at midnight, with later events in the state and later bins waiting.
+- **`state`**: a DataFrame, or a parquet or CSV path; `''` is a first run; a missing path raises. **`history`**: a folder or glob, or a function giving one, read only by a check and cast to the listed types. A run the state lists whose rows are missing raises before the check, and rows of runs it does not list (a failed attempt) are ignored.
+- **`live.empty_run(con, state)`** is a run with no events: no rows, in all columns, and the state as it was.
+- A long run is the same steps in a row, so it writes what the same events cut into 15-minute runs write.
+
 ## Which phases each ped input calls
 
 `ped_assignments(con, "events")` reads, from the same ped events, which phases and ped overlaps each ped input calls

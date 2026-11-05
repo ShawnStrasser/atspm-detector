@@ -160,7 +160,7 @@ def _worker(jd: str, k: int):
         src = f"(SELECT DeviceId, Timestamp, EventId, Parameter FROM {PREFIX}job.ev WHERE g = {i})"
         stmts = [re.sub(rf"\b{PREFIX}events\b", src, st) for st in J["stmts"]]
         r = group(con, stmts, J["drops"], J["nf"])
-        r = (r[0], r[1] if len(r) > 1 else None)
+        r = (r[0], r[1] if len(r) > 1 else None) + tuple(r[2:])
         with open(f"{jd}/r{i}.tmp", "wb") as f:
             pickle.dump(r, f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(f"{jd}/r{i}.tmp", f"{jd}/r{i}.pkl")
