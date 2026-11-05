@@ -26,8 +26,20 @@ from atspm_detector import predict
 
 events = pd.read_parquet("events.parquet")
 results = predict(events)
-results[["Detector", "phase_pred", "function_pred", "lanes", "distance_ft", "health_status"]].head()
+results[["Detector", "phase_pred", "phase_prob", "function_pred", "function_prob",
+         "lanes", "distance_ft", "health_status"]].round(2).head()
 ```
+
+```text
+   Detector  phase_pred  phase_prob function_pred  function_prob lanes  distance_ft    health_status
+0         2           2        0.99       Advance           0.90     2        164.0               ok
+1         3           2        1.00       Advance           0.64   1,2        153.0               ok
+2         4           2        1.00      Presence           0.40   1,2          0.0               ok
+3         5           2        1.00       Advance           0.53     1        152.0               ok
+4         6        <NA>         NaN           NaN            NaN   NaN          NaN  not_enough_data
+```
+
+From the bundled 30-minute sample; detector 6 had one actuation, too few to judge.
 
 One row per detector: phase and function (each with a probability), lanes, setback in ft, and `health_status`
 (ok / watch / suspect / bad / not_enough_data / lane_closure / timing_plan). Under 5 actuations there is no answer.
@@ -49,6 +61,19 @@ Each detector gets a status and findings in plain words, judged against what is 
 30 minutes to 92 days. Checks: stuck on, counts fall, misses vehicles at night, busy at night, too fast / too many,
 spiky counts, no daily pattern, counts too high. Lane closures and timing plans are reported, not counted as faults.
 Ped push buttons are judged the same way. Not field-verified.
+
+```python
+results, findings = predict(events, return_findings=True)
+findings.head()
+```
+
+```text
+                               DeviceId DetectorType  Detector               Start                     End            Label  Confidence                       Detail
+0  d2d0de72-c8aa-45ca-ae1a-8fc626c5afc9      Vehicle         6 2026-10-06 12:00:00 2026-10-06 12:30:00.900  not_enough_data         0.0  too few actuations to judge
+```
+
+One row per finding. On a real log a fault reads, for example, `Label` stuck on with `Detail` "held ON 3 times, 5 h in
+total". Give a day or more of log for the full set of checks.
 
 ![Stuck on: a Presence detector held ON three times in one day](https://raw.githubusercontent.com/ShawnStrasser/atspm-detector/main/docs/images/health_stuck_on.png)
 
