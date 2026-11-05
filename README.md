@@ -356,7 +356,7 @@ found, checked = live.live_run(con, "raw_data", "detectors", state=last_state, h
 # tables hl_final (rows to write), hl_state (the next run's state), hl_rows (add to history)
 ```
 
-- **Each bin the run reaches** gets rows from the rules that can answer at its end: vehicle stuck on (held the detector's limit and 30 minutes), too-fast actuations (only detectors the last check rated too fast), too many for the traffic, ped stuck on and ped long hold.
+- **Each bin the run reaches** gets rows from the rules that can answer at its end: vehicle stuck on (held the detector's limit), too-fast actuations (only detectors the last check rated too fast), too many for the traffic, ped stuck on and ped long hold.
 - **The first run past a midnight** also runs the whole check on the last `horizon_days` and adds what it finds in the day that just ended (`found`: its findings, `checked`: its time). The limits for the per-run rules come from this check, so first runs write nothing until the first one, at the first midnight after a complete day.
 - **Midnight is from event stamps only**: 9 in 10 of the signals heard from in the day before it are past it, or the run is `clock_ahead_minutes` past it. Until then the run stops at midnight, with later events in the state and later bins waiting.
 - **`state`**: a DataFrame, or a parquet or CSV path; `''` is a first run; a missing path raises. **`history`**: a folder or glob, or a function giving one, read only by a check and cast to the listed types. A run the state lists whose rows are missing raises before the check, and rows of runs it does not list (a failed attempt) are ignored.

@@ -27,7 +27,6 @@ DAY = pd.Timedelta(days=1)
 LIMIT_CODES = {"lim_stuck": 9501, "bad_stuck": 9502, "lim_rapid": 9505, "bad_rapid": 9506, "lim_volume": 9507, "bad_volume": 9508, "fast_known": 9511}
 BINS_THROUGH, LAST_CHECK, FIRST_DAY, TRIMMED, RUN_ID, VERSION, PEND = 9602, 9603, 9604, 9601, 9605, 9606, 9700
 PON_WALKS, PON_GREENS, INPUT_PHASE, INPUT_FLAGS = 9233, 9234, 9520, 9521
-STUCK_FLOOR_S = 1800        # a hold writes its first row at its limit and this long: a row cannot be taken back, and shorter holds are often queues
 TS9, I4, I8, I2, F8, TXT = "TIMESTAMP_NS", "INTEGER", "BIGINT", "SMALLINT", "DOUBLE", "VARCHAR"
 ROW_COLUMNS = {"Tbl": TXT, "DeviceId": None, "TimeStamp": TS9, "Events": I4, "First_Event": TS9, "Last_Event": TS9, "Detector": I8, "Chain_Tag": TS9, "Piece_Phase": I4, "Piece_Tag": TS9, "Piece_Kind": I2,
                "Starts": I4, "Fast_Starts": I4, "Chatter_Starts": I4, "Starts_GY": I4, "Fast_Starts_R2": I4, "Chatter_Starts_R2": I4, "Relogged_Ons": I4, "Stray_Offs": I4, "Closing_Offs": I4,
@@ -113,7 +112,7 @@ def _live_step(con, T, detectors):
     has = con.execute("SELECT count(*) FROM hl_limits").fetchall()[0][0] > 0
     parts = []
     if has:
-        # stuck on: a chain still open at the bin's end, or closed in it, held for its limit and STUCK_FLOOR_S so far.  Not over a comms gap, and the signal logged in the bin.
+        # stuck on: a chain still open at the bin's end, or closed in it, held for its limit so far.  Not over a comms gap, and the signal logged in the bin.
         x = f"(epoch(least(h.f, {Z})) - epoch(h.s))"
         c = _conf(x, "l.lim_stuck", "l.bad_stuck")
         parts.append(f"""SELECT h.DeviceId, 'Vehicle' AS DetectorType, h.det::BIGINT AS Detector, 'stuck on' AS Label,
@@ -128,7 +127,7 @@ def _live_step(con, T, detectors):
                   UNION ALL SELECT DeviceId, Channel, StartTime::TIMESTAMP, EndTime::TIMESTAMP FROM {s}health_intervals WHERE Kind = 'long_on' AND EndTime >= {A} AND EndTime < {Z}) h
             JOIN (SELECT DISTINCT DeviceId FROM {s}health_signal_5min WHERE TimeStamp >= {A} AND TimeStamp < {Z} AND Events > 0) USING (DeviceId)
             JOIN hl_limits l ON l.DeviceId = h.DeviceId AND l.det = h.det
-            WHERE {x} >= greatest(l.lim_stuck, {STUCK_FLOOR_S}) AND least(h.f, {Z}) > greatest(h.s, {A}) GROUP BY ALL""")
+            WHERE {x} >= l.lim_stuck AND least(h.f, {Z}) > greatest(h.s, {A}) GROUP BY ALL""")
         # too fast: a detector the last check rated too fast, at its limit in this bin
         vf = _sc("xr", "1.0", "bx")
         cf = _conf(vf, "0.35", "0.75")

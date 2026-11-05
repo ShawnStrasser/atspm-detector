@@ -338,11 +338,11 @@ def of(rows, kind, detector, label):
     return rows[(rows.DetectorType == kind) & (rows.Detector == detector) & (rows.Label == label)]
 
 
-def test_vehicle_stuck_on_waits_for_30_minutes_then_each_bin_has_its_row(tmp_path):
+def test_vehicle_stuck_on_each_bin_from_its_limit_has_its_row(tmp_path):
     ev = with_events(beat("S1", BASE, BASE + 4 * Q), "S1", (BASE, 82, 9))
     runs = bins_in_turn(ev, marks(), tmp_path, 4)
     rows = [of(r, "Vehicle", 9, "stuck on") for r in runs]
-    assert [len(r) for r in rows] == [0, 1, 1, 1]        # held 30 minutes at the end of the second bin, still open at each run's end
+    assert [len(r) for r in rows] == [1, 1, 1, 1]        # past its 300 s limit in the first bin, still open at each run's end
     assert rows[2].TimeStamp.iloc[0] == BASE + 2 * Q and rows[2].Score.iloc[0] > 0
 
 
