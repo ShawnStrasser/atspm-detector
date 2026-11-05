@@ -33,7 +33,11 @@ def _values_equal(got, f):
     gold = G.values(G.read_pq(os.path.join(G.GOLD, f)))
     assert list(gold) == list(got.columns), f
     for c, v in G.values(got).items():
-        assert v == gold[c], (f, c)
+        if v != gold[c] and all(isinstance(x, float) for x in v + gold[c]):
+            # the ped movement model's probabilities can differ in the last bit across platforms (onnxruntime)
+            assert v == pytest.approx(gold[c], rel=1e-12, abs=1e-15, nan_ok=True), (f, c)
+        else:
+            assert v == gold[c], (f, c)
 
 
 CASES = list(G.cases(*MODS["oracle"]))
