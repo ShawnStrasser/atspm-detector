@@ -2,17 +2,11 @@
 
     pytest tests/test_atspm_export.py
 
-The contract and option tests need only this package.  The end-to-end tests run atspm's measures on the bundled sample
-with the exported config; they are skipped when atspm is not installed (`pip install atspm`).  The comparison with
-atspm's own sample data runs only when ATSPM_SAMPLES points to an atspm source tree (the folder holding src/atspm and
-tests/).
+A schema check of the output (columns, types, values) and its options; none needs atspm. The end-to-end run of
+atspm's measures on this output lives in atspm's own tests.
 """
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -26,74 +20,6 @@ ATSPM_FUNCTIONS = {"Advance", "Presence", "Yellow_Red", "Count"}
 @pytest.fixture(scope="module")
 def sample_pred():
     return dc.predict(SAMPLE)
-
-
-@pytest.fixture(scope="module")
-def atspm():
-    return pytest.importorskip("atspm")
-
-
-# ------------------------------------------------------------------ helpers (atspm side)
-def run_atspm(events: pd.DataFrame, config: pd.DataFrame, extra=()):
-    from atspm import SignalDataProcessor
-    import atspm as _a
-    aggs = [{"name": "has_data", "params": {}},
-            {"name": "actuations", "params": {}},
-            {"name": "arrival_on_green", "params": {"latency_offset_seconds": 0, "spillback_on_seconds": None}},
-            {"name": "split_failures", "params": {"red_time": 5, "red_occupancy_threshold": 0.80,
-                                                  "green_occupancy_threshold": 0.80, "by_approach": True,
-                                                  "by_cycle": False}},
-            {"name": "yellow_red", "params": {"latency_offset_seconds": 0}}]
-    if (Path(_a.__file__).parent / "queries" / "platoon_ratio.sql").exists():      # atspm 2.5 and newer
-        aggs.append({"name": "platoon_ratio", "params": {}})
-    aggs += list(extra)
-    p = SignalDataProcessor(raw_data=events, detector_config=config, bin_size=15, remove_incomplete=False,
-                            verbose=0, aggregations=aggs)
-    p.load()
-    p.aggregate()
-    tabs = {a["name"]: p.conn.query(f"SELECT * FROM {a['name']}").df() for a in aggs}
-    p.conn.close()
-    return tabs
-
-
-def atspm_events(path) -> pd.DataFrame:
-    ev = read_parquet(path)
-    ev.columns = ["TimeStamp" if c.lower() == "timestamp" else c for c in ev.columns]
-    return ev[["TimeStamp", "DeviceId", "EventId", "Parameter"]]
-
-
-def aog_by_hand(ev: pd.DataFrame, config: pd.DataFrame) -> pd.DataFrame:
-    """Share of Advance ON events arriving while their phase shows green (last of events 1 / 8 / 10 before it = 1).
-    atspm 3.0 and newer moves each ON to the stop bar first (by the config's distance, else its defaults, 220 ft
-    on phases 2 and 6, else 120 ft, at 35 MPH), and leaves out arrivals past the end of its results."""
-    ev = ev.assign(DeviceId=ev.DeviceId.astype(str), EventId=ev.EventId.astype("int64"),
-                   Parameter=ev.Parameter.astype("int64"))
-    adv = config[config.Function.eq("Advance")].assign(DeviceId=lambda x: x.DeviceId.astype(str),
-                                                       Parameter=lambda x: x.Parameter.astype("int64"))
-    on = ev[ev.EventId.eq(82)].merge(adv, on=["DeviceId", "Parameter"])
-    import atspm as _a
-    if (Path(_a.__file__).parent / "queries" / "arrival_projection.sql").exists():      # atspm 3.0 and newer
-        dist = on.Phase.astype(int).isin([2, 6]).map({True: 220.0, False: 120.0})
-        if "DistanceFromStopBar" in on:                                  # the distance found, where there is one
-            d = pd.to_numeric(on.DistanceFromStopBar, errors="coerce")
-            dist = d.where(np.isfinite(d) & (d >= 0), dist)
-        ms = (dist / (35 * 1.467) * 1000).round()
-        on = on.assign(TimeStamp=pd.to_datetime(on.TimeStamp) + pd.to_timedelta(ms, unit="ms"))
-        last = pd.to_datetime(ev.TimeStamp).max()
-        bin_end = last.floor("15min") + pd.Timedelta(minutes=15)
-        end = bin_end if bin_end - last <= pd.Timedelta(seconds=1) else last + pd.Timedelta(milliseconds=1)
-        on = on[on.TimeStamp < end]
-    ph = ev[ev.EventId.isin([1, 8, 10])].rename(columns={"Parameter": "Phase", "EventId": "state"})
-    ph = ph.assign(Phase=ph.Phase.astype(int))
-    rows = []
-    for (dv, p), g in on.groupby(["DeviceId", "Phase"]):
-        s = ph[(ph.DeviceId == dv) & (ph.Phase == p)].sort_values(["TimeStamp", "state"])
-        ts = s.TimeStamp.astype("datetime64[ns]").to_numpy().astype("int64")
-        tg = g.TimeStamp.astype("datetime64[ns]").to_numpy().astype("int64")
-        k = np.searchsorted(ts, tg, side="right") - 1                     # last phase event at or before the ON
-        st = np.where(k >= 0, s.state.to_numpy()[np.clip(k, 0, None)], 0)
-        rows.append({"DeviceId": dv, "Phase": int(p), "n": len(g), "green": int((st == 1).sum())})
-    return pd.DataFrame(rows, columns=["DeviceId", "Phase", "n", "green"])
 
 
 # ------------------------------------------------------------------ 1. contract (no atspm needed)
@@ -192,92 +118,12 @@ def test_empty_and_errors(sample_pred):
         dc.to_atspm_config(sample_pred.drop(columns=["phase_pred"]))
 
 
-# ------------------------------------------------------------------ 2. end to end with atspm (skipped without it)
-def test_end_to_end_bundled(sample_pred, atspm):
-    cfg = dc.to_atspm_config(sample_pred)
-    ev = atspm_events(SAMPLE)
-    t = run_atspm(ev, cfg)
-    aog, sf, act = t["arrival_on_green"], t["split_failures"], t["actuations"]
-    assert len(aog) > 0
-    assert set(aog.Phase.astype(int)) == set(cfg.Phase[cfg.Function.eq("Advance")].astype(int))
-    assert aog.Percent_AOG.between(0, 1).all()
-    hand = aog_by_hand(ev, cfg)
-    a = (aog.assign(green=aog.Percent_AOG * aog.Total_Actuations).groupby("Phase")
-         .agg(n=("Total_Actuations", "sum"), green=("green", "sum")).reset_index())
-    m = a.merge(hand, on="Phase", suffixes=("_atspm", "_hand"))
-    print("\nAOG atspm vs by hand:\n" + m.round(3).to_string())
-    assert len(m) == len(a) and (m.n_atspm == m.n_hand).all()
-    assert np.allclose(m.green_atspm / m.n_atspm, m.green_hand / m.n_hand, atol=1e-6)
-    assert len(sf) > 0
-    assert set(sf.Phase.astype(int)) <= set(cfg.Phase[cfg.Function.eq("Presence")].astype(int))
-    for c in ("Green_Occupancy", "Red_Occupancy"):
-        assert sf[c].between(0, 1).all()
-    assert (sf.Green_Time > 0).all() and (sf.Split_Failure >= 0).all()
-    tot = act.groupby("Detector").Total.sum()
-    nact = sample_pred.set_index("Detector").n_actuations.astype(int)
-    assert (tot.reindex(nact.index).fillna(0).astype(int) == nact).all()
-    assert ("Yellow_Red" in set(cfg.Function)) == (len(t["yellow_red"]) > 0)
-    if "platoon_ratio" in t:
-        assert len(t["platoon_ratio"]) > 0 and (t["platoon_ratio"].Platoon_Ratio > 0).all()
-
-
-def test_end_to_end_options(sample_pred, atspm):
-    ev = atspm_events(SAMPLE)
-    t = run_atspm(ev, dc.to_atspm_config(sample_pred, extra_columns=True))       # atspm ignores the extras
-    assert len(t["arrival_on_green"]) > 0
-    t = run_atspm(ev, dc.to_atspm_config(sample_pred, device_id_dtype="string"))
-    assert len(t["arrival_on_green"]) > 0
-    t = run_atspm(ev, dc.to_atspm_config(sample_pred.iloc[0:0]))                 # empty config: measures empty
-    assert len(t["arrival_on_green"]) == 0 and len(t["actuations"]) > 0
-
-
-def test_atspm_reads_distance_and_count_zones(atspm):
-    """arrival_on_green moves an arrival by the distance; left_turn_gaps reads a zone named Count."""
-    t0 = pd.Timestamp("2026-09-01 08:00:00")
-    pred = pd.DataFrame({"DeviceId": ["A", "A", "A"], "Detector": [1, 2, 3], "phase_pred": [2, 2, 4], "function_pred": ["Advance", "Count", "Advance"],
-                         "phase_prob": 0.9, "function_prob": 0.9, "distance_ft": [513.45, 0.0, np.nan]})
-    cfg = dc.to_atspm_config(pred)
-    assert list(cfg.columns) == ["DeviceId", "Phase", "Parameter", "Function", "DistanceFromStopBar"]
-    assert cfg.set_index("Parameter").Function.to_dict() == {1: "Advance", 2: "Count", 3: "Advance"}
-    assert cfg.set_index("Parameter").DistanceFromStopBar.iloc[0] == 513.45 and np.isnan(cfg.set_index("Parameter").DistanceFromStopBar[3])
-    rows = []
-    for m in range(0, 60):
-        t = t0 + pd.Timedelta(minutes=m)
-        # Phase 2 green from 30 to 50 s. The on at 25 s reaches the stop bar 10 s later, at 35 s, on green, with 513.45 ft at 35 MPH
-        rows += [(t, 10, 2), (t + pd.Timedelta(seconds=25), 82, 1), (t + pd.Timedelta(seconds=26), 81, 1), (t + pd.Timedelta(seconds=30), 1, 2),
-                 (t + pd.Timedelta(seconds=32), 82, 2), (t + pd.Timedelta(seconds=33), 81, 2), (t + pd.Timedelta(seconds=50), 8, 2), (t + pd.Timedelta(seconds=54), 10, 2),
-                 (t + pd.Timedelta(seconds=55), 1, 1), (t + pd.Timedelta(seconds=56), 8, 1), (t + pd.Timedelta(seconds=57), 10, 1), (t + pd.Timedelta(seconds=58), 82, 2), (t + pd.Timedelta(seconds=58.5), 81, 2)]
-    ev = pd.DataFrame(rows, columns=["TimeStamp", "EventId", "Parameter"]).assign(DeviceId="A")[["TimeStamp", "DeviceId", "EventId", "Parameter"]]
-    with atspm.SignalDataProcessor(raw_data=ev, detector_config=cfg, bin_size=15, verbose=0,
-                                   aggregations=[{"name": "has_data", "params": {}}, {"name": "arrival_on_green", "params": {}}, {"name": "left_turn_gaps", "params": {}}]) as p:
-        p.load()
-        p.aggregate()
-        aog = p.conn.execute("SELECT Phase, SUM(Percent_AOG * Total_Actuations) / SUM(Total_Actuations) FROM arrival_on_green GROUP BY 1").fetchall()
-        gaps = p.conn.execute("SELECT COUNT(*) FROM left_turn_gaps").fetchone()[0]
-    assert dict(aog)[2] == pytest.approx(1.0)  # with the default 220 ft it reaches the bar at 29.3 s, on red: 0
-    assert gaps > 0
-
-
-SAMPLES = [("src/atspm/data/sample_raw_data.parquet", "src/atspm/data/sample_config.parquet"),
-           ("tests/hires_test_data.parquet", "tests/configs_test_data.parquet")]
-
-
-@pytest.mark.parametrize("raw,cfgp", SAMPLES, ids=["atspm_sample_data", "atspm_test_data"])
-def test_atspm_samples(raw, cfgp, atspm):
-    root = os.environ.get("ATSPM_SAMPLES")
-    if not root or not (Path(root) / raw).exists():
-        pytest.skip("set ATSPM_SAMPLES to an atspm source tree to compare with its shipped configs")
-    raw, cfgp = Path(root) / raw, Path(root) / cfgp
-    ev = atspm_events(raw)
-    pred = dc.predict(ev.rename(columns={"TimeStamp": "Timestamp"}))
-    ours = dc.to_atspm_config(pred, device_id_dtype=ev.DeviceId.dtype)
-    theirs = read_parquet(cfgp)
-    t1 = run_atspm(ev, ours)
-    for k in ("arrival_on_green", "split_failures", "yellow_red"):
-        assert len(t1[k]) > 0, f"{k} empty with the exported config"
-    used = theirs[theirs.Function.isin(["Advance", "Presence", "Yellow_Red"])]
-    j = used.merge(ours, on=["DeviceId", "Parameter"], how="left", suffixes=("", "_ours"))
-    same = (j.Phase == j.Phase_ours) & (j.Function == j.Function_ours)
-    print(f"\n{raw.name}: shipped config rows read by atspm {len(used)}, same phase + function {int(same.sum())}")
-    assert t1["arrival_on_green"].Percent_AOG.between(0, 1).all()
-    assert t1["split_failures"].Red_Occupancy.between(0, 1).all()
+def test_distance_and_count_columns():
+    """Distance is exported as DistanceFromStopBar (NaN where unknown); a Count zone keeps the name Count."""
+    pred = pd.DataFrame({"DeviceId": ["A", "A", "A"], "Detector": [1, 2, 3], "phase_pred": [2, 2, 4],
+                         "function_pred": ["Advance", "Count", "Advance"], "phase_prob": 0.9, "function_prob": 0.9,
+                         "distance_ft": [513.45, 0.0, float("nan")]})
+    cfg = dc.to_atspm_config(pred).set_index("Parameter")
+    assert list(dc.to_atspm_config(pred).columns) == ["DeviceId", "Phase", "Parameter", "Function", "DistanceFromStopBar"]
+    assert cfg.Function.to_dict() == {1: "Advance", 2: "Count", 3: "Advance"}
+    assert cfg.DistanceFromStopBar[1] == 513.45 and pd.isna(cfg.DistanceFromStopBar[3])

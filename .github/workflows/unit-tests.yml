@@ -66,13 +66,6 @@ jobs:
     - name: Run tests
       run: pytest -n auto --junitxml=pytest-results.xml
 
-    # End to end with the atspm package (not a dependency: installed here only).
-    - name: atspm end to end
-      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
-      run: |
-        pip install "atspm>=3.0"
-        pytest tests/test_atspm_export.py -rs
-
     # Installs the wheel just built into a fresh virtual environment and runs the CLI and the check there.
     - name: Fresh-venv install of the built wheel
       if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.14'
