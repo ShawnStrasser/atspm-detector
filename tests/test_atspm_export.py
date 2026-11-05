@@ -37,9 +37,9 @@ def atspm():
 def run_atspm(events: pd.DataFrame, config: pd.DataFrame, extra=()):
     from atspm import SignalDataProcessor
     import atspm as _a
-    aggs = [{"name": "has_data", "params": {"no_data_min": 5, "min_data_points": 3}},
+    aggs = [{"name": "has_data", "params": {}},
             {"name": "actuations", "params": {}},
-            {"name": "arrival_on_green", "params": {"latency_offset_seconds": 0}},
+            {"name": "arrival_on_green", "params": {"latency_offset_seconds": 0, "spillback_on_seconds": None}},
             {"name": "split_failures", "params": {"red_time": 5, "red_occupancy_threshold": 0.80,
                                                   "green_occupancy_threshold": 0.80, "by_approach": True,
                                                   "by_cycle": False}},
