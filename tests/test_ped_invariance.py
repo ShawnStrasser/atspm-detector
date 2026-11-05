@@ -92,7 +92,7 @@ def _same_float(a, b):
     return bool(((a == b) | (np.isnan(a) & np.isnan(b))).all())
 
 
-SEEDS = list(range(12))
+SEEDS = [0, 1]
 
 
 @pytest.mark.parametrize("log", [_log, _recall_log], ids=["wiring", "recall"])

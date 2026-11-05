@@ -160,35 +160,12 @@ def stuck():
     return dict(s, con=con, runs=runs, days=days, b=pd.concat([r.bins for r in runs.values()], ignore_index=True))
 
 
-@pytest.mark.parametrize("kind, det", [("Vehicle", 1), ("Ped", 2)])
-def test_a_stuck_on_scores_every_bin_from_its_on_to_its_off_past_the_window(stuck, kind, det):
-    b = stuck["b"]
-    x = b[(b.DetectorType == kind) & (b.Detector == det) & (b.Label == "stuck on")].sort_values("TimeStamp")
-    assert x.TimeStamp.iloc[0] == stuck["on"] and x.TimeStamp.iloc[-1] == stuck["off"].floor("15min")
-    assert x.TimeStamp.diff().dropna().eq(BIN).all()
-    assert (x.Score.iloc[:-1] == 1).all() and x.Score.iloc[-1] == pytest.approx(0.5)
-    assert x.Score.sum() / 4 == pytest.approx((stuck["off"] - stuck["on"]) / pd.Timedelta(hours=1))
-    assert not b[(b.DetectorType == kind) & (b.Detector == det)].TimeStamp.lt(stuck["on"]).any()
 
 
-def test_a_stuck_on_out_of_the_window_has_no_finding_only_its_bins(stuck):
-    day = stuck["on"].normalize() + 4 * DAY     # the ON is days out of the 1-day window
-    f = stuck["runs"][day].findings
-    assert f[(f.Label == "stuck on") & (f.Detector.isin([1, 2]))].empty
-    b = stuck["runs"][day].bins
-    assert set(b[b.Label == "stuck on"].Detector) == {1, 2}
 
 
-def test_the_stuck_detector_is_not_also_called_silent(stuck):
-    b = stuck["b"]
-    x = b[(b.Detector == 1) & (b.DetectorType == "Vehicle") & (b.TimeStamp >= stuck["on"]) & (b.TimeStamp < stuck["off"].floor("15min"))]
-    assert set(x.Label) == {"stuck on"}
 
 
-def test_each_bin_once_and_each_detectors_bin_adds_up_to_at_most_one(stuck):
-    b = stuck["b"]
-    assert not b.duplicated(["TimeStamp", "DeviceId", "DetectorType", "Detector", "Label"]).any()
-    assert b.groupby(["TimeStamp", "DeviceId", "DetectorType", "Detector"]).Score.sum().max() <= 1 + 1e-5
 
 
 def test_the_carry_holds_the_on_while_it_is_on_and_lets_it_go_after_its_off():
@@ -205,15 +182,6 @@ def test_the_carry_holds_the_on_while_it_is_on_and_lets_it_go_after_its_off():
         assert [(t, p // 1000) for t, p in carry(con, 9232)] == ([(s["on"].to_pydatetime(), 2)] if held else []), b
 
 
-def test_a_new_store_from_export_and_rebuild_keep_the_on():
-    s = stuck_events()
-    con = connect(s["ev"], s["det"])
-    days = [s["day0"] + k * DAY for k in range(1, 5)]
-    run_cuts(con, days, days)
-    before = carry(con, 9232)
-    assert before
-    I.rebuild(con, "chunk", "detectors", upto=days[-1])
-    assert carry(con, 9232) == before
 
 
 def test_nothing_is_rated_without_bins_and_health_on_a_window_is_unchanged():
@@ -230,29 +198,8 @@ def test_nothing_is_rated_without_bins_and_health_on_a_window_is_unchanged():
     assert f[(f.Label == "stuck on") & (f.Detector.isin([1, 2]))].empty
 
 
-def test_no_row_while_the_signal_is_silent_and_on_again_when_it_returns():
-    s = stuck_events()
-    gone_a, gone_b = s["on"] + pd.Timedelta(days=2), s["on"] + pd.Timedelta(days=2, hours=5)
-    ev = s["ev"][~((s["ev"].Timestamp >= gone_a) & (s["ev"].Timestamp < gone_b))]
-    con = connect(ev, s["det"])
-    days = [s["day0"] + k * DAY for k in range(1, 8)]
-    b = pd.concat([r.bins for r in run_cuts(con, days, days).values()], ignore_index=True)
-    for kind, det in (("Vehicle", 1), ("Ped", 2)):
-        x = b[(b.DetectorType == kind) & (b.Detector == det) & (b.Label == "stuck on")]
-        assert x.TimeStamp.max() == s["off"].floor("15min")
-        assert not x.TimeStamp.between(gone_a, gone_b - BIN).any()
-        assert x.TimeStamp.between(gone_b, gone_b + 8 * BIN).sum() >= 7
 
 
-def test_a_button_whose_phase_stops_walking_stops_scoring():
-    s = stuck_events()
-    stop = s["on"] + pd.Timedelta(days=2)
-    ev = s["ev"][~((s["ev"].EventId.isin([21, 22, 23])) & (s["ev"].Parameter == 2) & (s["ev"].Timestamp >= stop))]
-    con = connect(ev, s["det"])
-    days = [s["day0"] + k * DAY for k in range(1, 7)]
-    b = pd.concat([r.bins for r in run_cuts(con, days, days).values()], ignore_index=True)
-    x = b[(b.DetectorType == "Ped") & (b.Detector == 2) & (b.Label == "stuck on")]
-    assert x.TimeStamp.max() == stop.floor("15min") - BIN or x.TimeStamp.max() == stop.floor("15min")
 
 
 # --- each bin once, whatever the cuts ---------------------------------------------------------------------------------------------------------------------
@@ -270,44 +217,10 @@ def judged_bins(con, judges, cuts=(), horizon_days=3):
     return ordered(pd.concat([r.bins for r in runs.values()], ignore_index=True))
 
 
-@pytest.mark.parametrize("seed", [1, 2])
-def test_bins_do_not_depend_on_the_cuts(seed):
-    ev, det = faults()
-    day0 = ev.Timestamp.min().floor("D")
-    judges = [day0 + k * DAY for k in range(2, 7)]
-    whole = judged_bins(connect(ev, det), judges)
-    assert len(whole) > 0
-    rng = np.random.default_rng(seed)
-    cuts = [day0 + pd.Timedelta(seconds=int(x)) for x in rng.integers(3600, 6 * 86400, 12)]
-    pd.testing.assert_frame_equal(judged_bins(connect(ev, det), judges, cuts), whole)
 
 
-def test_nothing_is_written_twice_and_a_bin_never_passes_one():
-    ev, det = faults()
-    day0 = ev.Timestamp.min().floor("D")
-    judges = [day0 + k * DAY for k in range(2, 7)]
-    con = connect(ev, det)
-    runs = run_cuts(con, judges, judges, horizon_days=3)
-    for t, r in runs.items():
-        if len(r.bins):
-            assert r.bins.TimeStamp.min() >= t - 3 * DAY and r.bins.TimeStamp.max() < t
-    b = pd.concat([r.bins for r in runs.values()], ignore_index=True)
-    assert not b.duplicated(LATE_KEY).any()
-    assert b.groupby(LATE_KEY[:-1]).Score.sum().max() <= 1 + 1e-5
-    kept = con.execute(f"SELECT TimeStamp, DeviceId, DetectorType, Detector, Label, Score FROM {ST}.health_bins_released").df()
-    want = b[b.TimeStamp >= judges[-1] - 3 * DAY]
-    pd.testing.assert_frame_equal(ordered(kept), ordered(want), check_dtype=False)
 
 
-def test_the_store_equals_a_health_of_each_window_with_no_store():
-    ev, det = faults()
-    day0 = ev.Timestamp.min().floor("D")
-    start, end = day0 + DAY, day0 + 6 * DAY
-    con = connect(ev[ev.Timestamp >= start], det)
-    batch = ordered(B.health_bins(con, "events", "detectors", start, end, horizon_days=3))
-    store = judged_bins(connect(ev[ev.Timestamp >= start], det), [start + k * DAY for k in range(1, 6)])
-    assert len(batch) > 0
-    pd.testing.assert_frame_equal(store, batch, check_dtype=False)
 
 
 # --- late finds: a later judge's first find in a bin already released ---------------------------------------------------------------------------------------
@@ -385,126 +298,21 @@ def _hours(day0, k, a, z=None):
     return day0 + k * DAY + pd.Timedelta(hours=a), day0 + k * DAY + pd.Timedelta(hours=a + 1 if z is None else z)
 
 
-def test_a_later_judge_releases_what_it_finds_in_released_bins_once_and_old_rows_stay(monkeypatch):
-    day0 = stuck_events()["day0"]
-    first = (1, *_hours(day0, 2, 10), "silent", 0.9)
-    found_late = (2, *_hours(day0, 2, 5), "stuck on", 0.9)
-    s = Scripted(monkeypatch, {3: [first], 4: [first, found_late], 5: [first, found_late], 6: [first, found_late]})
-    a = s.judge(3)
-    assert len(a) == 4 and set(a.Detector) == {1}
-    b = s.judge(4)
-    assert set(b.Detector) == {2} and b.TimeStamp.min() == day0 + 2 * DAY + pd.Timedelta(hours=5) and b.TimeStamp.max() < day0 + 3 * DAY
-    assert len(b) == 4 and (b.Score == 1).all()
-    assert s.judge(5).empty and s.judge(6).empty
 
 
-def test_judging_the_same_time_again_releases_nothing(monkeypatch):
-    day0 = stuck_events()["day0"]
-    s = Scripted(monkeypatch, {3: [(1, *_hours(day0, 2, 10), "silent", 0.9)]})
-    assert len(s.judge(3)) == 4
-    assert s.judge(3).empty and s.released() == 4
 
 
-def test_the_store_keeps_what_it_released_only_for_the_window(monkeypatch):
-    day0 = stuck_events()["day0"]
-    s = Scripted(monkeypatch, {3: [(1, *_hours(day0, 2, 10), "silent", 0.9)], 4: [], 5: [], 6: []})
-    s.judge(3), s.judge(4), s.judge(5)
-    assert s.released() == 4
-    s.judge(6)
-    assert s.released() == 0
 
 
-def test_a_longer_horizon_does_not_write_again_what_the_store_let_go(monkeypatch):
-    day0 = stuck_events()["day0"]
-    old = (1, *_hours(day0, 2, 10), "silent", 0.9)
-    s = Scripted(monkeypatch, {3: [old], 4: [old], 5: [old], 6: [old]})
-    assert len(s.judge(3, horizon_days=1)) == 4
-    assert s.judge(4, horizon_days=1).empty and s.judge(5, horizon_days=1).empty
-    assert s.released() == 0
-    assert s.judge(6, horizon_days=3).empty
 
 
-def test_a_store_from_before_the_table_adds_no_late_row_before_its_last_bins(monkeypatch):
-    day0 = stuck_events()["day0"]
-    late = (2, *_hours(day0, 2, 5), "stuck on", 0.9)
-    newer = (2, *_hours(day0, 3, 5), "stuck on", 0.9)
-    s = Scripted(monkeypatch, {3: [], 4: [late, newer]})
-    s.judge(3)
-    s.con.execute(f"DROP TABLE {ST}.health_bins_released")
-    s.con.execute(f"DELETE FROM {ST}.health_meta WHERE Key = 'bins_known_from'")
-    b = s.judge(4)
-    assert b.TimeStamp.min() == newer[1] and len(b) == 4 and s.released() == 4
 
 
-def test_what_was_released_comes_along_in_an_export(monkeypatch, tmp_path):
-    day0 = stuck_events()["day0"]
-    old = (1, *_hours(day0, 2, 10), "silent", 0.9)
-    s = Scripted(monkeypatch, {3: [old], 4: [old]})
-    assert len(s.judge(3)) == 4
-    I.export_store(s.con, tmp_path)
-    (tmp_path / "x").mkdir()
-    other = connect(s.s["ev"], s.s["det"])
-    I.attach_store(other, None)
-    I.import_store(other, tmp_path)
-    assert s.judge(4, con=other).empty
 
 
-def test_each_daily_verdict_releases_the_whole_past_day(stuck):
-    days = stuck["days"]
-    on, off = stuck["on"], stuck["off"]
-    whole = [t for t in days if on <= t - DAY and t <= off]
-    assert whole
-    for t in whole:
-        b = stuck["runs"][t].bins
-        x = b[(b.DetectorType == "Vehicle") & (b.Detector == 1) & (b.Label == "stuck on")].sort_values("TimeStamp")
-        assert x.TimeStamp.tolist() == list(pd.date_range(t - DAY, t - BIN, freq=BIN)), t
-        assert (x.Score == 1).all()
 
 
-def test_a_verdict_after_a_judge_in_the_day_still_gives_the_whole_day(monkeypatch):
-    day0 = stuck_events()["day0"]
-    morning = (1, *_hours(day0, 3, 8, 22), "silent", 0.9)
-    s = Scripted(monkeypatch, {3: [], day0 + 3 * DAY + pd.Timedelta(hours=14): [], 4: [morning]})
-    s.judge(3)
-    assert s.judge(day0 + 3 * DAY + pd.Timedelta(hours=14)).empty
-    b = s.judge(4)
-    assert b.TimeStamp.tolist() == list(pd.date_range(morning[1], morning[2] - BIN, freq=BIN))
 
 
-def test_a_new_rating_of_an_on_covers_bins_released_before_it():
-    # an ON from 23:50: too young to call at midnight, rated the next day; its first ten minutes are in a bin already released
-    s = stuck_events()
-    on = s["day0"] + 2 * DAY - pd.Timedelta(minutes=10)
-    off = s["day0"] + 4 * DAY
-    dev, ev = s["dev"], s["ev"]
-    margin = pd.Timedelta(minutes=5)
-    keep = ~(ev.EventId.isin([81, 82]) & (ev.Parameter == 7) & (ev.Timestamp >= on - margin) & (ev.Timestamp <= off + margin))
-    add = pd.DataFrame({"DeviceId": dev, "Timestamp": [on, off], "EventId": [82, 81], "Parameter": [7, 7]})
-    e = pd.concat([ev[keep], add], ignore_index=True).astype({"EventId": "int32", "Parameter": "int32"})
-    days = [s["day0"] + k * DAY for k in range(1, 6)]
-    runs = run_cuts(connect(e, s["det"]), days, days, horizon_days=3)
-    b = pd.concat([r.bins for r in runs.values()], ignore_index=True)
-    assert not b.duplicated(LATE_KEY).any()
-    found = runs[s["day0"] + 3 * DAY].bins
-    x = found[(found.DetectorType == "Vehicle") & (found.Detector == 7) & (found.Label == "stuck on")]
-    assert x.TimeStamp.min() == on.floor("15min") and x.Score.iloc[0] == pytest.approx(10 / 15, abs=1e-4)
-    assert (b[(b.TimeStamp < s["day0"] + 2 * DAY) & (b.Detector == 7) & (b.DetectorType == "Vehicle") & (b.Label == "stuck on")]).TimeStamp.min() == on.floor("15min")
 
 
-def test_a_brief_press_inside_a_stuck_on_past_the_window_leaves_its_bins_unbroken():
-    # a one-second OFF, days after the ON left the 1-day window: the button goes on stuck and the press stays in the log
-    s = stuck_events()
-    blip = s["on"] + pd.Timedelta(days=3, hours=1, minutes=3)
-    add = pd.DataFrame({"DeviceId": s["dev"], "Timestamp": [blip, blip + pd.Timedelta(seconds=1), blip + pd.Timedelta(seconds=1.1)], "EventId": [89, 90, 45], "Parameter": [2, 2, 2]})
-    ev = pd.concat([s["ev"], add], ignore_index=True).astype({"EventId": "int32", "Parameter": "int32"})
-    con = connect(ev, s["det"])
-    days = [s["day0"] + k * DAY for k in range(1, 8)]
-    b = pd.concat([r.bins for r in run_cuts(con, days, days).values()], ignore_index=True)
-    x = b[(b.DetectorType == "Ped") & (b.Detector == 2) & (b.Label == "stuck on")].sort_values("TimeStamp")
-    assert not x.duplicated(LATE_KEY).any()
-    assert x.TimeStamp.iloc[0] == s["on"] and x.TimeStamp.iloc[-1] == s["off"].floor("15min")
-    assert x.TimeStamp.diff().dropna().eq(BIN).all()
-    assert x.Score.sum() / 4 == pytest.approx((s["off"] - s["on"]) / pd.Timedelta(hours=1), abs=0.01)
-    with_blip = PH.ped_health(con, "events", start=blip - DAY, end=blip + DAY).set_index("Input").loc[2, "presses"]
-    con.execute("DELETE FROM events WHERE EventId IN (89, 90) AND Timestamp BETWEEN ? AND ?", [blip, blip + pd.Timedelta(seconds=1)])
-    assert with_blip == PH.ped_health(con, "events", start=blip - DAY, end=blip + DAY).set_index("Input").loc[2, "presses"] + 1

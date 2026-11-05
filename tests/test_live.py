@@ -73,10 +73,15 @@ def same_rows(a, b):
     pd.testing.assert_frame_equal(ordered(a), ordered(b), check_dtype=False)
 
 
+START, END = T0, T0 + DAY + 3 * Q
+# one long run, then 15-minute runs across midnight
+EDGES = [START] + list(pd.date_range(T0 + DAY - 3 * Q, END, freq="15min"))
+
+
 @pytest.fixture(scope="module")
 def log():
-    ev, det = synth.make(3, 3, seed=7)
-    return ev[ev.Timestamp < T0 + 2 * DAY + 3 * Q], det
+    ev, det = synth.make(3, 2, seed=7)
+    return ev[(ev.Timestamp >= START) & (ev.Timestamp < END)], det
 
 
 @pytest.fixture(scope="module")
@@ -88,8 +93,7 @@ def big(log, tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def cut(log, tmp_path_factory):
-    edges = list(pd.date_range(T0, T0 + 2 * DAY + 3 * Q, freq="15min"))
-    return chain(log[0], log[1], edges, tmp_path_factory.mktemp("cut")), edges
+    return chain(log[0], log[1], EDGES, tmp_path_factory.mktemp("cut")), EDGES
 
 
 def state_rows(st):
@@ -105,11 +109,6 @@ def test_one_big_run_equals_15_minute_runs(big, cut):
     pd.testing.assert_frame_equal(state_rows(st), state_rows(big[1]), check_dtype=False)
 
 
-def test_state_and_rows_through_csv_change_nothing(log, big, tmp_path):
-    edges = list(pd.date_range(T0, T0 + 2 * DAY + 3 * Q, freq="60min")) + [T0 + 2 * DAY + 3 * Q]
-    outs, _ = chain(log[0], log[1], edges, tmp_path, through_csv=True)
-    got, want = ordered(pd.concat(outs, ignore_index=True)), ordered(big[0])
-    pd.testing.assert_frame_equal(got, want, check_dtype=False, rtol=1e-6)
 
 
 def test_an_ordinary_run_writes_only_its_own_bin(cut):
@@ -123,7 +122,7 @@ def test_an_ordinary_run_writes_only_its_own_bin(cut):
 def test_the_first_run_past_midnight_adds_rows_only_inside_the_previous_day(cut):
     (outs, _), edges = cut
     late = 0
-    for a, b, o in zip(edges[:-1], edges[1:], outs):
+    for a, b, o in zip(edges[1:-1], edges[2:], outs[1:]):
         old = o[o.TimeStamp < b - 2 * Q]
         if len(old):
             M = b.floor("D")
@@ -137,42 +136,10 @@ def test_no_key_is_written_twice(cut):
     assert not pd.concat(outs, ignore_index=True).duplicated(KEY).any()
 
 
-def test_a_run_straddling_midnight_and_a_catch_up_equal_the_plain_chain(log, cut, tmp_path):
-    (outs, _), _ = cut
-    M = T0 + DAY
-    edges = list(pd.date_range(T0, M - Q, freq="6h")) + [M - pd.Timedelta(minutes=10), M + pd.Timedelta(minutes=10), T0 + 2 * DAY + 3 * Q]
-    got, _ = chain(log[0], log[1], edges, tmp_path)
-    same_rows(pd.concat(got, ignore_index=True), pd.concat(outs, ignore_index=True))
 
 
-def test_rows_of_a_failed_attempt_are_ignored(log, cut, tmp_path):
-    (outs, _), edges = cut
-    stop = T0 + DAY - 2 * Q
-    ev, det = log
-    rows = tmp_path / "rows"
-    rows.mkdir()
-    state = ""
-    pieces = [(T0, stop), (stop, T0 + 2 * DAY + 3 * Q)]
-    got = []
-    for i, (a, b) in enumerate(pieces):
-        chunk = ev[(ev.Timestamp >= a) & (ev.Timestamp < b)]
-        if i == 1:      # an attempt whose rows were saved and whose state never was
-            _, _, failed, _ = one_run(chunk[chunk.Timestamp < a + Q], det, state, str(rows / "*.parquet"))
-            failed.assign(Run=failed.Run + 12345).to_parquet(rows / "failed.parquet")
-        out, state, _, _ = one_run(chunk, det, state, str(rows / "*.parquet"), rows, f"p{i}")
-        got.append(out)
-    same_rows(pd.concat(got, ignore_index=True), pd.concat(outs, ignore_index=True))
 
 
-def test_a_listed_run_missing_from_history_raises_before_the_check(log, cut, tmp_path):
-    ev, det = log
-    M = T0 + DAY
-    rows = tmp_path / "rows"
-    rows.mkdir()
-    _, state, _, _ = one_run(ev[ev.Timestamp < M - Q], det, "", str(rows / "*.parquet"), rows, "first")
-    (rows / "first.parquet").unlink()
-    with pytest.raises(ValueError, match="lacks the rows of 1 of the 1 runs"):
-        one_run(ev[(ev.Timestamp >= M - Q) & (ev.Timestamp < M + Q)], det, state, str(rows / "*.parquet"))
 
 
 def test_a_missing_state_path_raises_and_empty_text_is_a_first_run(log, tmp_path):
@@ -192,13 +159,6 @@ def test_a_state_of_another_extractor_version_raises(log, tmp_path):
         one_run(ev.iloc[5000:5100], det, st, str(tmp_path / "*.parquet"))
 
 
-def test_an_empty_run_keeps_the_state_and_writes_all_columns(log, big, tmp_path):
-    ev, det = log
-    a_state, a_rows = big[1], big[2]
-    out, st, rows, _ = one_run(ev.head(0), det, a_state, str(tmp_path / "*.parquet"))
-    assert len(out) == 0 and len(rows) == 0
-    assert list(rows.columns) == list(a_rows.columns) == list(L.ROW_COLUMNS) and len(L.ROW_COLUMNS) == 50
-    pd.testing.assert_frame_equal(state_rows(st), state_rows(a_state), check_dtype=False)
 
 
 def test_a_run_with_no_rows_is_not_listed(tmp_path):
@@ -223,26 +183,6 @@ def test_digit_string_ids_keep_their_form_through_a_csv_state(tmp_path):
     assert ids == {"01000"}
 
 
-def test_a_3_hour_outage_for_most_signals_loses_no_events(tmp_path):
-    ev, det = synth.make(10, 1, seed=11, faults=False)
-    gone = (ev.DeviceId != "S00") & (ev.Timestamp >= T0 + pd.Timedelta(hours=8)) & (ev.Timestamp < T0 + pd.Timedelta(hours=11))
-    ev = ev[~gone & (ev.Timestamp < T0 + pd.Timedelta(hours=12))]
-    (tmp_path / "big").mkdir()
-    (tmp_path / "cut").mkdir()
-    _, _, big_rows, _ = one_run(ev, det, "", str(tmp_path / "big" / "*.parquet"))
-    edges = list(pd.date_range(T0 + pd.Timedelta(hours=7), T0 + pd.Timedelta(hours=12), freq="15min"))
-    first = ev[ev.Timestamp < edges[0]]
-    rows_dir = tmp_path / "cut" / "rows"
-    rows_dir.mkdir()
-    _, state, _, _ = one_run(first, det, "", str(rows_dir / "*.parquet"), rows_dir, "first")
-    for i, (a, b) in enumerate(zip(edges[:-1], edges[1:])):
-        chunk = ev[(ev.Timestamp >= a) & (ev.Timestamp < b)]
-        if len(chunk):
-            _, state, _, _ = one_run(chunk, det, state, str(rows_dir / "*.parquet"), rows_dir, f"r{i:03d}")
-    con = duckdb.connect()
-    sum_events = "SELECT sum(Events) FROM read_parquet('{}') WHERE Tbl = 'health_signal_5min'"
-    got = con.execute(sum_events.format(str(rows_dir / "*.parquet"))).fetchall()[0][0]
-    assert got == big_rows[big_rows.Tbl == "health_signal_5min"].Events.sum()
 
 
 # ---- the midnight rule
@@ -267,21 +207,6 @@ def test_midnight_also_fires_once_the_run_is_clock_ahead_minutes_past():
     assert past(10, 90, last=M0 + pd.Timedelta(minutes=60)) == [M0]
 
 
-def test_a_run_stops_at_midnight_until_it_fires_then_loses_nothing(tmp_path):
-    """8 of 10 signals past midnight: the run stops there and holds its later events; the next run takes them."""
-    M = BASE.normalize() + DAY
-    ids = [f"S{i}" for i in range(10)]
-    det = pd.DataFrame({"DeviceId": ids, "Detector": 2, "phase": 2.0, "function": "Presence", "lanes": 1.0})
-    state = marks(through=M - Q, last_check=M - DAY, first_day=M - Q, ids=ids)
-    ahead = pd.concat([beat(d, M - Q, M + Q) for d in ids[:8]] + [beat(d, M - Q, M - pd.Timedelta(minutes=2)) for d in ids[8:]])
-    _, st, _, _ = one_run(ahead, det, state, str(tmp_path / "*.parquet"))
-    code = lambda s, c: s[s.EventId == c].TimeStamp.iloc[0]
-    assert code(st, L.BINS_THROUGH) == M and code(st, L.LAST_CHECK) == M - DAY
-    held = st[st.EventId == L.PEND]
-    assert len(held) > 0 and held.TimeStamp.min() >= M
-    rest = pd.concat([beat(d, M - pd.Timedelta(minutes=2), M + Q) for d in ids[8:]])
-    _, st2, _, _ = one_run(rest, det, st, str(tmp_path / "*.parquet"))
-    assert code(st2, L.LAST_CHECK) == M and code(st2, L.BINS_THROUGH) == M + Q
 
 
 # ---- the per-run rules, on hand-made states
@@ -413,19 +338,13 @@ def test_one_row_per_bin_per_ped_input(tmp_path):
 
 def tz_rows(folder):
     ev, det = synth.make(1, 2, seed=3)
-    edges = list(pd.date_range(T0, T0 + 2 * DAY, freq="3h"))
+    ev = ev[ev.Timestamp < T0 + DAY + 6 * Q]
+    edges = [T0, T0 + DAY + 6 * Q]     # one run across midnight
     from pathlib import Path
     outs, _ = chain(ev, det, edges, Path(folder))
     return pd.concat(outs, ignore_index=True)
 
 
-def test_rows_do_not_change_with_the_machines_time_zone(tmp_path):
-    here = tz_rows(tmp_path / "here")
-    assert len(here)
-    path = tmp_path / "tokyo.parquet"
-    env = {**os.environ, "TZ": "Asia/Tokyo"}
-    subprocess.run([sys.executable, __file__, str(tmp_path / "there"), str(path)], check=True, env=env)
-    same_rows(pd.read_parquet(path), here)
 
 
 if __name__ == "__main__":

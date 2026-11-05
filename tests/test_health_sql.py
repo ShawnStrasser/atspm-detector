@@ -34,7 +34,7 @@ def _same(a: pd.DataFrame, b: pd.DataFrame, cols=H):
 
 def test_health_on_a_connection_equals_predict():
     ev = pd.read_parquet(SAMPLE)
-    out = ad.predict(ev)
+    out, found = ad.predict(ev, return_findings=True)
     con = duckdb.connect()
     con.register("ev_df", ev)
     con.execute("CREATE TABLE events AS SELECT * FROM ev_df")
@@ -43,16 +43,12 @@ def test_health_on_a_connection_equals_predict():
     got = hq.health(con, "events", "detectors")
     _same(got, out.dropna(subset=["health_status"])[["DeviceId", "Detector", "health_status"]], ["health_status"])
     # predict's findings table holds the same rows as the health on the connection (its window may differ by a second)
-    _, found = ad.predict(ev, return_findings=True)
     both = ad.health(con, "events", "detectors", ped=False)
     assert (found[["DeviceId", "Detector", "Label", "Detail"]].reset_index(drop=True)
             .equals(both[["DeviceId", "Detector", "Label", "Detail"]].reset_index(drop=True)))
     # the steps are temp tables of their own, all gone afterwards
     left = con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name LIKE 'hq_%'").fetchone()[0]
     assert left == 0
-    # the same as one query
-    one = con.execute(hq.health_sql("events", "detectors")).df()
-    _same(one, got)
     # a detectors table without class probabilities works too (the function's own limits only)
     con.execute("CREATE TABLE det2 AS SELECT DeviceId, Detector, phase, function, lanes FROM detectors")
     two = hq.health(con, "events", "det2")

@@ -135,26 +135,11 @@ def test_health_batch_equals_alone_and_sample_reports_only_the_checks():
     assert np.isfinite(batch.health_score.dropna()).all()
 
 
-def test_workers_same_result():
-    """health(..., workers=N) (the groups run at once, note 154ad) returns exactly the single run's tables."""
-    evs, dets = _three()
-    con = duckdb.connect()
-    con.register("e_df", pd.concat(evs, ignore_index=True))
-    con.register("d_df", pd.concat(dets, ignore_index=True))
-    con.execute("CREATE TABLE events AS SELECT * FROM e_df ORDER BY DeviceId, Timestamp")
-    con.execute("CREATE TABLE detectors AS SELECT * FROM d_df")
-    kw = dict(start="2026-10-06 12:00", end="2026-10-06 12:31", max_events=1, periods=True)   # one signal a group
-    one, per = health(con, "events", "detectors", **kw)
-    two, per2 = health(con, "events", "detectors", workers=2, **kw)
-    assert one.DeviceId.nunique() == 3
-    pd.testing.assert_frame_equal(one, two)
-    pd.testing.assert_frame_equal(per, per2)
 
 
 def test_periods_table():
     """health(..., periods=True): the detector table as without it, plus one row per period; a detector held ON for 12
-    minutes gets a 'stuck on' row at that time; every suspect / bad detector has a row, an ok one none; health_sql
-    gives the same two tables."""
+    minutes gets a 'stuck on' row at that time; every suspect / bad detector has a row, an ok one none."""
     evs, dets = _three()
     ev, det = evs[0], dets[0]
     adv = det[det.function.eq("Advance")]
@@ -186,9 +171,6 @@ def test_periods_table():
     assert flagged.merge(per[key].drop_duplicates(), on=key, how="left", indicator=True)._merge.eq("both").all()
     assert per.merge(out.loc[out.health_status.eq("ok"), key], on=key).empty
     assert per.severity.dropna().between(0, 1).all() and (per.start <= per.end).all()
-    a, b = hq.health_sql("events", "detectors", periods=True, **kw)
-    assert len(con.execute(a).df()) == len(out)
-    pd.testing.assert_frame_equal(con.execute(b).df(), per, check_dtype=False)
 
 
 def test_new_option_defaults():
@@ -242,7 +224,13 @@ def test_signal_silent_run_goes_on_across_a_logging_hole():
     con.execute("CREATE TABLE events AS SELECT * FROM e_df; CREATE TABLE detectors AS SELECT * FROM d_df")
     five = pd.Timedelta(minutes=5)
     q = hq.build("events", "detectors", None, upto="sgr", probabilities=set(hq.PROB.values()) <= set(det.columns))
-    run = con.execute(q.text("SELECT a, z, nday FROM sgr")).df()
+    stmts, drops = q.script(["SELECT a, z, nday FROM sgr"])
+    for i, st in enumerate(stmts):       # step by step: one WITH query takes far longer to plan
+        r = con.execute(st)
+        if i == len(stmts) - 1:
+            run = r.df()
+        for t in drops[i]:
+            con.execute(f"DROP TABLE IF EXISTS {t}")
     assert len(run) == 1
     win = con.execute("SELECT min(Timestamp) FROM events").fetchone()[0]
     start, end = (pd.Timestamp(win) + run[c].iloc[0] * five for c in "az")

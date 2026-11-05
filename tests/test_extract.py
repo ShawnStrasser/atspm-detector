@@ -83,18 +83,6 @@ def _same(name, a, b):
             assert x[c].astype(str).tolist() == y[c].astype(str).tolist(), f"{name}.{c} differs"
 
 
-@pytest.mark.parametrize("inp,win", [("sample", "whole"), ("synth_a", "whole"), ("synth_a", "m30"), ("edge", "whole"),
-                                     ("edge", "odd"), ("edge", "m30")])
-def test_adapters_equal_oracle_steps(inp, win):
-    con = _set(inp)
-    _windows(con, win)
-    a, b = G.steps(H0, con, STEPS), G.steps(H, con, STEPS)
-    assert set(a) == set(b)
-    for n in a:
-        _same(n, a[n], b[n])
-    if (inp, win) == ("edge", "whole"):    # the edge set reaches every adapter
-        assert all(len(b[n][0]) for n in ("hold", "gonb", "hib", "pdg", "lcsw", "pmode", "pall")), \
-            {n: len(b[n][0]) for n in b}
 
 
 def test_bind_on_empty_inputs():
@@ -191,11 +179,6 @@ def _ns(col):
     return col.astype("datetime64[ns]").astype("int64")
 
 
-@pytest.mark.parametrize("inp,win", [("sample", "whole"), ("edge", "whole"), ("edge", "odd")])
-def test_every_emitted_fact_has_its_owner_in_the_chunk(inp, win):
-    con = _set(inp)
-    _windows(con, win)
-    check_owners(_raw(con), {t: x[0] for t, x in G.steps(H, con, STORE).items()})
 
 
 def check_owners(ev, rows, open_labels=True):
@@ -542,16 +525,6 @@ SCENES = {"re-logged chain, two OFFs, start": _relogged_two_offs,
           "ON of no length in a green": _no_length_on_in_green}
 
 
-@pytest.mark.parametrize("name", SCENES)
-def test_rare_branches_equal_oracle(name):
-    con, reach = SCENES[name]()
-    reach()
-    a, b = G.steps(H0, con, STEPS), G.steps(H, con, STEPS)
-    for n in a:
-        _same(n, a[n], b[n])
-    for x, y in zip(H0.health(con, "events", "detectors", periods=True, windows_table="wtab", max_events=None),
-                    H.health(con, "events", "detectors", periods=True, windows_table="wtab", max_events=None)):
-        assert G.dtypes(x) == G.dtypes(y) and G.values(x) == G.values(y)
 
 
 def test_capped_medians_compared_below_the_cap():

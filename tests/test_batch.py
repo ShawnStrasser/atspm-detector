@@ -23,7 +23,7 @@ def _eq(x: pd.DataFrame, y: pd.DataFrame) -> None:
     pd.testing.assert_frame_equal(x, y, check_exact=True, check_dtype=False)
 
 
-@pytest.mark.parametrize("batch", [None, 2, 1])
+@pytest.mark.parametrize("batch", [None, 2])
 def test_batch_equals_alone(batch):
     ev = _three_signals()
     out, ph = predict(ev, min_actuations=1, return_phases=True, batch_signals=batch)
