@@ -102,7 +102,7 @@ MATE_HOURS = {"low": 0.5, "high": 2.0, "own_low": 0.75, "own_high": 1.5, "min_ex
 CLEAN_YARD = {"own": 0.5, "rest": 0.3, "own_min": 1.5, "rest_min": 20.0}
 # note 154aa (option pulse_mode): a Presence detector with >= n complete calls in the window, >= share of them lasting
 # s seconds or less (the log's 0.1-s ticks: a ~0.13-s pulse logs as 0.1 or 0.2 s) and a median call under s
-# (2B033 det 11: every call ~0.13 s, ~0 % ON)
+# (every call ~0.13 s, ~0 % ON)
 PULSE = {"n": 200, "share": 0.8, "s": 0.2}
 # note 154ac (with closure_1h): a lane closure with faults of the detector's own on the same calendar day on both sides
 # (sides 2; 1 = either side) is part of the fault; all: every closure (False: only the quarter-hour candidates)

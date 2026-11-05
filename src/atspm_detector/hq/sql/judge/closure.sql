@@ -216,7 +216,7 @@ SELECT NULL::INT AS dev, NULL::INT AS det, NULL::VARCHAR AS kind, NULL::INT AS p
   FROM lcc c LEFT JOIN lcr r USING (dev, det, kind) LEFT JOIN lcsw s USING (dev, det, kind)
   WHERE r.dev IS NOT NULL OR s.dev IS NOT NULL{% endset %}
 {% if q1h %}
-{# note 154ac (user, review v13 row 5: 10055 det 9): a closure on a day when the detector has faults of its own
+{# note 154ac (user, review v13 row 5): a closure on a day when the detector has faults of its own
    (LC_FAULT_DAY) before AND after it on the same calendar day is part of the fault, not a closure.  Its faults:
    silences over its suspect limit, count drops against its phase mates (>= 2 h, >= the suspect GEH), counted stuck-on
    holds -- each not overlapping any closure / switch candidate of the detector (those are explained) #}
@@ -254,7 +254,7 @@ WHERE NOT EXISTS (SELECT 1 FROM a o WHERE o.dev = a.dev AND o.det = a.det AND o.
                   AND (o.b1 - o.b0 > a.b1 - a.b0 OR (o.b1 - o.b0 = a.b1 - a.b0 AND o.kind < a.kind))))
 {# the silence / the count drop are explained when closures cover half of it; note 154n / 154o (mate_drop /
    count_rise): any overlap with a closure explains a run of hours against the phase mates (the closure is its
-   near-zero core: 03055 det 2), and a detector with a timing-plan switch counts by the plan (03038 det 56) #}
+   near-zero core), and a detector with a timing-plan switch counts by the plan #}
 {% macro ov(p, who) %}(SELECT coalesce(sum(greatest(least(r.z_ns, x.{{ p }}_z * {{ NSH }}) - greatest(r.a_ns, x.{{ p }}_a * {{ NSH }}), 0)), 0) FROM lcres r WHERE r.dev = x.dev AND {{ who }}) > 0 OR EXISTS (SELECT 1 FROM lcres r WHERE r.dev = x.dev AND r.det = x.det AND r.switch){% endmacro %}
 -- @step xfc mat
 SELECT x.* EXCLUDE (l0, l1),

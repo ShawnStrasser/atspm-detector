@@ -80,7 +80,7 @@ SELECT * , sqrt(2 * (M - E) ^ 2 / greatest(M + E, 1e-9)) AS rgeh FROM (
   GROUP BY dev, det, grp HAVING count(*) FILTER (hi) >= 1)
 {% if opt['rise_dead_days'] %}
 {# note 154x: a day that is "too high" only because the detector nearly stopped on the window's other days (the
-   time-of-day yardstick, a median over the days, is then the dead level: 10035 det 2) is not a rise -- the other days
+   time-of-day yardstick, a median over the days, is then the dead level) is not a rise -- the other days
    (<= 10 % of that day's 06-22 h count while its mates kept >= half their traffic) are the fault #}
 -- @step mhday mat
 SELECT g.dev, g.det, g.dy, g.Md, m.Mmd

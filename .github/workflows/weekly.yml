@@ -41,8 +41,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - duckdb: '1.5.2'                 # the SQL also keeps running on the 1.5 line
-            install: 'duckdb==1.5.2'
+          - duckdb: '2.0.0'                 # the oldest supported
+            install: 'duckdb==2.0.0'
           - duckdb: 'pre-release'
             install: '--pre duckdb'
     steps:

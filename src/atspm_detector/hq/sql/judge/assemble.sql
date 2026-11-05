@@ -36,7 +36,7 @@ LEFT JOIN (SELECT dev, ph, sum((status1 <> 'bad')::INT) AS nh FROM xm GROUP BY d
    and either keeps >= 80 % of its daytime level at night with a profile unlike theirs, or is a low-volume zone (< 30 an
    hour) keeping >= 30 % (and 2.5 x the mates' share) of it at night; a zone ON >= 25 % of the daytime hours and >= 3 x
    its night share while it counts LESS by day (< 0.8 x night) is a queue zone: vehicles sit on it -- neither noise nor
-   busy at night (user: 2B345 det 11).  own / ref per hour of day are averages of whole counts (exact); their means over
+   busy at night.  own / ref per hour of day are averages of whole counts (exact); their means over
    the hours are taken in hour order, so the text's "~26 an hour" never depends on the order DuckDB's threads add them
    up in (note 154ad) #}
 -- @step flatm mat

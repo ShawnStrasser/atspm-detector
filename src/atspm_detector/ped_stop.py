@@ -78,11 +78,11 @@ NP_GREEN_SHARE = 0.8
 NP_OTHER_Q = 2
 # rated bad (option walks_bad) once the run holds >= NP_BAD_H logged hours of walks at >= NP_WALKS_H an hour and >= NP_GREEN_SHARE of a phase's greens: the report then counts it at once (150 bad
 # minutes in a day alert), and one short of it stays suspect, which never adds up: the flag drops off the later windows.  Set from the five buttons the user marked real (review of 2026-11-03);
-# the shortest, 08127 ped 6, ran 2.75 and 3.5 such hours
+# the shortest ran 2.75 and 3.5 such hours
 NP_BAD_H = 2.5
 # sustained pressing (option sustained_press, on; hq/sql/ped/judge.sql, step f_press): a day with >= SP_PRESSES presses, >= SP_TIMES x its usual (the median of the window's other logged
 # days, itself >= SP_USUAL) and >= SP_BINS 15-minute periods of >= SP_BIN presses and >= SP_PER_WALK presses per walk (no walk counts as one).  Raw presses.  Rated suspect, however
-# strong.  From the review of 2026-11-03: presses per walk alone finds people (13 of 13 flagged days seen in events were not faults); 43 days of counts found 2B353 ped 2 and 08404 ped 6
+# strong.  From the review of 2026-11-03: presses per walk alone finds people (13 of 13 flagged days seen in events were not faults); 43 days of counts found the two real cases
 SP_PRESSES = 1000
 SP_TIMES = 5.0
 SP_USUAL = 20.0
