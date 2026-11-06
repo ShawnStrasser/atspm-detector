@@ -4,8 +4,6 @@ name: Weekly checks
 on:
   schedule:
     - cron: '0 6 * * 1'
-  release:
-    types: [published]
   workflow_dispatch:
 
 jobs:

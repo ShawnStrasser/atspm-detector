@@ -22,6 +22,8 @@ on:
 jobs:
   test:
     name: tests (${{ matrix.os }}, py${{ matrix.python-version }}${{ matrix.duckdb && format(', duckdb {0}', matrix.duckdb) || '' }})
+    # A release is only made once the push's tests have passed, so a release goes straight to publishing.
+    if: github.event_name != 'release'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -81,7 +83,6 @@ jobs:
 
   publish:
     name: publish to PyPI
-    needs: test
     runs-on: ubuntu-latest
     if: github.event_name == 'release' && github.event.action == 'published'
     environment:
