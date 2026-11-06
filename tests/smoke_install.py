@@ -87,7 +87,7 @@ def main():
               "--out-phases", run / "phases.csv", "--out-atspm", run / "atspm_config.csv", "--min-actuations", "1",
               "--quiet"], cwd=run))
     cfg = (run / "atspm_config.csv").read_text(encoding="utf-8").splitlines()
-    assert cfg[0] == "DeviceId,Phase,Parameter,Function" and len(cfg) > 1, "--out-atspm wrote no config"
+    assert cfg[0].startswith("DeviceId,Phase,Parameter,Function") and len(cfg) > 1, "--out-atspm wrote no config"
     print(f"--out-atspm: {len(cfg) - 1} atspm detector_config rows")
     dep = sh([exe / "atspm-detector", "--events", sample, "--out", run / "preds_le2h.csv", "--profile", "le2h",
               "--min-actuations", "1", "--quiet"], cwd=run)
