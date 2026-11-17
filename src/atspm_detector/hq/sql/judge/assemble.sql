@@ -16,12 +16,12 @@ SELECT x.*, a.rep_frac, a.max_on_s, a.rep_time_s, a.dur_p50, a.n_on_a, a.n_rep, 
        CASE WHEN g.geh_night IS NOT NULL THEN g.geh_night_exp0 END AS geh_night_exp, g.geh_drop, g.drop_t, g.drop_t2,
        g.occ_after,
        g.own_before, g.own_after, g.exp_after, g.occ_own, g.occ_mates, p.spk_bursts, p.spk_gmax, p.spk_daily, p.spk_lvl,
-       m.mocc AS occ{% if mh_on %}, coalesce(mb.mh_ok, false) AS mh_ok, mb.md_h, mb.md_geh, mb.md_r, mb.md_a, mb.md_z, mb.md_own, mb.md_exp, mb.mr_h, mb.mr_geh, mb.mr_r, mb.mr_a, mb.mr_z{% endif %}
+       m.mocc AS occ{{ ', n.mo_min, n.mo_long, n.mo_t0, n.mo_occ, n.mo_mocc, n.mo_nm, n.mo_n' if opt['mostly_on'] else '' }}{% if mh_on %}, coalesce(mb.mh_ok, false) AS mh_ok, mb.md_h, mb.md_geh, mb.md_r, mb.md_a, mb.md_z, mb.md_own, mb.md_exp, mb.mr_h, mb.mr_geh, mb.mr_r, mb.mr_a, mb.mr_z{% endif %}
 
 FROM xm x LEFT JOIN act a USING (dev, det) LEFT JOIN slp s USING (dev, det) LEFT JOIN lkc k USING (dev, det)
 LEFT JOIN q5 q USING (dev, det) LEFT JOIN fe f USING (dev, det) LEFT JOIN tf t USING (dev, det)
 LEFT JOIN ohi o USING (dev, det) LEFT JOIN geh g USING (dev, det) LEFT JOIN spk p USING (dev, det)
-LEFT JOIN (SELECT DISTINCT dev, det, mocc FROM gb) m USING (dev, det){% if mh_on %}
+LEFT JOIN (SELECT DISTINCT dev, det, mocc FROM gb) m USING (dev, det){{ ' LEFT JOIN mon n USING (dev, det)' if opt['mostly_on'] else '' }}{% if mh_on %}
 
 LEFT JOIN mhbest mb USING (dev, det){% endif %}
 
@@ -38,17 +38,22 @@ LEFT JOIN (SELECT dev, ph, sum((status1 <> 'bad')::INT) AS nh FROM xm GROUP BY d
    its night share while it counts LESS by day (< 0.8 x night) is a queue zone: vehicles sit on it -- neither noise nor
    busy at night.  own / ref per hour of day are averages of whole counts (exact); their means over
    the hours are taken in hour order, so the text's "~26 an hour" never depends on the order DuckDB's threads add them
-   up in (note 154ad) #}
+   up in (note 154ad).  Note 157d (flat_clean_mates): a mate that keeps >= CY.own of its day level at night while carrying
+   >= CY.rest_min an hour by day is no yardstick for the shape (its own mates do not matter: two flat detectors on a
+   phase would hide each other; a near-silent twin is too small to distort the yardstick and stays).  Note 157f
+   (flat_two_hours): a busy zone (>= 30 an hour) must keep its day level in two night hours (the second-busiest), so one
+   burst (often on the one night the sample covers) is not a whole night; the low-volume rule is left alone; (flat_busier_busy): flat_nb = busier at night than by day -> named busy at
+   night (same score, whole window) #}
 -- @step flatm mat
 SELECT *, coalesce(occ_d >= 900 AND occ_d >= 3 * occ_n AND own_d < 0.8 * own_n, false) AS qzone FROM (
 WITH t AS (SELECT dev, hid, sum(M) AS S FROM mh GROUP BY dev, hid),
 pm AS (SELECT m.dev, z.det, m.hid, sum(m.M) AS P FROM mh m JOIN dz zm USING (dev, det)
-       JOIN dz z ON z.dev = m.dev AND z.ph = zm.ph AND z.det <> m.det WHERE z.ph IS NOT NULL GROUP BY m.dev, z.det, m.hid),
+       JOIN dz z ON z.dev = m.dev AND z.ph = zm.ph AND z.det <> m.det WHERE z.ph IS NOT NULL{{ ' AND NOT EXISTS (SELECT 1 FROM ntm t WHERE t.dev = m.dev AND t.det = m.det AND t.own_d >= ' ~ (CY['rest_min']|dbl) ~ ' AND t.own_n >= ' ~ (CY['own']|dbl) ~ ' * t.own_d)' if opt['flat_clean_mates'] and opt['clean_yardsticks'] else '' }} GROUP BY m.dev, z.det, m.hid),
 r AS (SELECT m.dev, m.det, x.hod, avg(m.M) AS own, avg(m.O) AS occ, avg(coalesce(p.P, t.S - m.M)) AS ref
       FROM mh m JOIN hix x USING (dev, hid) JOIN t USING (dev, hid) LEFT JOIN pm p USING (dev, det, hid)
       WHERE x.ch GROUP BY m.dev, m.det, x.hod)
 SELECT dev, det, list_avg(list(own ORDER BY hod) FILTER (hod >= 7 AND hod < 19)) AS own_d,
-       list_avg(list(own ORDER BY hod) FILTER (hod >= 1 AND hod < 5)) AS own_n,
+       list_avg(list(own ORDER BY hod) FILTER (hod >= 1 AND hod < 5)) AS own_n,{{ " list_sort(list(own) FILTER (hod >= 1 AND hod < 5), 'DESC')[2] AS own_n2," if opt['flat_two_hours'] else '' }}
        list_avg(list(ref ORDER BY hod) FILTER (hod >= 7 AND hod < 19)) AS rest_d,
        list_avg(list(ref ORDER BY hod) FILTER (hod >= 1 AND hod < 5)) AS rest_n,
        avg(occ) FILTER (hod >= 7 AND hod < 19) AS occ_d, avg(occ) FILTER (hod >= 1 AND hod < 5) AS occ_n,
@@ -57,13 +62,13 @@ FROM r GROUP BY dev, det)
 -- @step flat mat
 SELECT * FROM flatm
 WHERE n_hod >= 20 AND rest_d >= 100 AND rest_n <= 0.3 * rest_d AND own_d >= 1.5 AND NOT qzone
-  AND ((own_n >= 0.8 * own_d AND coalesce(prof_corr, 0) < 0.6)
+  AND ((own_n >= 0.8 * own_d{{ ' AND coalesce(own_n2, own_n) >= 0.8 * own_d' if opt['flat_two_hours'] else '' }} AND coalesce(prof_corr, 0) < 0.6)
        OR (own_d < 30 AND own_n >= greatest(0.3, 2.5 * rest_n / rest_d) * own_d AND coalesce(prof_corr, 0) < 0.8))
 {% endif %}
 {# Count zone held ON / extension; the queue excuse is never for a counting zone #}
 -- @step xx mat
-SELECT x.*, t.tod_z, t.tod_dph, t.tod_n_night, t.tod_r, t.tod_mate_r, t.tod_d0,
-       {% if opt['no_daily_pattern'] %}f.det IS NOT NULL AS flat, f.own_d AS flat_d, f.own_n AS flat_n, f.rest_d AS flat_rd, f.rest_n AS flat_rn, coalesce(fm.qzone, false) AS qzone,{% else %}false AS flat, NULL::DOUBLE AS flat_d, NULL::DOUBLE AS flat_n, NULL::DOUBLE AS flat_rd, NULL::DOUBLE AS flat_rn, false AS qzone,{% endif %}
+SELECT x.*, t.tod_z, t.tod_dph, t.tod_n_night, t.tod_r, t.tod_mate_r, t.tod_d0,{{ ' t.tod_lz,' if opt['busy_long_zone'] else '' }}
+       {% if opt['no_daily_pattern'] %}f.det IS NOT NULL AS flat,{{ ' coalesce(f.det IS NOT NULL AND f.own_n > f.own_d, false) AS flat_nb,' if opt['flat_busier_busy'] else '' }} f.own_d AS flat_d, f.own_n AS flat_n, f.rest_d AS flat_rd, f.rest_n AS flat_rn, coalesce(fm.qzone, false) AS qzone,{% else %}false AS flat, NULL::DOUBLE AS flat_d, NULL::DOUBLE AS flat_n, NULL::DOUBLE AS flat_rd, NULL::DOUBLE AS flat_rn, false AS qzone,{% endif %}
 
        x.fn = 'Count' AND (len(x.alts) = 0 OR list_has_all(['Count'], x.alts)) AND NOT x.c1 AS count_on_ok,
        x.c1 AS c1_pre, CASE WHEN x.c1 THEN 'C1' WHEN x.c2 THEN 'C2' ELSE '' END AS cfg,
@@ -167,7 +172,7 @@ LEFT JOIN (SELECT dev, det, v, max(lam) AS lam, first(a ORDER BY round(lam, 6) D
            FROM (SELECT r.*, s.n_on / greatest(r.s_tot - r.s_in, 1) * r.s_in AS lam FROM dcrs r JOIN dstat s USING (dev, det)
                  {{ lib.cap() }})
            WHERE lam > 0 GROUP BY dev, det, v) r1 ON r1.dev = c.dev AND r1.det = c.det AND r1.v = 1
-{% set chain = opt['signal_silent'] or opt['phase_drop'] %}
+{% set chain = opt['signal_silent'] or opt['phase_drop'] or opt['silent_not_held'] %}
 {% set own = opt['own_history'] %}
 -- @step {{ 'xfa0' if own else 'xfa' if chain else 'xf' }} mat
 SELECT x.* REPLACE (

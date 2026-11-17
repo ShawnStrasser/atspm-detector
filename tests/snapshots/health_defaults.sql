@@ -556,12 +556,22 @@ SELECT dev, det, min(a) AS a, max(z) AS z FROM (
     WINDOW w AS (PARTITION BY r.dev, r.det ORDER BY r.a)))
 GROUP BY dev, det, grp
 ),
+hq_hold AS MATERIALIZED (
+SELECT h.*, row_number() OVER (ORDER BY h.dev, h.det, h.s) AS hid FROM (
+  SELECT dev, det, s / 1e9 AS s, f / 1e9 AS f, false AS open_end, f / 1e9 - s / 1e9 AS dur FROM hq_rhold
+  UNION ALL
+  SELECT c.dev, c.det, c.s / 1e9, w.T, true, c.dur FROM hq_fch c JOIN hq_win w USING (dev) WHERE NOT c.gap AND c.dur >= 300) h
+),
+hq_hold_co AS MATERIALIZED (
+SELECT a.hid, count(DISTINCT b.det) FILTER (least(a.f, b.f) - greatest(a.s, b.s) >= 0.5 * a.dur) AS co
+FROM hq_hold a LEFT JOIN hq_hold b ON a.dev = b.dev AND a.det <> b.det GROUP BY a.hid
+),
 hq_lvl0 AS (
 SELECT dev, det, k, n15, S15, c15,
        sum(n15) OVER w AS cx, sum(S15) OVER w AS cs, row_number() OVER w AS pos,
        count(*) OVER (PARTITION BY dev, det) AS nl, sum(n15) OVER (PARTITION BY dev, det) AS X,
        sum(S15) OVER (PARTITION BY dev, det) AS SS
-FROM (SELECT dev, det, k, n15, sum(n15) OVER (PARTITION BY dev, k) - n15 AS S15, c15 FROM hq_a15) WHERE c15
+FROM (SELECT dev, det, k, n15, sum(n15) OVER (PARTITION BY dev, k) - n15 AS S15, c15 FROM hq_a15) a WHERE c15 AND NOT EXISTS (SELECT 1 FROM hq_hold h WHERE h.dev = a.dev AND h.det = a.det AND h.dur >= 900 AND h.f > a.k * 900.0 AND h.s < (a.k + 1) * 900.0)
 WINDOW w AS (PARTITION BY dev, det ORDER BY k ROWS UNBOUNDED PRECEDING)
 ),
 hq_lvlshift AS (
@@ -578,16 +588,6 @@ FROM (SELECT dev, det, pos,
                    X / greatest(SS, 1) AS p0
             FROM hq_lvl0 WHERE nl >= 8 AND X >= 20 AND pos >= 2 AND pos <= nl - 2))
 GROUP BY dev, det
-),
-hq_hold AS MATERIALIZED (
-SELECT h.*, row_number() OVER (ORDER BY h.dev, h.det, h.s) AS hid FROM (
-  SELECT dev, det, s / 1e9 AS s, f / 1e9 AS f, false AS open_end, f / 1e9 - s / 1e9 AS dur FROM hq_rhold
-  UNION ALL
-  SELECT c.dev, c.det, c.s / 1e9, w.T, true, c.dur FROM hq_fch c JOIN hq_win w USING (dev) WHERE NOT c.gap AND c.dur >= 300) h
-),
-hq_hold_co AS MATERIALIZED (
-SELECT a.hid, count(DISTINCT b.det) FILTER (least(a.f, b.f) - greatest(a.s, b.s) >= 0.5 * a.dur) AS co
-FROM hq_hold a LEFT JOIN hq_hold b ON a.dev = b.dev AND a.det <> b.det GROUP BY a.hid
 ),
 hq_p1ph AS MATERIALIZED (
 SELECT d.dev, d.det, c.ph FROM hq_dets d LEFT JOIN hq_dcl c USING (dev, det)
@@ -1178,6 +1178,47 @@ hq_ohi AS (
 SELECT o.dev, o.det, count(h.k) * any_value(o.bs) / 60.0 AS hi_min_c, max(h.occ) AS hi_occ_max
 FROM (SELECT DISTINCT dev, det, bs FROM hq_ohr) o LEFT JOIN hq_hib h USING (dev, det) GROUP BY o.dev, o.det
 ),
+hq_mo10 AS MATERIALIZED (
+SELECT dev, det, b // 2 AS t, sum(occ) / 600.0 AS occ, bool_and(cov) AND sum(unk) < CAST(60.0 AS DOUBLE) AS c
+FROM hq_g5 GROUP BY dev, det, b // 2
+),
+hq_mo10l AS MATERIALIZED (
+SELECT a.dev, a.det, a.t, a.occ, a.c, coalesce(m.mo, 0.0) AS mo, coalesce(m.nm, 0) AS nm,
+       list(CASE WHEN a.c THEN a.occ END) OVER wl || list(CASE WHEN a.c THEN a.occ END) OVER wr AS ol,
+       list(CASE WHEN a.c THEN coalesce(m.mo, 0.0) END) OVER wl || list(CASE WHEN a.c THEN coalesce(m.mo, 0.0) END) OVER wr AS ml
+FROM hq_mo10 a LEFT JOIN (
+  SELECT z.dev, z.det, b.t, avg(b.occ) AS mo, count(*) AS nm
+  FROM hq_dz z JOIN hq_dz y ON y.dev = z.dev AND y.ph = z.ph AND y.det <> z.det JOIN hq_mo10 b ON b.dev = y.dev AND b.det = y.det
+  WHERE z.ph IS NOT NULL AND b.c AND b.occ < 0.95 AND y.status1 IS DISTINCT FROM 'bad' GROUP BY z.dev, z.det, b.t) m USING (dev, det, t)
+WINDOW wl AS (PARTITION BY a.dev, a.det ORDER BY a.t ROWS BETWEEN 12 PRECEDING AND 2 PRECEDING),
+       wr AS (PARTITION BY a.dev, a.det ORDER BY a.t ROWS BETWEEN 2 FOLLOWING AND 12 FOLLOWING)
+),
+hq_mo_runs AS MATERIALIZED (
+SELECT * FROM (SELECT dev, det, min(t) AS a, max(t) + 1 AS z, avg(occ) AS occ, avg(mo) AS mo, max(nm) AS nm, median(ex) AS ex FROM (
+  SELECT *, t - row_number() OVER (PARTITION BY dev, det ORDER BY t) AS grp FROM (
+    SELECT *, greatest(list_median(list_filter(ol, lambda v: v IS NOT NULL)), CAST(0.02 AS DOUBLE))
+              * greatest(mo / greatest(coalesce(list_median(list_filter(ml, lambda v: v IS NOT NULL)), 0.0), CAST(0.02 AS DOUBLE)), 1.0) AS ex
+    FROM hq_mo10l WHERE c AND len(list_filter(ol, lambda v: v IS NOT NULL)) >= 3)
+  WHERE occ >= CAST(0.5 AS DOUBLE))
+GROUP BY dev, det, grp HAVING count(*) >= 3 AND avg(occ) >= CAST(3.0 AS DOUBLE) * median(ex)
+  AND (max(nm) = 0 OR avg(mo) < CAST(0.5 AS DOUBLE) * avg(occ))) r
+WHERE NOT coalesce((SELECT sum(least(h.f, r.z * 600.0) - greatest(h.s, r.a * 600.0)) FROM hq_hold h WHERE h.dev = r.dev
+                    AND h.det = r.det AND h.f > r.a * 600.0 AND h.s < r.z * 600.0) >= 0.5 * (r.z - r.a) * 600.0, false)
+),
+hq_mon AS (
+SELECT dev, det, 10.0 * sum(z - a) AS mo_min, 10.0 * max(z - a) AS mo_long, arg_max(a, z - a) AS mo_t0,
+       arg_max(occ, z - a) AS mo_occ, arg_max(mo, z - a) AS mo_mocc, max(nm) AS mo_nm, count(*) AS mo_n
+FROM hq_mo_runs GROUP BY dev, det
+),
+hq_hiv AS MATERIALIZED (
+SELECT dev, det, s, f FROM hq_hold WHERE dur >= 900
+UNION ALL SELECT h.dev, h.det, h.k * w.bs, (h.k + 1) * w.bs FROM hq_hib h JOIN hq_win w USING (dev)
+UNION ALL SELECT dev, det, a * 600.0, z * 600.0 FROM hq_mo_runs
+),
+hq_hheld AS MATERIALIZED (
+SELECT DISTINCT dev, det, unnest(range((w.s_ns + round(h.s * 1e9)::BIGINT) // 3600000000000, (w.s_ns + round(h.f * 1e9)::BIGINT - 1) // 3600000000000 + 1)) AS hid
+FROM hq_hiv h JOIN hq_win w USING (dev) WHERE h.f > h.s
+),
 hq_hix AS MATERIALIZED (
 SELECT dev, hid, hid - min(hid) OVER (PARTITION BY dev) AS j, hid % 24 AS hod, nb_ = 12 AND nc = 12 AS ch,
        count(*) OVER (PARTITION BY dev) AS H
@@ -1198,10 +1239,10 @@ LEFT JOIN (SELECT * FROM hq_p1part x WHERE NOT EXISTS (SELECT 1 FROM hq_ntraf t 
 WHERE NOT EXISTS (SELECT 1 FROM hq_ntraf t WHERE t.dev = k.dev AND t.det = k.det)
 ),
 hq_gh AS MATERIALIZED (
-SELECT m.dev, m.det, x.j, x.hod, x.ch, x.H, m.M, m.O, y.p IS NOT NULL OR y.isph AS has_m,
+SELECT m.dev, m.det, x.j, x.hod, x.ch AND hd.hid IS NULL AS ch, hd.hid IS NOT NULL AS hd, x.H, m.M, m.O, y.p IS NOT NULL OR y.isph AS has_m,
        CASE WHEN y.p IS NULL AND NOT y.isph THEN CASE WHEN y.cl THEN s.SMc ELSE s.SM END - m.M ELSE coalesce(r.RM, 0) END
        AS R, coalesce(r.RO, 0) AS Om
-FROM hq_mh m JOIN hq_hix x USING (dev, hid) JOIN hq_yk y USING (dev, det)
+FROM hq_mh m JOIN hq_hix x USING (dev, hid) JOIN hq_yk y USING (dev, det) LEFT JOIN hq_hheld hd USING (dev, det, hid)
 JOIN (SELECT m.dev, m.hid, sum(m.M) AS SM, sum(m.M) FILTER (t.det IS NULL) AS SMc FROM hq_mh m LEFT JOIN hq_ntraf t USING (dev, det)
       GROUP BY m.dev, m.hid) s USING (dev, hid)
 LEFT JOIN (SELECT a.dev, a.det, b.hid, sum(b.M) AS RM, sum(b.O) AS RO
@@ -1280,11 +1321,11 @@ LEFT JOIN (SELECT g.dev, g.det, median(CASE WHEN a.re THEN CASE WHEN g.ch THEN (
 ),
 hq_lvr AS MATERIALIZED (
 SELECT * FROM (
-WITH h AS (SELECT g.dev, g.det, g.j, g.ch AND CASE WHEN a.re THEN a.s2 ELSE a.s END * g.R >= 10 AS judged,
+WITH h AS (SELECT g.dev, g.det, g.j, g.hd, g.ch AND CASE WHEN a.re THEN a.s2 ELSE a.s END * g.R >= 10 AS judged,
                   g.ch AND CASE WHEN a.re THEN a.s2 ELSE a.s END * g.R >= 10
                   AND g.M <= 0.5 * CASE WHEN a.re THEN a.s2 ELSE a.s END * g.R AS low
            FROM hq_gh2 g JOIN hq_gh4 a USING (dev, det)),
-r AS (SELECT *, sum((judged AND NOT low)::INT) OVER (PARTITION BY dev, det ORDER BY j) AS grp FROM h)
+r AS (SELECT *, sum((judged AND NOT low OR hd)::INT) OVER (PARTITION BY dev, det ORDER BY j) AS grp FROM h)
 SELECT dev, det, min(j) FILTER (low) AS ja, max(j) FILTER (low) + 1 AS jz FROM r
 GROUP BY dev, det, grp HAVING count(*) FILTER (low) >= 2)
 ),
@@ -1447,12 +1488,12 @@ WHERE h.q_hod IS NOT NULL AND p.Mm >= 5 GROUP BY p.dev, p.det, p.hid
 ),
 hq_mhf AS MATERIALIZED (
 SELECT g.dev, g.det, g.hid, g.M, g.O, v.E, o.occ_ref,
-       coalesce(v.nv >= 1 AND v.E >= CAST(8.0 AS DOUBLE), false) AS jl, coalesce(v.nv >= 1, false) AS jh,
+       coalesce(v.nv >= 1 AND v.E >= CAST(8.0 AS DOUBLE), false) OR hd.hid IS NOT NULL AS jl, coalesce(v.nv >= 1, false) AS jh,
        coalesce(v.nv >= 1 AND v.E >= CAST(8.0 AS DOUBLE) AND v.wlo >= 0.5 AND g.M <= CAST(0.75 AS DOUBLE) * o.own_ref AND (g.M - o.own_ref) / sqrt(CAST(1.5 AS DOUBLE) * o.own_ref + 1) <= -CAST(2.5 AS DOUBLE),
-                false) AS lo,
+                false) AND hd.hid IS NULL AS lo,
        coalesce(v.nv >= 1 AND v.nhi >= least(2, v.nv) AND v.nhi >= CAST(0.6 AS DOUBLE) * v.nv
                 AND g.M >= CAST(1.5 AS DOUBLE) * o.own_ref + 10 AND (g.M - o.own_ref) / sqrt(CAST(1.5 AS DOUBLE) * o.own_ref + 1) >= CAST(2.5 AS DOUBLE), false) AS hi
-FROM hq_mhg g LEFT JOIN hq_mhv v USING (dev, det, hid) LEFT JOIN hq_mhoh o USING (dev, det, dy, hod)
+FROM hq_mhg g LEFT JOIN hq_mhv v USING (dev, det, hid) LEFT JOIN hq_mhoh o USING (dev, det, dy, hod) LEFT JOIN hq_hheld hd USING (dev, det, hid)
 ),
 hq_mhrun0 AS MATERIALIZED (
 SELECT * , sqrt(2 * (M - E) ^ 2 / greatest(M + E, 1e-9)) AS rgeh FROM (
@@ -1502,11 +1543,11 @@ SELECT x.*, a.rep_frac, a.max_on_s, a.rep_time_s, a.dur_p50, a.n_on_a, a.n_rep, 
        CASE WHEN g.geh_night IS NOT NULL THEN g.geh_night_exp0 END AS geh_night_exp, g.geh_drop, g.drop_t, g.drop_t2,
        g.occ_after,
        g.own_before, g.own_after, g.exp_after, g.occ_own, g.occ_mates, p.spk_bursts, p.spk_gmax, p.spk_daily, p.spk_lvl,
-       m.mocc AS occ, coalesce(mb.mh_ok, false) AS mh_ok, mb.md_h, mb.md_geh, mb.md_r, mb.md_a, mb.md_z, mb.md_own, mb.md_exp, mb.mr_h, mb.mr_geh, mb.mr_r, mb.mr_a, mb.mr_z
+       m.mocc AS occ, n.mo_min, n.mo_long, n.mo_t0, n.mo_occ, n.mo_mocc, n.mo_nm, n.mo_n, coalesce(mb.mh_ok, false) AS mh_ok, mb.md_h, mb.md_geh, mb.md_r, mb.md_a, mb.md_z, mb.md_own, mb.md_exp, mb.mr_h, mb.mr_geh, mb.mr_r, mb.mr_a, mb.mr_z
 FROM hq_xm x LEFT JOIN hq_act a USING (dev, det) LEFT JOIN hq_slp s USING (dev, det) LEFT JOIN hq_lkc k USING (dev, det)
 LEFT JOIN hq_q5 q USING (dev, det) LEFT JOIN hq_fe f USING (dev, det) LEFT JOIN hq_tf t USING (dev, det)
 LEFT JOIN hq_ohi o USING (dev, det) LEFT JOIN hq_geh g USING (dev, det) LEFT JOIN hq_spk p USING (dev, det)
-LEFT JOIN (SELECT DISTINCT dev, det, mocc FROM hq_gb) m USING (dev, det)
+LEFT JOIN (SELECT DISTINCT dev, det, mocc FROM hq_gb) m USING (dev, det) LEFT JOIN hq_mon n USING (dev, det)
 LEFT JOIN hq_mhbest mb USING (dev, det)
 LEFT JOIN (SELECT dev, ph, sum((status1 <> 'bad')::INT) AS nh FROM hq_xm GROUP BY dev, ph) hm
   ON hm.dev = x.dev AND hm.ph = x.ph
@@ -1592,7 +1633,8 @@ SELECT a.*, sqrt((a.nn + 0.5) / (b.b4n + 0.5)) AS r, asin(sqrt(a.onm)) AS onv,
        asin(sqrt(least(greatest(b.b4o, 0.0), 1.0))) AS od, log10(1 + a.tot) AS lv,
        CASE WHEN a.tot / 24.0 < 20 THEN 'low' WHEN a.tot / 24.0 < 100 THEN 'medium' ELSE 'high' END AS band
 FROM (SELECT dev, det, d0, sum(N) AS tot, avg(N) FILTER (hr >= 1 AND hr < 5) AS nn, sum(N) FILTER (hr >= 1 AND hr < 5)
-             AS n_night, avg(least(greatest(O, 0.0), 1.0)) FILTER (hr >= 1 AND hr < 5) AS onm
+             AS n_night, avg(least(greatest(O, 0.0), 1.0)) FILTER (hr >= 1 AND hr < 5) AS onm,
+             avg(N) FILTER (hr >= 20) AS ev
       FROM hq_tdh GROUP BY dev, det, d0 HAVING count(N) = 24 AND count(O) = 24 AND sum(N) >= 50) a
 JOIN (SELECT a.dev, a.det, a.d0, max(s4n) / 4 AS b4n, max(s4o) / 4 AS b4o FROM (
         SELECT a.dev, a.det, a.d0, a.hr, sum(b.N) AS s4n, sum(least(greatest(b.O, 0.0), 1.0)) AS s4o
@@ -1613,11 +1655,16 @@ JOIN hq_todg g ON g.key = k.key
 ),
 hq_tdd AS (
 SELECT f.*, z.z_own AS tod_z0, CASE WHEN z.z_own IS NOT NULL THEN least(z.z_own, z.z_alt) END AS tod_z,
-       f.r - m.mate_r AS tod_dph, m.mate_r AS tod_mate_r, l.lim_prof
+       f.r - m.mate_r AS tod_dph, m.mate_r AS tod_mate_r, l.lim_prof,
+       sin(f.od) ^ 2 AS lz_occ, sqrt(coalesce(f.onm, 0.0) / nullif(sin(f.od) ^ 2, 0)) - m.mate_r AS lz_dph,
+       ((f.nn + 0.25) / (f.ev + 0.25)) / m.m_ne AS lz_k,
+       coalesce(sin(f.od) ^ 2 >= CAST(0.25 AS DOUBLE) AND m.m_ne IS NOT NULL AND f.ev IS NOT NULL
+                AND sqrt(coalesce(f.onm, 0.0) / (sin(f.od) ^ 2)) - m.mate_r < CAST(0.3 AS DOUBLE)
+                AND ((f.nn + 0.25) / (f.ev + 0.25)) / m.m_ne < CAST(3.5 AS DOUBLE), false) AS lz
 FROM hq_tdf f JOIN (SELECT dev, det, d0, max(z) FILTER (own) AS z_own, min(z) FILTER (NOT own) AS z_alt FROM hq_tdz
                  GROUP BY dev, det, d0) z USING (dev, det, d0)
 JOIN hq_xbase x USING (dev, det) JOIN hq_limits l USING (dev, det)
-LEFT JOIN (SELECT a.dev, a.det, a.d0, median(b.r) AS mate_r FROM hq_tdf a JOIN hq_xbase xa USING (dev, det)
+LEFT JOIN (SELECT a.dev, a.det, a.d0, median(b.r) AS mate_r , median((b.nn + 0.25) / (b.ev + 0.25)) AS m_ne FROM hq_tdf a JOIN hq_xbase xa USING (dev, det)
            JOIN hq_xbase xb2 ON xb2.dev = a.dev AND xb2.ph = xa.ph AND xb2.det <> a.det
            JOIN hq_tdf b ON b.dev = a.dev AND b.det = xb2.det AND b.d0 = a.d0
            JOIN (SELECT dev, det, d0, max(z) FILTER (own) AS zo FROM hq_tdz GROUP BY dev, det, d0) bz
@@ -1632,13 +1679,30 @@ SELECT *, CASE WHEN tod_z IS NULL THEN NULL
                     AND tod_z >= lim_prof * CAST(0.5833333333333334 AS DOUBLE) THEN 0.5 ELSE 0.0 END AS lvl
 FROM hq_tdd
 ),
+hq_lzg AS MATERIALIZED (
+WITH nb AS (SELECT dev, b FROM hq_bins5 WHERE cov AND hr >= 1 AND hr < 5),
+gr AS (SELECT p.dev, p.ph, p.b::BIGINT AS b, p.ngreen FROM hq_p5 p JOIN nb n ON n.dev = p.dev AND n.b = p.b WHERE p.ngreen > 0),
+dn AS (SELECT g.dev, g.det, g.b::BIGINT AS b, x.ph FROM hq_g5 g JOIN hq_xbase x USING (dev, det) WHERE g.n > 0 AND x.ph IS NOT NULL),
+k AS (SELECT x.dev, x.det, gr.ngreen,
+             EXISTS (SELECT 1 FROM dn WHERE dn.dev = x.dev AND dn.det = x.det AND dn.b BETWEEN gr.b - 1 AND gr.b) AS own,
+             EXISTS (SELECT 1 FROM dn WHERE dn.dev = x.dev AND dn.ph = x.ph AND dn.det <> x.det AND dn.b BETWEEN gr.b - 1 AND gr.b) AS mate
+      FROM hq_xbase x JOIN gr ON gr.dev = x.dev AND gr.ph = x.ph)
+SELECT dev, det, sum(ngreen) AS g_all, coalesce(sum(ngreen) FILTER (own AND NOT mate), 0) AS g_alone,
+       coalesce(sum(ngreen) FILTER (NOT own AND NOT mate), 0) AS g_none
+FROM k GROUP BY dev, det
+),
 hq_tod AS (
-SELECT dev, det, first(tod_z ORDER BY coalesce(lvl, -1) DESC, d0) AS tod_z,
-       first(tod_dph ORDER BY coalesce(lvl, -1) DESC, d0) AS tod_dph,
-       first(n_night ORDER BY coalesce(lvl, -1) DESC, d0) AS tod_n_night,
-       first(r ORDER BY coalesce(lvl, -1) DESC, d0) AS tod_r, first(tod_mate_r ORDER BY coalesce(lvl, -1) DESC, d0) AS tod_mate_r,
-       first(d0 ORDER BY coalesce(lvl, -1) DESC, d0) AS tod_d0
-FROM hq_tdl GROUP BY dev, det
+SELECT dev, det, first(tod_z ORDER BY (coalesce(lvl, -1) > 0 AND NOT lz) DESC, coalesce(lvl, -1) DESC, d0) AS tod_z,
+       first(tod_dph ORDER BY (coalesce(lvl, -1) > 0 AND NOT lz) DESC, coalesce(lvl, -1) DESC, d0) AS tod_dph,
+       first(n_night ORDER BY (coalesce(lvl, -1) > 0 AND NOT lz) DESC, coalesce(lvl, -1) DESC, d0) AS tod_n_night,
+       first(r ORDER BY (coalesce(lvl, -1) > 0 AND NOT lz) DESC, coalesce(lvl, -1) DESC, d0) AS tod_r, first(tod_mate_r ORDER BY (coalesce(lvl, -1) > 0 AND NOT lz) DESC, coalesce(lvl, -1) DESC, d0) AS tod_mate_r,
+       first(d0 ORDER BY (coalesce(lvl, -1) > 0 AND NOT lz) DESC, coalesce(lvl, -1) DESC, d0) AS tod_d0,
+       coalesce(bool_and(lz) FILTER (lvl > 0), false)
+         AND NOT coalesce(any_value(g.g_alone) >= CAST(6.0 AS DOUBLE)
+                          AND any_value(g.g_alone) >= CAST(0.2 AS DOUBLE) * any_value(g.g_all)
+                          AND any_value(g.g_none) <= CAST(0.1 AS DOUBLE) * any_value(g.g_all), false) AS tod_lz,
+       any_value(g.g_all) AS tod_g_all, any_value(g.g_alone) AS tod_g_alone, any_value(g.g_none) AS tod_g_none
+FROM hq_tdl LEFT JOIN hq_lzg g USING (dev, det) GROUP BY dev, det
 ),
 hq_todnote AS (
 SELECT dev, first(d0 ORDER BY n_odd / greatest(n_ok, 1) DESC, d0) AS d0, first(n_odd ORDER BY n_odd / greatest(n_ok, 1)
@@ -1650,12 +1714,12 @@ hq_flatm AS MATERIALIZED (
 SELECT *, coalesce(occ_d >= 900 AND occ_d >= 3 * occ_n AND own_d < 0.8 * own_n, false) AS qzone FROM (
 WITH t AS (SELECT dev, hid, sum(M) AS S FROM hq_mh GROUP BY dev, hid),
 pm AS (SELECT m.dev, z.det, m.hid, sum(m.M) AS P FROM hq_mh m JOIN hq_dz zm USING (dev, det)
-       JOIN hq_dz z ON z.dev = m.dev AND z.ph = zm.ph AND z.det <> m.det WHERE z.ph IS NOT NULL GROUP BY m.dev, z.det, m.hid),
+       JOIN hq_dz z ON z.dev = m.dev AND z.ph = zm.ph AND z.det <> m.det WHERE z.ph IS NOT NULL AND NOT EXISTS (SELECT 1 FROM hq_ntm t WHERE t.dev = m.dev AND t.det = m.det AND t.own_d >= CAST(20.0 AS DOUBLE) AND t.own_n >= CAST(0.5 AS DOUBLE) * t.own_d) GROUP BY m.dev, z.det, m.hid),
 r AS (SELECT m.dev, m.det, x.hod, avg(m.M) AS own, avg(m.O) AS occ, avg(coalesce(p.P, t.S - m.M)) AS ref
       FROM hq_mh m JOIN hq_hix x USING (dev, hid) JOIN t USING (dev, hid) LEFT JOIN pm p USING (dev, det, hid)
       WHERE x.ch GROUP BY m.dev, m.det, x.hod)
 SELECT dev, det, list_avg(list(own ORDER BY hod) FILTER (hod >= 7 AND hod < 19)) AS own_d,
-       list_avg(list(own ORDER BY hod) FILTER (hod >= 1 AND hod < 5)) AS own_n,
+       list_avg(list(own ORDER BY hod) FILTER (hod >= 1 AND hod < 5)) AS own_n, list_sort(list(own) FILTER (hod >= 1 AND hod < 5), 'DESC')[2] AS own_n2,
        list_avg(list(ref ORDER BY hod) FILTER (hod >= 7 AND hod < 19)) AS rest_d,
        list_avg(list(ref ORDER BY hod) FILTER (hod >= 1 AND hod < 5)) AS rest_n,
        avg(occ) FILTER (hod >= 7 AND hod < 19) AS occ_d, avg(occ) FILTER (hod >= 1 AND hod < 5) AS occ_n,
@@ -1665,12 +1729,12 @@ FROM r GROUP BY dev, det)
 hq_flat AS MATERIALIZED (
 SELECT * FROM hq_flatm
 WHERE n_hod >= 20 AND rest_d >= 100 AND rest_n <= 0.3 * rest_d AND own_d >= 1.5 AND NOT qzone
-  AND ((own_n >= 0.8 * own_d AND coalesce(prof_corr, 0) < 0.6)
+  AND ((own_n >= 0.8 * own_d AND coalesce(own_n2, own_n) >= 0.8 * own_d AND coalesce(prof_corr, 0) < 0.6)
        OR (own_d < 30 AND own_n >= greatest(0.3, 2.5 * rest_n / rest_d) * own_d AND coalesce(prof_corr, 0) < 0.8))
 ),
 hq_xx AS MATERIALIZED (
-SELECT x.*, t.tod_z, t.tod_dph, t.tod_n_night, t.tod_r, t.tod_mate_r, t.tod_d0,
-f.det IS NOT NULL AS hq_flat, f.own_d AS flat_d, f.own_n AS flat_n, f.rest_d AS flat_rd, f.rest_n AS flat_rn, coalesce(fm.qzone, false) AS qzone,
+SELECT x.*, t.tod_z, t.tod_dph, t.tod_n_night, t.tod_r, t.tod_mate_r, t.tod_d0, t.tod_lz,
+f.det IS NOT NULL AS hq_flat, coalesce(f.det IS NOT NULL AND f.own_n > f.own_d, false) AS flat_nb, f.own_d AS flat_d, f.own_n AS flat_n, f.rest_d AS flat_rd, f.rest_n AS flat_rn, coalesce(fm.qzone, false) AS qzone,
        x.fn = 'Count' AND (len(x.alts) = 0 OR list_has_all(['Count'], x.alts)) AND NOT x.c1 AS count_on_ok,
        x.c1 AS c1_pre, CASE WHEN x.c1 THEN 'C1' WHEN x.c2 THEN 'C2' ELSE '' END AS cfg,
        x.fn IN ('Advance', 'Count', 'Yellow_Red') AND NOT list_has_any(x.alts, ['Presence', 'Other', 'Mid']) AS noq,
@@ -1724,7 +1788,7 @@ LEFT JOIN (SELECT dev, det, count(*) AS n_over, count(*) FILTER (counted) AS n_e
 ),
 hq_preS AS MATERIALIZED (
 SELECT x.dev, x.det, s.s_stuck_v AS v_stuck,
-  CASE WHEN x.count_on_ok THEN (CASE WHEN (coalesce(x.hi_min_c, 0)) IS NULL OR isnan(coalesce(x.hi_min_c, 0)) OR (l.lim_count_on) IS NULL OR isnan(l.lim_count_on) THEN NULL WHEN (coalesce(x.hi_min_c, 0)) < (l.lim_count_on) THEN 0.0 ELSE least(0.35 + 0.40 * greatest(((coalesce(x.hi_min_c, 0)) - (l.lim_count_on)) / greatest((l.bad_count_on) - (l.lim_count_on), 1e-9), 0.0), 1.0) END) END AS v_count_on,
+  CASE WHEN x.count_on_ok THEN greatest((CASE WHEN (coalesce(x.hi_min_c, 0)) IS NULL OR isnan(coalesce(x.hi_min_c, 0)) OR (l.lim_count_on) IS NULL OR isnan(l.lim_count_on) THEN NULL WHEN (coalesce(x.hi_min_c, 0)) < (l.lim_count_on) THEN 0.0 ELSE least(0.35 + 0.40 * greatest(((coalesce(x.hi_min_c, 0)) - (l.lim_count_on)) / greatest((l.bad_count_on) - (l.lim_count_on), 1e-9), 0.0), 1.0) END), coalesce(CASE WHEN x.fn <> 'Bike' AND x.mo_min IS NOT NULL THEN CASE WHEN coalesce(x.mo_nm, 0) = 0 THEN least((CASE WHEN (x.mo_min) IS NULL OR isnan(x.mo_min) OR (CAST(30.0 AS DOUBLE)) IS NULL OR isnan(CAST(30.0 AS DOUBLE)) THEN NULL WHEN (x.mo_min) < (CAST(30.0 AS DOUBLE)) THEN 0.0 ELSE least(0.35 + 0.40 * greatest(((x.mo_min) - (CAST(30.0 AS DOUBLE))) / greatest((CAST(60.0 AS DOUBLE)) - (CAST(30.0 AS DOUBLE)), 1e-9), 0.0), 1.0) END), CAST(0.5 AS DOUBLE)) ELSE (CASE WHEN (x.mo_min) IS NULL OR isnan(x.mo_min) OR (CAST(30.0 AS DOUBLE)) IS NULL OR isnan(CAST(30.0 AS DOUBLE)) THEN NULL WHEN (x.mo_min) < (CAST(30.0 AS DOUBLE)) THEN 0.0 ELSE least(0.35 + 0.40 * greatest(((x.mo_min) - (CAST(30.0 AS DOUBLE))) / greatest((CAST(60.0 AS DOUBLE)) - (CAST(30.0 AS DOUBLE)), 1e-9), 0.0), 1.0) END) END END, 0.0)) ELSE CASE WHEN x.fn <> 'Bike' AND x.mo_min IS NOT NULL THEN CASE WHEN coalesce(x.mo_nm, 0) = 0 THEN least((CASE WHEN (x.mo_min) IS NULL OR isnan(x.mo_min) OR (CAST(30.0 AS DOUBLE)) IS NULL OR isnan(CAST(30.0 AS DOUBLE)) THEN NULL WHEN (x.mo_min) < (CAST(30.0 AS DOUBLE)) THEN 0.0 ELSE least(0.35 + 0.40 * greatest(((x.mo_min) - (CAST(30.0 AS DOUBLE))) / greatest((CAST(60.0 AS DOUBLE)) - (CAST(30.0 AS DOUBLE)), 1e-9), 0.0), 1.0) END), CAST(0.5 AS DOUBLE)) ELSE (CASE WHEN (x.mo_min) IS NULL OR isnan(x.mo_min) OR (CAST(30.0 AS DOUBLE)) IS NULL OR isnan(CAST(30.0 AS DOUBLE)) THEN NULL WHEN (x.mo_min) < (CAST(30.0 AS DOUBLE)) THEN 0.0 ELSE least(0.35 + 0.40 * greatest(((x.mo_min) - (CAST(30.0 AS DOUBLE))) / greatest((CAST(60.0 AS DOUBLE)) - (CAST(30.0 AS DOUBLE)), 1e-9), 0.0), 1.0) END) END END END AS v_count_on,
   CASE WHEN x.fn = 'Bike' THEN NULL WHEN x.silent THEN 0.0 
        WHEN x.drop_b1 - x.drop_b0 < 3 THEN least(x.sd, 0.5) ELSE x.sd END AS v_dropout,
   CASE WHEN x.fn = 'Bike' OR NOT x.geh_ok THEN NULL 
@@ -1739,8 +1803,8 @@ WHEN x.geh_drop IS NOT NULL AND x.occ_own >= 3.0 AND x.occ_own >= 3.0 * coalesce
   CASE WHEN x.fn = 'Bike' THEN NULL 
        WHEN x.moved AND coalesce(x.drop_lam, 0) < 50 THEN 0.0
        WHEN x.moved AND coalesce(x.drop_lam, 0) < 100 THEN least(x.sd, 0.5)
-       WHEN x.moved THEN x.sd ELSE x.nd END AS v_night_drop,
-  CASE WHEN x.fn <> 'Bike' AND coalesce(CASE WHEN x.silent THEN 0.0 ELSE x.sd END, 0)
+       WHEN x.moved THEN x.sd WHEN coalesce(x.pv, 0) >= 0.35 AND NOT (coalesce(x.tod_lz, false) AND coalesce(s.s_stuck_v, 0) < 0.35 AND NOT coalesce(x.hq_flat, false)) THEN 0.0 ELSE x.nd END AS v_night_drop,
+  CASE WHEN (coalesce(x.tod_lz, false) AND coalesce(s.s_stuck_v, 0) < 0.35 AND NOT coalesce(x.hq_flat, false)) THEN CASE WHEN x.pv IS NOT NULL THEN 0.0 END WHEN x.fn <> 'Bike' AND coalesce(CASE WHEN x.silent THEN 0.0 ELSE x.sd END, 0)
             >= 0.42
        THEN CASE WHEN x.pv IS NOT NULL THEN 0.0 END ELSE x.pv END AS v_prof,
   CASE WHEN x.N >= 50 THEN (CASE WHEN (x.xr + 1e-9 * (x.xr > 0)::INT) IS NULL OR isnan(x.xr + 1e-9 * (x.xr > 0)::INT) OR (1.0) IS NULL OR isnan(1.0) THEN NULL WHEN (x.xr + 1e-9 * (x.xr > 0)::INT) < (1.0) THEN 0.0 ELSE least(0.35 + 0.40 * greatest(((x.xr + 1e-9 * (x.xr > 0)::INT) - (1.0)) / greatest((l.bad_rapid / l.lim_rapid) - (1.0), 1e-9), 0.0), 1.0) END) END AS v_rapid,
@@ -2008,7 +2072,7 @@ SELECT * FROM (
   GROUP BY h.dev, h.det, r.dev, r.ph, r.ha, r.hz, r.md HAVING count(*) FILTER (abs(h.M - h.md) <= 0.01 * h.md + 1) >= 3)
 QUALIFY row_number() OVER (PARTITION BY dev, det ORDER BY hz - ha DESC, ph, ha) = 1
 ),
-hq_xf AS MATERIALIZED (
+hq_xfh AS MATERIALIZED (
 SELECT x.* EXCLUDE (mpd, mlk) REPLACE (
          CASE WHEN mlk THEN 1e6 WHEN mpd THEN k.ex - k.obs ELSE x.drop_lam END AS drop_lam,
          CASE WHEN mlk THEN (l.ha * 3600000000000 - w.s_ns) // 300000000000 WHEN mpd THEN (k.ha * 3600000000000 - w.s_ns) // 300000000000
@@ -2023,6 +2087,38 @@ FROM (SELECT x.*, coalesce(k.ex >= 30 AND k.obs <= 0.25 * k.ex AND k.ex - k.obs 
                            AND k.ex - k.obs > coalesce(x.drop_lam, 0), false) AS mpd, l.det IS NOT NULL AS mlk
       FROM hq_xfs x LEFT JOIN hq_pdk k USING (dev, det) LEFT JOIN hq_lkd l USING (dev, det)) x
 LEFT JOIN hq_pdk k USING (dev, det) LEFT JOIN hq_lkd l USING (dev, det) JOIN hq_win w USING (dev)
+),
+hq_shh AS MATERIALIZED (
+SELECT dev, det, s, f FROM hq_hiv UNION ALL SELECT dev, det, s, f FROM hq_efl WHERE label <> 'queue'
+),
+hq_shb AS MATERIALIZED (
+SELECT d.dev, d.det, g.b, g.n,
+       EXISTS (SELECT 1 FROM hq_shh h WHERE h.dev = d.dev AND h.det = d.det AND h.f > g.b * 300.0 AND h.s < (g.b + 1) * 300.0) AS held
+FROM hq_xfh d JOIN hq_g5 g ON g.dev = d.dev AND g.det = d.det AND g.b >= d.drop_b0 AND g.b < d.drop_b1
+WHERE d.drop_b1 > d.drop_b0
+  AND EXISTS (SELECT 1 FROM hq_shh h WHERE h.dev = d.dev AND h.det = d.det AND h.f > d.drop_b0 * 300.0 AND h.s < d.drop_b1 * 300.0)
+),
+hq_shr AS MATERIALIZED (
+SELECT o.dev, o.det, r.a, r.z, r.obs FROM (SELECT DISTINCT dev, det FROM hq_shb) o LEFT JOIN (
+  SELECT dev, det, min(b) AS a, max(b) + 1 AS z, sum(n) AS obs FROM (
+    SELECT *, b - row_number() OVER (PARTITION BY dev, det ORDER BY b) AS grp FROM hq_shb WHERE NOT held)
+  GROUP BY dev, det, grp
+  QUALIFY row_number() OVER (PARTITION BY dev, det ORDER BY max(b) + 1 - min(b) DESC, min(b)) = 1) r USING (dev, det)
+),
+hq_xf AS MATERIALIZED (
+SELECT x.* REPLACE (
+    CASE WHEN c.dev IS NULL THEN x.drop_lam WHEN c.a IS NULL THEN 0.0
+         ELSE x.drop_lam * (c.z - c.a) / (x.drop_b1 - x.drop_b0) END AS drop_lam,
+    CASE WHEN c.dev IS NULL THEN x.drop_b0 WHEN c.a IS NULL THEN -1 ELSE c.a END AS drop_b0,
+    CASE WHEN c.dev IS NULL THEN x.drop_b1 WHEN c.a IS NULL THEN -1 ELSE c.z END AS drop_b1,
+    CASE WHEN c.dev IS NULL THEN x.s_dropout WHEN c.a IS NULL THEN 0.0
+         WHEN x.drop_lam * (c.z - c.a) / (x.drop_b1 - x.drop_b0) < 30 THEN 0.0
+         ELSE least(x.s_dropout, 0.35 + 0.65 * least((x.drop_lam * (c.z - c.a) / (x.drop_b1 - x.drop_b0) - 30) / 70, 1)) END
+      AS s_dropout,
+    CASE WHEN c.dev IS NULL OR NOT x.ph_drop THEN x.ph_obs WHEN c.a IS NULL THEN 0 ELSE c.obs END AS ph_obs,
+    CASE WHEN c.dev IS NULL OR NOT x.ph_drop THEN x.ph_exp WHEN c.a IS NULL THEN 0.0
+         ELSE x.ph_exp * (c.z - c.a) / (x.drop_b1 - x.drop_b0) END AS ph_exp)
+FROM hq_xfh x LEFT JOIN hq_shr c USING (dev, det)
 ),
 hq_lcz AS MATERIALIZED (
 SELECT * FROM (
@@ -2243,7 +2339,7 @@ FROM (SELECT x.*, (epoch_ns(x.drop_t) - w.s_ns) // 300000000000 AS l0,
 ),
 hq_finS AS MATERIALIZED (
 SELECT x.dev, x.det, s.s_stuck_v AS v_stuck,
-  CASE WHEN x.count_on_ok THEN (CASE WHEN (coalesce(x.hi_min_c, 0)) IS NULL OR isnan(coalesce(x.hi_min_c, 0)) OR (l.lim_count_on) IS NULL OR isnan(l.lim_count_on) THEN NULL WHEN (coalesce(x.hi_min_c, 0)) < (l.lim_count_on) THEN 0.0 ELSE least(0.35 + 0.40 * greatest(((coalesce(x.hi_min_c, 0)) - (l.lim_count_on)) / greatest((l.bad_count_on) - (l.lim_count_on), 1e-9), 0.0), 1.0) END) END AS v_count_on,
+  CASE WHEN x.count_on_ok THEN greatest((CASE WHEN (coalesce(x.hi_min_c, 0)) IS NULL OR isnan(coalesce(x.hi_min_c, 0)) OR (l.lim_count_on) IS NULL OR isnan(l.lim_count_on) THEN NULL WHEN (coalesce(x.hi_min_c, 0)) < (l.lim_count_on) THEN 0.0 ELSE least(0.35 + 0.40 * greatest(((coalesce(x.hi_min_c, 0)) - (l.lim_count_on)) / greatest((l.bad_count_on) - (l.lim_count_on), 1e-9), 0.0), 1.0) END), coalesce(CASE WHEN x.fn <> 'Bike' AND x.mo_min IS NOT NULL THEN CASE WHEN coalesce(x.mo_nm, 0) = 0 THEN least((CASE WHEN (x.mo_min) IS NULL OR isnan(x.mo_min) OR (CAST(30.0 AS DOUBLE)) IS NULL OR isnan(CAST(30.0 AS DOUBLE)) THEN NULL WHEN (x.mo_min) < (CAST(30.0 AS DOUBLE)) THEN 0.0 ELSE least(0.35 + 0.40 * greatest(((x.mo_min) - (CAST(30.0 AS DOUBLE))) / greatest((CAST(60.0 AS DOUBLE)) - (CAST(30.0 AS DOUBLE)), 1e-9), 0.0), 1.0) END), CAST(0.5 AS DOUBLE)) ELSE (CASE WHEN (x.mo_min) IS NULL OR isnan(x.mo_min) OR (CAST(30.0 AS DOUBLE)) IS NULL OR isnan(CAST(30.0 AS DOUBLE)) THEN NULL WHEN (x.mo_min) < (CAST(30.0 AS DOUBLE)) THEN 0.0 ELSE least(0.35 + 0.40 * greatest(((x.mo_min) - (CAST(30.0 AS DOUBLE))) / greatest((CAST(60.0 AS DOUBLE)) - (CAST(30.0 AS DOUBLE)), 1e-9), 0.0), 1.0) END) END END, 0.0)) ELSE CASE WHEN x.fn <> 'Bike' AND x.mo_min IS NOT NULL THEN CASE WHEN coalesce(x.mo_nm, 0) = 0 THEN least((CASE WHEN (x.mo_min) IS NULL OR isnan(x.mo_min) OR (CAST(30.0 AS DOUBLE)) IS NULL OR isnan(CAST(30.0 AS DOUBLE)) THEN NULL WHEN (x.mo_min) < (CAST(30.0 AS DOUBLE)) THEN 0.0 ELSE least(0.35 + 0.40 * greatest(((x.mo_min) - (CAST(30.0 AS DOUBLE))) / greatest((CAST(60.0 AS DOUBLE)) - (CAST(30.0 AS DOUBLE)), 1e-9), 0.0), 1.0) END), CAST(0.5 AS DOUBLE)) ELSE (CASE WHEN (x.mo_min) IS NULL OR isnan(x.mo_min) OR (CAST(30.0 AS DOUBLE)) IS NULL OR isnan(CAST(30.0 AS DOUBLE)) THEN NULL WHEN (x.mo_min) < (CAST(30.0 AS DOUBLE)) THEN 0.0 ELSE least(0.35 + 0.40 * greatest(((x.mo_min) - (CAST(30.0 AS DOUBLE))) / greatest((CAST(60.0 AS DOUBLE)) - (CAST(30.0 AS DOUBLE)), 1e-9), 0.0), 1.0) END) END END END AS v_count_on,
   CASE WHEN x.fn = 'Bike' THEN NULL WHEN x.silent THEN 0.0 WHEN x.lc_d THEN 0.0
        WHEN x.drop_b1 - x.drop_b0 < 3 THEN least(x.sd, 0.5) ELSE x.sd END AS v_dropout,
   CASE WHEN x.fn = 'Bike' OR NOT x.geh_ok THEN NULL WHEN x.lc_l THEN 0.0
@@ -2258,8 +2354,8 @@ WHEN x.geh_drop IS NOT NULL AND x.occ_own >= 3.0 AND x.occ_own >= 3.0 * coalesce
   CASE WHEN x.fn = 'Bike' THEN NULL WHEN x.moved AND x.lc_d THEN 0.0
        WHEN x.moved AND coalesce(x.drop_lam, 0) < 50 THEN 0.0
        WHEN x.moved AND coalesce(x.drop_lam, 0) < 100 THEN least(x.sd, 0.5)
-       WHEN x.moved THEN x.sd ELSE x.nd END AS v_night_drop,
-  CASE WHEN x.fn <> 'Bike' AND coalesce(CASE WHEN x.silent THEN 0.0 ELSE x.sd END, 0)
+       WHEN x.moved THEN x.sd WHEN coalesce(x.pv, 0) >= 0.35 AND NOT (coalesce(x.tod_lz, false) AND coalesce(s.s_stuck_v, 0) < 0.35 AND NOT coalesce(x.hq_flat, false)) THEN 0.0 ELSE x.nd END AS v_night_drop,
+  CASE WHEN (coalesce(x.tod_lz, false) AND coalesce(s.s_stuck_v, 0) < 0.35 AND NOT coalesce(x.hq_flat, false)) THEN CASE WHEN x.pv IS NOT NULL THEN 0.0 END WHEN x.fn <> 'Bike' AND coalesce(CASE WHEN x.silent THEN 0.0 ELSE x.sd END, 0)
             >= 0.42
        THEN CASE WHEN x.pv IS NOT NULL THEN 0.0 END ELSE x.pv END AS v_prof,
   CASE WHEN x.N >= 50 THEN (CASE WHEN (x.xr + 1e-9 * (x.xr > 0)::INT) IS NULL OR isnan(x.xr + 1e-9 * (x.xr > 0)::INT) OR (1.0) IS NULL OR isnan(1.0) THEN NULL WHEN (x.xr + 1e-9 * (x.xr > 0)::INT) < (1.0) THEN 0.0 ELSE least(0.35 + 0.40 * greatest(((x.xr + 1e-9 * (x.xr > 0)::INT) - (1.0)) / greatest((l.bad_rapid / l.lim_rapid) - (1.0), 1e-9), 0.0), 1.0) END) END AS v_rapid,
@@ -2363,7 +2459,7 @@ WHERE u.lam >= l.lim_dropout AND NOT (u.a < x.drop_b1 AND u.z > x.drop_b0) AND N
 ),
 hq_evid AS (
 SELECT f.dev, f.det, f.key, f.ki,
-       CASE WHEN f.key = 'prof' AND x.hq_flat THEN 'No daily pattern' ELSE f.cat END AS cat, f.sc, f.sev, CASE f.key
+       CASE WHEN f.key = 'prof' AND x.hq_flat AND NOT x.flat_nb THEN 'No daily pattern' ELSE f.cat END AS cat, f.sc, f.sev, CASE f.key
   WHEN 'stuck' THEN CASE WHEN e.n_tog > 0 THEN 'held ON ' || CASE WHEN e.n_tog = 1
         THEN (CASE WHEN (e.tog_dur) < 300 THEN format('{:.0f} s', (e.tog_dur)) WHEN round_even((e.tog_dur) / 60.0, 0)::BIGINT < 60 THEN round_even((e.tog_dur) / 60.0, 0)::BIGINT || ' min' ELSE (round_even((e.tog_dur) / 60.0, 0)::BIGINT // 60) || ' h' || CASE WHEN round_even((e.tog_dur) / 60.0, 0)::BIGINT % 60 > 0 THEN ' ' || (round_even((e.tog_dur) / 60.0, 0)::BIGINT % 60) || ' min' ELSE '' END END) || ' from ' || strftime(make_timestamp((w.s_ns + round((e.tog_t0) * 1e9)::BIGINT) // 1000), '%a %H:%M')
         ELSE e.n_tog || ' times from ' || strftime(make_timestamp((w.s_ns + round((e.tog_t0) * 1e9)::BIGINT) // 1000), '%a %H:%M') || ', ' || (CASE WHEN (e.tog_tot) < 300 THEN format('{:.0f} s', (e.tog_tot)) WHEN round_even((e.tog_tot) / 60.0, 0)::BIGINT < 60 THEN round_even((e.tog_tot) / 60.0, 0)::BIGINT || ' min' ELSE (round_even((e.tog_tot) / 60.0, 0)::BIGINT // 60) || ' h' || CASE WHEN round_even((e.tog_tot) / 60.0, 0)::BIGINT % 60 > 0 THEN ' ' || (round_even((e.tog_tot) / 60.0, 0)::BIGINT % 60) || ' min' ELSE '' END END) || ' in total' END
@@ -2371,8 +2467,8 @@ SELECT f.dev, f.det, f.key, f.ki,
       WHEN e.n_cnt > 1 THEN 'held ON ' || e.n_cnt || ' times, ' || (CASE WHEN (e.tot) < 300 THEN format('{:.0f} s', (e.tot)) WHEN round_even((e.tot) / 60.0, 0)::BIGINT < 60 THEN round_even((e.tot) / 60.0, 0)::BIGINT || ' min' ELSE (round_even((e.tot) / 60.0, 0)::BIGINT // 60) || ' h' || CASE WHEN round_even((e.tot) / 60.0, 0)::BIGINT % 60 > 0 THEN ' ' || (round_even((e.tot) / 60.0, 0)::BIGINT % 60) || ' min' ELSE '' END END) || ' in total' || CASE WHEN e.n_nq > 0 AND e.n_nq = e.n_cnt THEN format('; not a queue: at the same traffic it was ON {:.0f} % of the time', 100 * e.nq_occ) ELSE '' END
       WHEN e.n_cnt = 1 THEN 'held ON ' || (CASE WHEN (e.tot) < 300 THEN format('{:.0f} s', (e.tot)) WHEN round_even((e.tot) / 60.0, 0)::BIGINT < 60 THEN round_even((e.tot) / 60.0, 0)::BIGINT || ' min' ELSE (round_even((e.tot) / 60.0, 0)::BIGINT // 60) || ' h' || CASE WHEN round_even((e.tot) / 60.0, 0)::BIGINT % 60 > 0 THEN ' ' || (round_even((e.tot) / 60.0, 0)::BIGINT % 60) || ' min' ELSE '' END END) || ' from ' || strftime(make_timestamp((w.s_ns + round((e.t0) * 1e9)::BIGINT) // 1000), '%a %H:%M') || CASE WHEN e.n_nq > 0 AND e.n_nq = e.n_cnt THEN format('; not a queue: at the same traffic it was ON {:.0f} % of the time', 100 * e.nq_occ) ELSE '' END
       ELSE 'held ON up to ' || (CASE WHEN (x.stuck_x) < 300 THEN format('{:.0f} s', (x.stuck_x)) WHEN round_even((x.stuck_x) / 60.0, 0)::BIGINT < 60 THEN round_even((x.stuck_x) / 60.0, 0)::BIGINT || ' min' ELSE (round_even((x.stuck_x) / 60.0, 0)::BIGINT // 60) || ' h' || CASE WHEN round_even((x.stuck_x) / 60.0, 0)::BIGINT % 60 > 0 THEN ' ' || (round_even((x.stuck_x) / 60.0, 0)::BIGINT % 60) || ' min' ELSE '' END END) END
-  WHEN 'count_on' THEN format('count zone ON up to {:.0f} % in light traffic for {:.0f} min', 100 * x.hi_occ_max,
-                              x.hi_min_c)
+  WHEN 'count_on' THEN CASE WHEN x.mo_min IS NOT NULL AND NOT coalesce(x.count_on_ok AND x.hi_min_c >= l.lim_count_on, false) THEN format('held ON {:.0f} % of the time for ', 100 * x.mo_occ) || (CASE WHEN (60 * x.mo_long) < 300 THEN format('{:.0f} s', (60 * x.mo_long)) WHEN round_even((60 * x.mo_long) / 60.0, 0)::BIGINT < 60 THEN round_even((60 * x.mo_long) / 60.0, 0)::BIGINT || ' min' ELSE (round_even((60 * x.mo_long) / 60.0, 0)::BIGINT // 60) || ' h' || CASE WHEN round_even((60 * x.mo_long) / 60.0, 0)::BIGINT % 60 > 0 THEN ' ' || (round_even((60 * x.mo_long) / 60.0, 0)::BIGINT % 60) || ' min' ELSE '' END END) || ' from ' || strftime(make_timestamp((w.s_ns + x.mo_t0 * 600000000000) // 1000), '%a %H:%M') || CASE WHEN x.mo_n > 1 THEN format(' ({} times, {:.0f} min in total)', x.mo_n, x.mo_min) ELSE '' END || CASE WHEN coalesce(x.mo_nm, 0) = 0 THEN ', no phase mates to compare with' ELSE format(' while its phase mates were ON {:.0f} %', 100 * x.mo_mocc) END || ' (flickering OFF and ON)' ELSE format('count zone ON up to {:.0f} % in light traffic for {:.0f} min', 100 * x.hi_occ_max,
+                              x.hi_min_c) END
   WHEN 'dropout' THEN CASE WHEN x.ph_lock THEN 'logs the same count as ' || (x.lk_n - 1) || ' other detectors on P' || trunc(x.ph)::BIGINT || ' every hour ' || CASE WHEN w.hours > 24.5 THEN strftime(make_timestamp((w.s_ns + x.drop_b0 * 300000000000) // 1000), '%a %H:%M') ELSE strftime(make_timestamp((w.s_ns + x.drop_b0 * 300000000000) // 1000), '%H:%M') END || '-' || CASE WHEN w.hours > 24.5 THEN strftime(make_timestamp((w.s_ns + x.drop_b1 * 300000000000) // 1000), '%a %H:%M') ELSE strftime(make_timestamp((w.s_ns + x.drop_b1 * 300000000000) // 1000), '%H:%M') END || format(' (~{:,.0f} an hour each): the inputs no longer see vehicles and log the same pulses (detector card in fail-safe, or a call placed on them)', x.lk_md) WHEN x.ph_drop THEN 'whole phase dropped ' || CASE WHEN w.hours > 24.5 THEN strftime(make_timestamp((w.s_ns + x.drop_b0 * 300000000000) // 1000), '%a %H:%M') ELSE strftime(make_timestamp((w.s_ns + x.drop_b0 * 300000000000) // 1000), '%H:%M') END || '-' || CASE WHEN w.hours > 24.5 THEN strftime(make_timestamp((w.s_ns + x.drop_b1 * 300000000000) // 1000), '%a %H:%M') ELSE strftime(make_timestamp((w.s_ns + x.drop_b1 * 300000000000) // 1000), '%H:%M') END || format(': {:,.0f} actuations where ~{:,.0f} expected; ', x.ph_obs, x.ph_exp) || x.ph_k || ' of ' || x.ph_m || ' detectors on P' || trunc(x.ph)::BIGINT || ' fell together while the rest of the signal counted normally (approach closed, or a shared card / cable)' ELSE 'no actuations ' || CASE WHEN w.hours > 24.5 THEN strftime(make_timestamp((w.s_ns + x.drop_b0 * 300000000000) // 1000), '%a %H:%M') ELSE strftime(make_timestamp((w.s_ns + x.drop_b0 * 300000000000) // 1000), '%H:%M') END || '-' || CASE WHEN w.hours > 24.5 THEN strftime(make_timestamp((w.s_ns + x.drop_b1 * 300000000000) // 1000), '%a %H:%M') ELSE strftime(make_timestamp((w.s_ns + x.drop_b1 * 300000000000) // 1000), '%H:%M') END || format('; ~{:,.0f} expected', x.drop_lam) || CASE WHEN x.sig_silent THEN '; every detector at the signal was silent while it kept serving greens (all inputs lost: detector rack / cabinet)' ELSE '' END END || coalesce((SELECT '; also ' || string_agg(strftime(make_timestamp((w.s_ns + u.a * 300000000000) // 1000), '%a %H:%M') || '-' || strftime(make_timestamp((w.s_ns + u.z * 300000000000) // 1000), '%a %H:%M') || format(' (~{:,.0f})', u.lam), ', ' ORDER BY u.a) FILTER (u.rk <= 3) || CASE WHEN count(*) > 3 THEN format(' and {} more', count(*) - 3) ELSE '' END FROM (SELECT *, row_number() OVER (ORDER BY round(lam, 6) DESC, a) AS rk FROM hq_silmore WHERE dev = x.dev AND det = x.det) u), '')
   WHEN 'night_drop' THEN CASE WHEN v.silent_night THEN CASE WHEN x.ph_lock THEN 'logs the same count as ' || (x.lk_n - 1) || ' other detectors on P' || trunc(x.ph)::BIGINT || ' every hour ' || CASE WHEN w.hours > 24.5 THEN strftime(make_timestamp((w.s_ns + x.drop_b0 * 300000000000) // 1000), '%a %H:%M') ELSE strftime(make_timestamp((w.s_ns + x.drop_b0 * 300000000000) // 1000), '%H:%M') END || '-' || CASE WHEN w.hours > 24.5 THEN strftime(make_timestamp((w.s_ns + x.drop_b1 * 300000000000) // 1000), '%a %H:%M') ELSE strftime(make_timestamp((w.s_ns + x.drop_b1 * 300000000000) // 1000), '%H:%M') END || format(' (~{:,.0f} an hour each): the inputs no longer see vehicles and log the same pulses (detector card in fail-safe, or a call placed on them)', x.lk_md) WHEN x.ph_drop THEN 'whole phase dropped ' || CASE WHEN w.hours > 24.5 THEN strftime(make_timestamp((w.s_ns + x.drop_b0 * 300000000000) // 1000), '%a %H:%M') ELSE strftime(make_timestamp((w.s_ns + x.drop_b0 * 300000000000) // 1000), '%H:%M') END || '-' || CASE WHEN w.hours > 24.5 THEN strftime(make_timestamp((w.s_ns + x.drop_b1 * 300000000000) // 1000), '%a %H:%M') ELSE strftime(make_timestamp((w.s_ns + x.drop_b1 * 300000000000) // 1000), '%H:%M') END || format(': {:,.0f} actuations where ~{:,.0f} expected; ', x.ph_obs, x.ph_exp) || x.ph_k || ' of ' || x.ph_m || ' detectors on P' || trunc(x.ph)::BIGINT || ' fell together while the rest of the signal counted normally (approach closed, or a shared card / cable)' ELSE 'no actuations ' || CASE WHEN w.hours > 24.5 THEN strftime(make_timestamp((w.s_ns + x.drop_b0 * 300000000000) // 1000), '%a %H:%M') ELSE strftime(make_timestamp((w.s_ns + x.drop_b0 * 300000000000) // 1000), '%H:%M') END || '-' || CASE WHEN w.hours > 24.5 THEN strftime(make_timestamp((w.s_ns + x.drop_b1 * 300000000000) // 1000), '%a %H:%M') ELSE strftime(make_timestamp((w.s_ns + x.drop_b1 * 300000000000) // 1000), '%H:%M') END || format('; ~{:,.0f} expected', x.drop_lam) || CASE WHEN x.sig_silent THEN '; every detector at the signal was silent while it kept serving greens (all inputs lost: detector rack / cabinet)' ELSE '' END END || coalesce((SELECT '; also ' || string_agg(strftime(make_timestamp((w.s_ns + u.a * 300000000000) // 1000), '%a %H:%M') || '-' || strftime(make_timestamp((w.s_ns + u.z * 300000000000) // 1000), '%a %H:%M') || format(' (~{:,.0f})', u.lam), ', ' ORDER BY u.a) FILTER (u.rk <= 3) || CASE WHEN count(*) > 3 THEN format(' and {} more', count(*) - 3) ELSE '' END FROM (SELECT *, row_number() OVER (ORDER BY round(lam, 6) DESC, a) AS rk FROM hq_silmore WHERE dev = x.dev AND det = x.det) u), '') WHEN x.geh_night_exp IS NOT NULL
        THEN format('night {:,.0f} actuations vs ~{:,.0f} expected (GEH {:.1f})', x.geh_night_n, x.geh_night_exp,
@@ -2394,7 +2490,8 @@ SELECT f.dev, f.det, f.key, f.ki,
                            x.spk_gmax, x.spk_daily)
   WHEN 'volume' THEN format('busiest 5 min {:,.0f} veh/h/lane vs limit {:,.0f}', x.q5_use, l.lim_volume)
   WHEN 'rise' THEN CASE WHEN x.mr_r >= 100 THEN 'counts rose far above its phase mates, which gave almost nothing at that time of day on the other days: ' ELSE format('counts rose to {:.1f} x what its phase mates gave at that time of day on the other days: ', x.mr_r) END || strftime(make_timestamp(x.mr_a * 3600000000), '%a %H:%M') || '-' || strftime(make_timestamp(x.mr_z * 3600000000), '%H:%M') || format(' ({} h, GEH {:.0f}): extra calls', x.mr_h, x.mr_geh)
-  WHEN 'prof' THEN CASE WHEN x.hq_flat THEN format('counts do not follow the day: ~{:.0f} an hour by day, ~{:.0f} at night, while '
+  WHEN 'prof' THEN CASE WHEN x.flat_nb THEN format('busier at night than by day: ~{:.0f} an hour at night, ~{:.0f} by day, while '
+       || 'the rest of the signal drops from ~{:,.0f} to ~{:,.0f}', x.flat_n, x.flat_d, x.flat_rd, x.flat_rn) WHEN x.hq_flat THEN format('counts do not follow the day: ~{:.0f} an hour by day, ~{:.0f} at night, while '
        || 'the rest of the signal drops from ~{:,.0f} to ~{:,.0f} (noise, not traffic)',
        x.flat_d, x.flat_n, x.flat_rd, x.flat_rn) ELSE
        format('night level {:.0f} % of its busiest hours; phase mates ', 100 * x.tod_r ^ 2)

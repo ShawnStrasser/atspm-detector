@@ -81,7 +81,7 @@ CONTEXT = dict(
     PED_PIECES=(("^stuck ON", "stuck on"), ("^held ON", "long hold"), ("^presses every", "machine-regular presses"),
                 ("^pressed ", "never calls a walk"), ("^no presses for", "sudden stop"), ("^walks jumped with no presses", "walks without presses"), ("^sustained pressing: ", "sustained pressing")),
     PED_SPLIT="; (stuck ON: |held ON |presses every |pressed |no presses for |walks jumped with no presses |sustained pressing: )",
-    PED_NOTES=(("^omitted during preemption", _ped.NOTE), ("^possible configuration issue|ped calls for P[0-9]+ waited", "call dropped"),
+    PED_NOTES=(("walks every cycle with no presses: recall", "recall (inferred)"), ("^omitted during preemption", _ped.NOTE), ("^possible configuration issue|ped calls for P[0-9]+ waited", "call dropped"),
                ("^never calls a walk not checked", "never calls a walk not checked"),
                ("^serves ped overlap", "serves ped overlap"), ("^calls P[0-9]+ and P[0-9]+ at once|^calls two ped phases", "calls two ped phases"),
                ("on ped recall", "on ped recall"), ("^same button as ped", "one button wired to two inputs"),
@@ -195,11 +195,14 @@ def _finish(frame: pd.DataFrame, cols: list) -> pd.DataFrame:
 
 
 def event_windows(con, events_table: str = "events", detectors_table: str = "detectors", start=None, end=None,
-                  windows_table: str | None = None, bin_origin: str = "window", ped: bool = False) -> pd.DataFrame:
+                  windows_table: str | None = None, bin_origin: str = "window", ped: bool = False,
+                  ped_hist: str | None = None) -> pd.DataFrame:
     """Each signal's judged window (WINDOW_COLS), by the rules of the vehicle health (ped=True: of the ped health) on the same
-    arguments.  ped=True gives only the signals with ped input events."""
+    arguments.  ped=True gives only the signals with ped input events (ped_hist: and those with presses in that table of
+    earlier press counts, as the ped option stop_history judges them)."""
     if ped:
-        sql = _plan.steps(_render.render("ped/windows.sql", E=events_table, start=start, end=end, CODES=_ped.CODES, carry=False))[0][1]
+        sql = _plan.steps(_render.render("ped/windows.sql", E=events_table, start=start, end=end, CODES=_ped.CODES, carry=False,
+                                         hist=ped_hist))[0][1]
         return con.execute(f'SELECT DeviceId, make_timestamp((s * 1e6)::BIGINT) AS "start", make_timestamp((e * 1e6)::BIGINT) AS "end" '
                            f"FROM ({sql})").df()
     if windows_table is None:
@@ -219,7 +222,8 @@ def health(con, events_table: str = "events", detectors_table: str = "detectors"
            vehicle: bool = True, ped: bool | None = None, summary: bool = False,
            windows_table: str | None = None, max_events: int | None = 4_000_000,
            ped_max_events: int | None = 3_000_000, distinct: bool = True, options: dict | None = None,
-           ped_options: dict | None = None, ped_assign: bool = False, workers: int = 1, bin_origin: str = "window"):
+           ped_options: dict | None = None, ped_assign: bool = False, workers: int = 1, bin_origin: str = "window",
+           ped_history=None):
     """The health of the vehicle detectors and ped buttons of `events_table` on an existing DuckDB connection (nothing is
     copied out): the findings table (FINDING_COLS), or with summary=True (findings, status).
 
@@ -238,7 +242,9 @@ def health(con, events_table: str = "events", detectors_table: str = "detectors"
     ped_assign        also run the ped movement model (ped_assign; needs onnxruntime)
     workers           > 1: the vehicle groups run in that many Python processes at once; same result
     bin_origin        "window" (default): bins from each signal's window start; "clock": from the quarter-hour at or
-                      before it, as an incremental store bins (its judge then gives this run's answers)"""
+                      before it, as an incremental store bins (its judge then gives this run's answers)
+    ped_history       (counts, logged): 15-minute press counts and logged bins from before the window, for the ped option
+                      stop_history (ped_health_duckdb.ped_health history=)"""
     if not vehicle and ped is False:
         raise ValueError("vehicle=False and ped=False leave nothing to judge")
     if windows_table is not None:
@@ -247,10 +253,12 @@ def health(con, events_table: str = "events", detectors_table: str = "detectors"
         ped = False
     det = per = win = pin = ped_in = ped_per = None
     if ped is not False:
-        pin = event_windows(con, events_table, start=start, end=end, ped=True)
+        if not (ped_history and {**_ped.OPT, **(ped_options or {})}.get("stop_history")):
+            ped_history = None
+        pin = event_windows(con, events_table, start=start, end=end, ped=True, ped_hist=ped_history[0] if ped_history else None)
         if len(pin):
             ped_in, ped_per = _ped.ped_health(con, events_table, start, end, periods=True, max_events=ped_max_events,
-                                              options=ped_options, assign=ped_assign)
+                                              options=ped_options, assign=ped_assign, history=ped_history)
     if vehicle:
         det, per = _hq.health(con, events_table, detectors_table, start, end, windows_table=windows_table,
                               max_events=max_events, distinct=distinct, options=options, periods=True, workers=workers,

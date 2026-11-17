@@ -274,6 +274,42 @@ SELECT p.dev, p.ch, make_timestamp((floor(p.t_on / 900) * 900 * 1000000)::BIGINT
 FROM pq_press p JOIN pq_wpart w USING (dev) WHERE p.t_on > w.s GROUP BY ALL
 -- @step stopl
 SELECT dev, make_timestamp(q * 900000000) AS b FROM pq_logq
+{% if opt['stop_not_held'] %}
+{# the 15-min bins each input was held ON (a stuck on or a long hold touches them): a held button sends no presses, so they are no
+   part of a zero-press run and no part of its level (ped_stop.stop_sql held) #}
+-- @step stoph
+SELECT dev, ch, make_timestamp((q * 900 * 1000000)::BIGINT) AS b FROM (
+  SELECT dev, ch, unnest(range(floor(a / 900)::BIGINT, ceil(z / 900)::BIGINT)) AS q FROM (
+    SELECT dev, ch, a, z FROM pq_f_stuck UNION ALL SELECT dev, ch, a, z FROM pq_f_hold) WHERE z > a)
+{% endif %}
+{% if opt['stop_history'] %}
+{# sudden stop against the button's own weeks (option stop_history, ped_stop.history_stop_sql): only a silence that reaches the window's end.
+   hist: 15-minute press counts and logged bins from before the window (ped_health history=), put in front of the window's own #}
+{% if hist %}
+-- @step hstopc
+SELECT w.dev, h.Input::INT AS ch, time_bucket(INTERVAL 15 MINUTE, h.TimeStamp::TIMESTAMP) AS b, sum(h.presses)::BIGINT AS n
+FROM {{ hist[0] }} h JOIN pq_wpart w ON CAST(h.DeviceId AS VARCHAR) = CAST(w.DeviceId AS VARCHAR)
+WHERE h.TimeStamp < w.lo AND h.presses > 0 GROUP BY ALL
+UNION ALL SELECT dev, ch, b, n FROM pq_stopc
+-- @step hstopl
+SELECT DISTINCT w.dev, time_bucket(INTERVAL 15 MINUTE, h.TimeStamp::TIMESTAMP) AS b
+FROM {{ hist[1] }} h JOIN pq_wpart w ON CAST(h.DeviceId AS VARCHAR) = CAST(w.DeviceId AS VARCHAR) WHERE h.TimeStamp < w.lo
+UNION SELECT dev, b FROM pq_stopl
+{% endif %}
+-- @step hstop
+{{ HSTOP }}
+-- @step f_stop
+SELECT 'sudden stop' AS kind, s.dev, s.ch, floor(greatest(epoch(s.run_start), w.s) / 86400)::BIGINT AS day,
+       greatest(epoch(s.run_start), w.s) AS a, epoch(s.run_end) AS z, s.silent_h / greatest(s.quiet_h, 1) AS x, s.silent_h AS n,
+       0.0 AS chance_cap, false AS ended, false AS before, epoch(s.run_start) AS since, s.quiet_h, s.usual,
+       CASE WHEN s.others_exp >= {{ HL['others_min'] }} THEN s.others_obs / s.others_exp END AS others,
+       (SELECT CASE arg_max(e.ev, e.ts) WHEN 90 THEN 'on' ELSE 'off' END FROM pq_ev e WHERE e.dev = s.dev AND e.p = s.ch AND e.ev IN (89, 90)
+        AND e.ts < epoch(s.run_end)) AS last_ev,
+       CASE WHEN EXISTS (SELECT 1 FROM pq_inp i WHERE i.dev = s.dev AND i.ch = s.ch AND i.ph IS NOT NULL) THEN
+       (SELECT count(*) FROM pq_walk k JOIN pq_inp i ON i.dev = k.dev AND i.ph = k.ph
+        WHERE i.dev = s.dev AND i.ch = s.ch AND k.t21 >= epoch(s.run_start) AND k.t21 < epoch(s.run_end)) END AS other
+FROM pq_hstop s JOIN pq_wpart w USING (dev) WHERE {{ opt['stop_test']|sqlbool }} AND s.flagged
+{% else %}
 -- @step stop
 {{ STOP }}
 -- @step f_stop
@@ -286,6 +322,7 @@ SELECT 'sudden stop' AS kind, s.dev, s.ch, floor(epoch(s.run_start) / 86400)::BI
         WHERE i.dev = s.dev AND i.ch = s.ch AND w.t21 >= epoch(s.run_start) AND w.t21 < epoch(s.run_end)) AS other
 FROM pq_stop s WHERE {{ opt['stop_test']|sqlbool }} AND (s.chance <= {{ STOPLIM['p_suspect'] }} OR s.simple) AND s.run_h >= {{ STOPLIM['min_run_h'] }}
   AND s.n_out >= {{ STOPLIM['min_presses'] }} AND s.active_h >= {{ STOPLIM['min_active_h'] }}
+{% endif %}
 {% if opt['walks_no_press'] %}
 {# unique presses of the window (ped_stop.UNIQ_S): a run is presses each within UNIQ_S of the one before; a press counts when it opens a new UNIQ_S-second slot of
    its run, so a button that keeps repeating keeps counting.  Inside the judge, from the window's own presses: no store column, no carry, the same for any cutting #}
@@ -308,7 +345,8 @@ SELECT l.dev, i.ch, l.q::BIGINT AS q, ((l.q % 96) // 4)::INT AS hh, coalesce(u.u
        row_number() OVER (PARTITION BY l.dev, i.ch ORDER BY l.q) AS k
 FROM pq_logq l JOIN i USING (dev) LEFT JOIN u ON u.dev = l.dev AND u.ch = i.ch AND u.q = l.q LEFT JOIN wk ON wk.dev = l.dev AND wk.ch = i.ch AND wk.q = l.q
 LEFT JOIN cl ON cl.dev = l.dev AND cl.ch = i.ch AND cl.q = l.q LEFT JOIN gr ON gr.dev = l.dev AND gr.ch = i.ch AND gr.q = l.q
-{# walks without presses: walks jump while the button's presses stop.  Needs no ON or OFF of the button, so it also works when those are missing.  A zero-press run
+{# walks without presses: walks jump while the button's presses stop (option walks_need_on, 2.1.0: a fault only with a sign of a
+   failed button, its last ON / OFF before the run ends an ON with no OFF; else recall, a config note -- ped_health_duckdb._assemble).  Needs no ON or OFF of the button, so it also works when those are missing.  A zero-press run
    against the look-back before it (never after it): walks per press from then, the usual walks at those hours of day; the first bin where the limits hold.  Not
    when another button of the signal fires about then (a signal-wide recall or plan), or a stuck ON already covers it #}
 -- @step f_nop
@@ -332,7 +370,9 @@ n AS (SELECT p.dev, p.ch, f.q0, min(p.q) AS q_next FROM f JOIN pq_pbin p ON p.de
 h AS (SELECT p.dev, p.ch, f.q0, count(*) / 4.0 AS walk_h FROM f JOIN pq_pbin p ON p.dev = f.dev AND p.ch = f.ch AND p.q BETWEEN f.q0 AND f.q1
       WHERE p.grn > 0 AND p.w >= {{ UN['np_walks_h'] }} / 4.0 AND p.w >= {{ UN['np_green_share'] }} * p.grn GROUP BY ALL)
 SELECT 'walks without presses' AS kind, f.dev, f.ch, (f.q0 // 96)::BIGINT AS day, f.q0 * 900.0 AS a, coalesce(n.q_next, f.q1 + 1) * 900.0 AS z, f.w_fire / f.rho0 AS x, f.w_fire AS n,
-       f.m_fire / 4.0 AS held, f.e_fire AS every_s, f.walks AS other, n.q_next IS NOT NULL AS ended, coalesce(h.walk_h, 0.0) AS walk_h
+       f.m_fire / 4.0 AS held, f.e_fire AS every_s, f.walks AS other, n.q_next IS NOT NULL AS ended, coalesce(h.walk_h, 0.0) AS walk_h,
+       (SELECT CASE arg_max(e.ev, e.ts) WHEN 90 THEN 'on' ELSE 'off' END FROM pq_ev e WHERE e.dev = f.dev AND e.p = f.ch AND e.ev IN (89, 90)
+        AND e.ts < coalesce(n.q_next, f.q1 + 1) * 900.0) AS last_ev
 FROM f LEFT JOIN n USING (dev, ch, q0) LEFT JOIN h USING (dev, ch, q0)
 WHERE NOT EXISTS (SELECT 1 FROM f o WHERE o.dev = f.dev AND o.ch <> f.ch AND abs(o.q_fire - f.q_fire) <= {{ UN['np_other_q'] }})
   AND NOT EXISTS (SELECT 1 FROM pq_f_stuck s WHERE s.dev = f.dev AND s.ch = f.ch AND s.a < (f.q_fire + 1) * 900.0 AND s.z > f.q0 * 900.0)

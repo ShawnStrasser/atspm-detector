@@ -57,8 +57,8 @@ One row per detector: phase and function (each with a probability), lanes, setba
 ## Detector health
 
 Each detector gets a status and findings in plain words, judged against what is normal for its type, on a window of
-30 minutes to 92 days. Checks: stuck on, counts fall, misses vehicles at night, busy at night, too fast / too many,
-spiky counts, no daily pattern, counts too high. Lane closures and timing plans are reported, not counted as faults.
+30 minutes to 92 days. Checks: stuck on (also mostly ON for half an hour while its phase mates are not), counts fall,
+misses vehicles at night, busy at night, too fast / too many, spiky counts, no daily pattern, counts too high. Lane closures and timing plans are reported, not counted as faults.
 Ped push buttons are judged the same way. Not field-verified.
 
 `predict` already runs health on its own answers. To run it yourself, give `health` each detector's phase,

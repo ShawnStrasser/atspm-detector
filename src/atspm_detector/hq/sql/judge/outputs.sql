@@ -87,10 +87,10 @@ WHERE u.lam >= l.lim_dropout AND NOT (u.a < x.drop_b1 AND u.z > x.drop_b0) {% if
 {% endif %}
 -- @step evid
 SELECT f.dev, f.det, f.key, f.ki,
-       CASE WHEN f.key = 'prof' AND x.flat THEN 'No daily pattern' ELSE f.cat END AS cat, f.sc, f.sev, CASE f.key
+       CASE WHEN f.key = 'prof' AND x.flat{{ ' AND NOT x.flat_nb' if opt['flat_busier_busy'] else '' }} THEN 'No daily pattern' ELSE f.cat END AS cat, f.sc, f.sev, CASE f.key
   WHEN 'stuck' THEN {{ stuck }}
-  WHEN 'count_on' THEN format('count zone ON up to {:.0f} % in light traffic for {:.0f} min', 100 * x.hi_occ_max,
-                              x.hi_min_c)
+  WHEN 'count_on' THEN {% if opt['mostly_on'] %}CASE WHEN x.mo_min IS NOT NULL AND NOT coalesce(x.count_on_ok AND x.hi_min_c >= l.lim_count_on, false) THEN format('held ON {:.0f} % of the time for ', 100 * x.mo_occ) || {{ lib.dur('60 * x.mo_long') }} || ' from ' || {{ lib.hm('w.s_ns + x.mo_t0 * 600000000000') }} || CASE WHEN x.mo_n > 1 THEN format(' ({} times, {:.0f} min in total)', x.mo_n, x.mo_min) ELSE '' END || CASE WHEN coalesce(x.mo_nm, 0) = 0 THEN ', no phase mates to compare with' ELSE format(' while its phase mates were ON {:.0f} %', 100 * x.mo_mocc) END || ' (flickering OFF and ON)' ELSE {% endif %}format('count zone ON up to {:.0f} % in light traffic for {:.0f} min', 100 * x.hi_occ_max,
+                              x.hi_min_c){{ ' END' if opt['mostly_on'] else '' }}
   WHEN 'dropout' THEN {{ silent }}
   WHEN 'night_drop' THEN CASE WHEN v.silent_night THEN {{ silent }} WHEN x.geh_night_exp IS NOT NULL
        THEN format('night {:,.0f} actuations vs ~{:,.0f} expected (GEH {:.1f})', x.geh_night_n, x.geh_night_exp,
@@ -106,7 +106,8 @@ SELECT f.dev, f.det, f.key, f.ki,
                            x.spk_gmax, x.spk_daily)
   WHEN 'volume' THEN format('busiest 5 min {:,.0f} veh/h/lane vs limit {:,.0f}', x.q5_use, l.lim_volume)
   WHEN 'rise' THEN {{ rise }}
-  WHEN 'prof' THEN CASE WHEN x.flat THEN format('counts do not follow the day: ~{:.0f} an hour by day, ~{:.0f} at night, while '
+  WHEN 'prof' THEN CASE {{ "WHEN x.flat_nb THEN format('busier at night than by day: ~{:.0f} an hour at night, ~{:.0f} by day, while '
+       || 'the rest of the signal drops from ~{:,.0f} to ~{:,.0f}', x.flat_n, x.flat_d, x.flat_rd, x.flat_rn) " if opt['flat_busier_busy'] else '' }}WHEN x.flat THEN format('counts do not follow the day: ~{:.0f} an hour by day, ~{:.0f} at night, while '
        || 'the rest of the signal drops from ~{:,.0f} to ~{:,.0f} (noise, not traffic)',
        x.flat_d, x.flat_n, x.flat_rd, x.flat_rn) ELSE
        format('night level {:.0f} % of its busiest hours; phase mates ', 100 * x.tod_r ^ 2)

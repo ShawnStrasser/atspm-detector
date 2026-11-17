@@ -35,7 +35,8 @@ runs_vol AS (SELECT dev, det, min(b) AS a, max(b) + 1 AS z FROM (SELECT dev, det
          'count zone held ON', (u.z - u.a) * w.bs / 60.0, l.lim_count_on, l.bad_count_on, 60 * l.bad_count_on
          FROM r JOIN runs_hi u USING (dev, det) JOIN win w USING (dev) JOIN limits l USING (dev, det)
          WHERE r.f_count_on OR r.sev_rule = 'C'
-  UNION ALL SELECT r.dev, r.det, 2, w.s_ns + r.drop_b0 * {{ NS5 }}, w.s_ns + r.drop_b1 * {{ NS5 }}, 'silent', {{ sil }}
+{% if opt['mostly_on'] %}  UNION ALL SELECT r.dev, r.det, 0, w.s_ns + u.a * 600000000000, least(w.s_ns + u.z * 600000000000, w.e_ns), 'stuck on', 10.0 * (u.z - u.a), {{ LJ['mostly_on']['min'][0]|dbl }}, {{ LJ['mostly_on']['min'][1]|dbl }}, 60 * {{ LJ['mostly_on']['min'][1]|dbl }} FROM r JOIN mo_runs u USING (dev, det) JOIN win w USING (dev) JOIN xf x USING (dev, det) JOIN limits l USING (dev, det) WHERE r.f_count_on AND x.mo_min IS NOT NULL AND NOT coalesce(x.count_on_ok AND x.hi_min_c >= l.lim_count_on, false)
+{% endif %}  UNION ALL SELECT r.dev, r.det, 2, w.s_ns + r.drop_b0 * {{ NS5 }}, w.s_ns + r.drop_b1 * {{ NS5 }}, 'silent', {{ sil }}
          WHERE r.f_dropout
   UNION ALL SELECT r.dev, r.det, 3, w.s_ns + r.drop_b0 * {{ NS5 }}, w.s_ns + r.drop_b1 * {{ NS5 }}, 'silent at night', {{ sil }}
          WHERE r.f_night_drop AND r.silent_night
@@ -49,7 +50,7 @@ runs_vol AS (SELECT dev, det, min(b) AS a, max(b) + 1 AS z FROM (SELECT dev, det
          {{ sc('volume') }} FROM r JOIN runs_vol u USING (dev, det) JOIN win w USING (dev) WHERE r.f_volume
   UNION ALL SELECT r.dev, r.det, 7, x.tod_d0 + {{ NSH }}, x.tod_d0 + 5 * {{ NSH }}, 'busy at night'{{ sc('prof') }}
          FROM r JOIN xf x USING (dev, det) WHERE r.f_prof AND x.tod_d0 IS NOT NULL AND NOT coalesce(x.flat, false)
-  UNION ALL SELECT r.dev, r.det, 7, w.s_ns, w.e_ns, 'no daily pattern'{{ sc('prof') }}
+  UNION ALL SELECT r.dev, r.det, 7, w.s_ns, w.e_ns, {{ "CASE WHEN x.flat_nb THEN 'busy at night' ELSE 'no daily pattern' END" if opt['flat_busier_busy'] else "'no daily pattern'" }}{{ sc('prof') }}
          FROM r JOIN xf x USING (dev, det) JOIN win w USING (dev) WHERE r.f_prof AND coalesce(x.flat, false)
   UNION ALL SELECT r.dev, r.det, 8, w.s_ns + u.a * 600000000000, least(w.s_ns + u.z * 600000000000, w.e_ns),
          'spiky counts',
@@ -65,13 +66,13 @@ runs_vol AS (SELECT dev, det, min(b) AS a, max(b) + 1 AS z FROM (SELECT dev, det
    0.75 bad -> 0.8; >= 0.8 when the rules rate the finding bad) #}
 {% set v %}CASE f.key {% for k in KEYS %}WHEN '{{ k }}' THEN v.v_{{ k }}{% if not loop.last %} {% endif %}{% endfor %} END{% endset %}
 -- @step pwhole
-SELECT f.dev, f.det, 20 + f.ki AS o, w.s_ns AS a, w.e_ns AS z, CASE f.key WHEN 'stuck' THEN 'stuck on' WHEN 'count_on' THEN 'count zone held ON' WHEN 'dropout' THEN 'silent'
+SELECT f.dev, f.det, 20 + f.ki AS o, w.s_ns AS a, w.e_ns AS z, CASE f.key WHEN 'stuck' THEN 'stuck on' WHEN 'count_on' THEN {{ "CASE WHEN x.mo_min IS NOT NULL AND NOT coalesce(x.count_on_ok AND x.hi_min_c >= l.lim_count_on, false) THEN 'stuck on' ELSE 'count zone held ON' END" if opt['mostly_on'] else "'count zone held ON'" }} WHEN 'dropout' THEN 'silent'
          WHEN 'night_drop' THEN CASE WHEN v.silent_night THEN 'silent at night' ELSE 'misses vehicles at night' END
          WHEN 'level' THEN 'counts dropped' WHEN 'rapid' THEN 'too-fast actuations'
          WHEN 'volume' THEN 'too many for the traffic' WHEN 'spiky' THEN 'spiky counts' WHEN 'rise' THEN 'counts too high'
-         WHEN 'prof' THEN CASE WHEN coalesce(x.flat, false) THEN 'no daily pattern' ELSE 'busy at night' END END AS what,
+         WHEN 'prof' THEN CASE WHEN coalesce(x.flat, false){{ ' AND NOT x.flat_nb' if opt['flat_busier_busy'] else '' }} THEN 'no daily pattern' ELSE 'busy at night' END END AS what,
        CASE WHEN f.sev = 'bad' THEN greatest({{ lib.conf(v, '0.35', '0.75') }}, 0.8) ELSE {{ lib.conf(v, '0.35', '0.75') }} END AS conf,
-       CASE f.key WHEN 'stuck' THEN l.bad_stuck WHEN 'count_on' THEN 60 * l.bad_count_on WHEN 'spiky' THEN {{ spl }} END AS lim
+       CASE f.key WHEN 'stuck' THEN l.bad_stuck WHEN 'count_on' THEN {{ "CASE WHEN x.mo_min IS NOT NULL AND NOT coalesce(x.count_on_ok AND x.hi_min_c >= l.lim_count_on, false) THEN " ~ (60 * LJ['mostly_on']['min'][1])|dbl ~ " ELSE 60 * l.bad_count_on END" if opt['mostly_on'] else '60 * l.bad_count_on' }} WHEN 'spiky' THEN {{ spl }} END AS lim
 FROM fnd f JOIN finV v USING (dev, det) JOIN xf x USING (dev, det) JOIN win w USING (dev) JOIN limits l USING (dev, det)
 WHERE v.health_st IN ('suspect', 'bad')
 {# in a lane closure / plan switch of its own, or within 30 min of one (the lane reopening) #}

@@ -14,7 +14,8 @@ only from the window: no list of buttons, no settings.  For each input with pres
              a gamma factor of squared variation PHI (fixed; plain Poisson is exp(-expected), PHI -> 0, clump 1).
   chance_cap the same with each baseline hour counted at most CAP x the button's median busy hour: one burst sets no level.
   simple     the run is >= SIMPLE_RUN_H logged hours and its level over the day (the level at each hour of day seen outside the
-             run, summed) is >= SIMPLE_LEVEL presses a day.
+             run, summed) is >= SIMPLE_LEVEL presses a day.  simple_cap (option stop_simple_cap, 2.1.0): that level with bursts
+             capped as for chance_cap (level_cap), so one burst of a quiet button sets no 30-a-day level (2026-11-12 review).
   rating     flagged when the statistical test (chance <= P_SUSPECT) OR the simple one says so: suspect; bad: chance_cap <=
              P_BAD.  A run must be >= MIN_RUN_H logged hours and the input needs >= MIN_PRESSES presses in >= MIN_ACTIVE_H
              separate hours outside the run: low-volume buttons cannot flag.
@@ -22,8 +23,16 @@ only from the window: no list of buttons, no settings.  For each input with pres
              ended just has an end time: there is no 'recovered' logic.
 
 stop_scores(con, counts, logged) -> one row per input: dev, ch, n_out, bins_out, active_h, run_h, run_start, run_end, next_b,
-starts_window, expected, expected_cap, clump, level, chance, chance_cap, chance_poisson, simple, rating.  counts: table / view
+starts_window, expected, expected_cap, clump, level, level_cap, chance, chance_cap, chance_poisson, simple, rating.  counts: table / view
 (dev, ch, b, n), b the bin start; logged: (dev, b).  Both already limited to the window.
+
+history_stops(con, counts, logged) -> one row per input still silent at the end of its signal's log for >= HIST_RUN_H logged hours,
+against its own earlier weeks (option stop_history, 2.1.0): dev, ch, run_start, run_end, silent_h, quiet_h, hist_days, usual,
+others_obs, others_exp, flagged.  counts / logged as above but over weeks (HIST_DAYS before the silence and the silence itself), from
+any source: the log or a table of 15-minute press counts.  flagged: the silence is >= HIST_TIMES x the button's longest quiet spell of
+the HIST_DAYS days before it, those days hold >= HIST_MIN_DAYS logged days with a usual (median) day of >= HIST_USUAL presses, and the
+other inputs of the signal brought >= HIST_OTHERS of their own usual for those hours (people still walked there).  A silence that
+ended is no stop: a button that came back by itself needs no repair.
 
 walk_change(con, counts, logged, since) -> one row per (input, day) where walks jumped and presses per walk fell against the
 button's own days: the existing report check's idea (walks vs presses) on its own baseline, with no comparison to the region.  A
@@ -49,6 +58,18 @@ CLUMP_K = 12
 CAP = 3.0          # chance_cap: an hour counts at most 3 x the button's median busy hour
 SIMPLE_RUN_H = 24.0
 SIMPLE_LEVEL = 30.0
+# stop against the button's own weeks (option stop_history; history_stop_sql).  Set on 43 report days of 15-minute press counts, Sep 28 -
+# Nov 11 2026: of 241 stops the window test flagged, 192 had ended before the report was made and 9 lasted two more days; of the 14 this
+# test flagged (31 report days with enough history) 7 lasted two more days, 3 were still silent at the end of the data and 4 ended within
+# two days (one of those buttons died for good three days later).  Signals near by (1 mile) added nothing once the signal's own other
+# buttons were compared
+HIST_DAYS = 28        # the look-back before the silence
+HIST_MIN_DAYS = 14    # logged days (>= 12 logged hours each) the look-back must hold
+HIST_RUN_H = 24.0     # silent for at least this many logged hours, up to the end of the log
+HIST_TIMES = 2.0      # and at least this many times its longest quiet spell of the look-back
+HIST_USUAL = 10.0     # presses on its usual (median) logged day of the look-back
+HIST_OTHERS = 0.5     # the signal's other inputs: their presses over the silence against their usual for those hours of day
+HIST_OTHERS_MIN = 10.0   # compared only where that usual is at least this many presses
 WC_RATIO = 3.0     # walk_change: walks per logged hour >= 3 x the button's lower-quartile day
 WC_DROP = 0.5      # and presses per walk <= half its upper-quartile day
 WC_MIN_WALKS_H = 2.0
@@ -91,20 +112,27 @@ SP_BIN = 30
 SP_PER_WALK = 10
 
 
-def stop_sql(counts: str, logged: str, phi: float = PHI, cap: float = CAP) -> str:
+def stop_sql(counts: str, logged: str, phi: float = PHI, cap: float = CAP, held: str | None = None, simple_cap: bool = True) -> str:
+    """held: a table (dev, ch, b) of the bins an input was held ON (stuck on, long hold): a held button sends no presses, so those
+    bins neither belong to a zero run (they break it) nor set its level -- one fault is not also a sudden stop.  simple_cap: the
+    simple test reads the day level with bursts capped (level_cap); False: the plain level, as before 2026-11-12."""
+    hj = f" LEFT JOIN (SELECT DISTINCT dev, ch, b FROM {held}) hd ON hd.dev = l.dev AND hd.ch = i.ch AND hd.b = l.b" if held else ""
+    hc = ", hd.b IS NOT NULL AS held" if held else ""
+    hz = " AND NOT held" if held else ""
+    ho = " AND NOT g.held" if held else ""
     return f"""
 WITH inp AS (SELECT dev, ch, sum(n) AS tot FROM {counts} GROUP BY ALL HAVING sum(n) > 0),
 grid AS (SELECT l.dev, i.ch, l.b, coalesce(c.n, 0) AS n,
-                row_number() OVER (PARTITION BY l.dev, i.ch ORDER BY l.b) AS k
+                row_number() OVER (PARTITION BY l.dev, i.ch ORDER BY l.b) AS k{hc}
          FROM (SELECT DISTINCT dev, b FROM {logged}) l JOIN inp i USING (dev)
-         LEFT JOIN {counts} c ON c.dev = l.dev AND c.ch = i.ch AND c.b = l.b),
+         LEFT JOIN {counts} c ON c.dev = l.dev AND c.ch = i.ch AND c.b = l.b{hj}),
 runs AS (SELECT dev, ch, min(b) AS r0, max(b) AS r1, count(*) AS bins
-         FROM (SELECT dev, ch, b, k - row_number() OVER (PARTITION BY dev, ch ORDER BY b) AS g FROM grid WHERE n = 0)
+         FROM (SELECT dev, ch, b, k - row_number() OVER (PARTITION BY dev, ch ORDER BY b) AS g FROM grid WHERE n = 0{hz})
          GROUP BY dev, ch, g),
 first_ AS (SELECT dev, ch, min(b) AS firstb FROM grid GROUP BY ALL),
 best AS (SELECT * FROM runs QUALIFY row_number() OVER (PARTITION BY dev, ch ORDER BY bins DESC, r0 DESC) = 1),
 nxt AS (SELECT g.dev, g.ch, min(g.b) AS next_b FROM grid g JOIN best b USING (dev, ch) WHERE g.b > b.r1 AND g.n > 0 GROUP BY ALL),
-out0 AS (SELECT g.dev, g.ch, g.b, g.n, hour(g.b) AS hh FROM grid g JOIN best b USING (dev, ch) WHERE g.b < b.r0 OR g.b > b.r1),
+out0 AS (SELECT g.dev, g.ch, g.b, g.n, hour(g.b) AS hh FROM grid g JOIN best b USING (dev, ch) WHERE (g.b < b.r0 OR g.b > b.r1){ho}),
 hours AS (SELECT dev, ch, date_trunc('hour', b) AS h, hour(b) AS hh, sum(n) AS n, count(*) AS m FROM out0 GROUP BY ALL),
 capv AS (SELECT dev, ch, {cap} * quantile_cont(n, 0.5) FILTER (n > 0) AS cap FROM hours GROUP BY ALL),
 hod AS (SELECT h.dev, h.ch, h.hh, sum(h.n) AS s, sum(least(h.n, coalesce(c.cap, h.n))) AS sc, sum(h.m) AS m
@@ -121,18 +149,18 @@ runb AS (SELECT g.dev, g.ch, sum(coalesce(l.lam, 0)) AS expected, sum(coalesce(l
          FROM grid g JOIN best b USING (dev, ch)
          LEFT JOIN lvl l ON l.dev = g.dev AND l.ch = g.ch AND l.hh = hour(g.b)
          WHERE g.b BETWEEN b.r0 AND b.r1 GROUP BY ALL),
-dayl AS (SELECT dev, ch, 4 * sum(lam) AS level FROM lvl GROUP BY ALL),
+dayl AS (SELECT dev, ch, 4 * sum(lam) AS level, 4 * sum(lamc) AS level_cap FROM lvl GROUP BY ALL),
 outn AS (SELECT dev, ch, sum(n) AS n_out, count(*) AS bins_out,
                 count(DISTINCT date_trunc('hour', b)) FILTER (n > 0) AS active_h FROM out0 GROUP BY ALL),
 s AS (SELECT b.dev, b.ch, coalesce(o.n_out, 0) AS n_out, coalesce(o.bins_out, 0) AS bins_out, coalesce(o.active_h, 0) AS active_h,
              b.bins * {BIN_MIN} / 60.0 AS run_h, b.r0 AS run_start, b.r1 + INTERVAL {BIN_MIN} MINUTE AS run_end, x.next_b,
-             b.r0 = z.firstb AS starts_window, coalesce(y.level, 0) AS level,
+             b.r0 = z.firstb AS starts_window, coalesce(y.level, 0) AS level, coalesce(y.level_cap, 0) AS level_cap,
              coalesce(r.expected, 0) AS expected, coalesce(r.expected_cap, 0) AS expected_cap,
              greatest(1.0, (coalesce(d.ss / nullif(d.mu, 0), 0) * greatest(coalesce(d.nh - d.nhh, 0), 0) + {CLUMP0} * {CLUMP_K}) / (greatest(coalesce(d.nh - d.nhh, 0), 0) + {CLUMP_K})) AS clump
       FROM best b JOIN first_ z USING (dev, ch) LEFT JOIN nxt x USING (dev, ch) LEFT JOIN runb r USING (dev, ch)
       LEFT JOIN outn o USING (dev, ch) LEFT JOIN disp d USING (dev, ch) LEFT JOIN dayl y USING (dev, ch))
 SELECT *, pow(1 + {phi} * expected / clump, -1.0 / {phi}) AS chance, pow(1 + {phi} * expected_cap / clump, -1.0 / {phi}) AS chance_cap,
-       exp(-expected) AS chance_poisson, level, coalesce(run_h >= {SIMPLE_RUN_H} AND level >= {SIMPLE_LEVEL}, false) AS simple FROM s"""
+       exp(-expected) AS chance_poisson, level, coalesce(run_h >= {SIMPLE_RUN_H} AND {'level_cap' if simple_cap else 'level'} >= {SIMPLE_LEVEL}, false) AS simple FROM s"""
 
 
 def rate(chance, chance_cap, run_h, n_out, active_h, simple=False):
@@ -147,6 +175,47 @@ def stop_scores(con, counts: str, logged: str):
     df["rating"] = [rate(c, k, r, n, h, q) for c, k, r, n, h, q in
                     zip(df.chance, df.chance_cap, df.run_h, df.n_out, df.active_h, df.simple)]
     return df
+
+
+def history_stop_sql(counts: str, logged: str, held: str | None = None) -> str:
+    """the stop test against the button's own weeks (module docstring, history_stops).  held: as stop_sql -- a bin the input was held
+    ON is no silence (it breaks the run)."""
+    hj = f" LEFT JOIN (SELECT DISTINCT dev, ch, b FROM {held}) hd ON hd.dev = l.dev AND hd.ch = i.ch AND hd.b = l.b" if held else ""
+    hc = ", hd.b IS NOT NULL AS held" if held else ""
+    hz = " AND NOT held" if held else ""
+    look = f"INTERVAL {HIST_DAYS} DAY"
+    return f"""
+WITH inp AS (SELECT dev, ch FROM {counts} GROUP BY ALL HAVING sum(n) > 0),
+grid AS (SELECT l.dev, i.ch, l.b, coalesce(c.n, 0) AS n, row_number() OVER (PARTITION BY l.dev, i.ch ORDER BY l.b) AS k{hc}
+         FROM (SELECT DISTINCT dev, b FROM {logged}) l JOIN inp i USING (dev)
+         LEFT JOIN (SELECT dev, ch, b, sum(n) AS n FROM {counts} GROUP BY ALL) c ON c.dev = l.dev AND c.ch = i.ch AND c.b = l.b{hj}),
+runs AS (SELECT dev, ch, min(b) AS r0, max(b) AS r1, max(k) AS k1, count(*) AS bins
+         FROM (SELECT dev, ch, b, k, k - row_number() OVER (PARTITION BY dev, ch ORDER BY b) AS g FROM grid WHERE n = 0{hz})
+         GROUP BY dev, ch, g),
+-- the silence that reaches the end of the signal's log
+cur AS (SELECT r.* FROM runs r JOIN (SELECT dev, ch, max(k) AS kz FROM grid GROUP BY ALL) z USING (dev, ch)
+        WHERE r.k1 = z.kz AND r.bins * {BIN_MIN} / 60.0 >= {HIST_RUN_H}),
+-- its longest quiet spell that ended in the look-back (whole length, also what began before it)
+quiet AS (SELECT r.dev, r.ch, max(r.bins) AS bins FROM runs r JOIN cur c USING (dev, ch)
+          WHERE r.r1 < c.r0 AND r.r1 >= c.r0 - {look} GROUP BY ALL),
+days AS (SELECT c.dev, c.ch, g.b::DATE AS d, sum(g.n) AS n, count(*) AS bins FROM cur c JOIN grid g USING (dev, ch)
+         WHERE g.b < c.r0 AND g.b >= c.r0 - {look} GROUP BY ALL),
+lvl AS (SELECT dev, ch, count(*) AS days, quantile_cont(n, 0.5) AS usual FROM days WHERE bins * {BIN_MIN} >= 720 GROUP BY ALL),
+-- the signal's other inputs over the silence against their own level at those hours of day in the look-back
+oth AS (SELECT c.dev, c.ch, g.ch AS ch2, hour(g.b) AS hh, avg(g.n) FILTER (g.b < c.r0) AS lam,
+               coalesce(sum(g.n) FILTER (g.b >= c.r0), 0) AS obs, count(*) FILTER (g.b >= c.r0) AS m
+        FROM cur c JOIN grid g ON g.dev = c.dev AND g.ch <> c.ch AND g.b >= c.r0 - {look} GROUP BY ALL),
+o AS (SELECT dev, ch, sum(obs) AS others_obs, sum(coalesce(lam, 0) * m) AS others_exp FROM oth GROUP BY ALL),
+s AS (SELECT c.dev, c.ch, c.r0 AS run_start, c.r1 + INTERVAL {BIN_MIN} MINUTE AS run_end, c.bins * {BIN_MIN} / 60.0 AS silent_h,
+             coalesce(q.bins, 0) * {BIN_MIN} / 60.0 AS quiet_h, coalesce(l.days, 0) AS hist_days, coalesce(l.usual, 0) AS usual,
+             coalesce(o.others_obs, 0) AS others_obs, coalesce(o.others_exp, 0) AS others_exp
+      FROM cur c LEFT JOIN quiet q USING (dev, ch) LEFT JOIN lvl l USING (dev, ch) LEFT JOIN o USING (dev, ch))
+SELECT *, silent_h >= {HIST_TIMES} * quiet_h AND hist_days >= {HIST_MIN_DAYS} AND usual >= {HIST_USUAL}
+          AND (others_exp < {HIST_OTHERS_MIN} OR others_obs >= {HIST_OTHERS} * others_exp) AS flagged FROM s"""
+
+
+def history_stops(con, counts: str, logged: str):
+    return con.execute(history_stop_sql(counts, logged)).df()
 
 
 def walk_change_sql(counts: str, logged: str, since=None) -> str:

@@ -4,6 +4,7 @@
 {% import "judge/verdict.sql" as vd with context %}
 {% import "judge/signal_silent.sql" as ss with context %}
 {% import "judge/phase_drop.sql" as pd with context %}
+{% import "judge/silent_held.sql" as sh with context %}
 {% import "adapters.sql" as ad with context %}
 {% include "store_read.sql" %}
 {% include "finalize.sql" %}
@@ -24,11 +25,15 @@
 {% endif %}
 {% include "judge/assemble.sql" %}
 {# the signal-wide checks rewrite the silence of xfa -> (xfs ->) xf #}
+{% set snh = opt['silent_not_held'] %}
 {% if opt['signal_silent'] %}
-{{ ss.signal_silent('xfa', 'xfs' if opt['phase_drop'] else 'xf') }}
+{{ ss.signal_silent('xfa', 'xfs' if opt['phase_drop'] else 'xfh' if snh else 'xf') }}
 {% endif %}
 {% if opt['phase_drop'] %}
-{{ pd.phase_drop('xfs' if opt['signal_silent'] else 'xfa', 'xf') }}
+{{ pd.phase_drop('xfs' if opt['signal_silent'] else 'xfa', 'xfh' if snh else 'xf') }}
+{% endif %}
+{% if snh %}
+{{ sh.silent_held('xfh' if opt['signal_silent'] or opt['phase_drop'] else 'xfa', 'xf') }}
 {% endif %}
 {% if opt['lane_closure'] %}
 {% include "judge/closure.sql" %}

@@ -1,5 +1,69 @@
 # Changelog
 
+## 2.1.0 - mostly ON, busy at night on long zones, no daily pattern, one fault reported once, ped recall
+
+Phase, function, lanes, setback and night speed are unchanged. Health only.
+
+**One fault, reported once**
+
+- A detector held ON (stuck on, held ON together, a Count zone held ON, mostly ON) sends no new actuations, so its silence
+  no longer runs over the hold: a silence (a whole phase dropped, every input lost, a quiet run) keeps only its longest
+  stretch outside the detector's holds, with its expected count cut to match; silence at other times is still reported.
+  Option `silent_not_held`.
+- The same for a count drop: an hour a hold of 15 minutes or more touches is no low hour and ends a run (counts dropped
+  against the yardstick and against the phase mates, and the night check's hours), and for a detector with no known
+  function the 15-minute bins it touches leave its share-of-traffic test. A drop at other times is still reported.
+  Option `drop_not_held`.
+- Ped: a sudden stop leaves out the time the button is stuck on or on a long hold (option `stop_not_held`), and a stop of a
+  button with a stuck-on finding whose last event is an ON reads as that stuck ON, not "lost data, not stuck".
+
+**Ped: a sudden stop against the button's own weeks.** Option `stop_history` (on): a button is reported
+only while it is still silent, after at least 24 logged hours without a press, at least twice its longest quiet spell of
+the 28 days before, where a usual day brings 10 presses or more and the signal's other buttons carried on (at least half
+their usual presses). A silence that ended is not reported: the button came back by itself. Rated bad, and the reason
+says why ("its longest quiet spell in the 28 days before was 14 h"). It needs 14 logged days before the silence, and
+without them no sudden stop is reported: a longer
+window, or `ped_health(history=)` / `health(ped_history=)` with 15-minute press counts and logged bins from before the
+window. On six weeks of ODOT counts the window test flagged 241 stops, 192 of them already over when reported; this test
+flagged 14 in a month: 7 stayed silent two more days or longer, 3 were still silent when the data ended, 4 came back
+within two days. A signal whose buttons were all silent through the window is still judged when a history is given.
+`ped_stop.history_stops` gives the test alone. With the option off the test is the earlier one, on the window alone.
+
+Option `stop_simple_cap` (off): the window test's backup rule (no presses for 24 logged hours from a button of 30 presses
+a day) reads the level with bursts capped, so one burst of a quiet button sets no 30-a-day level. It drops about four in
+ten flags, but most of what it keeps had also ended by itself; `stop_history` replaces it.
+
+**Ped recall never alerts.** Walks at every cycle with no presses are a fault only with a sign of a failed button: its
+last ON / OFF up to the run's end is an ON with no OFF. Otherwise it is recall (newly turned on, or a plan), inferred from
+the log only, never from settings: the config note "P2 walks every cycle with no presses: recall (inferred)" (label
+`recall (inferred)`, Confidence 0), no status. Option `walks_need_on`.
+
+**New check: mostly ON.** A detector ON at least half the time for 30 minutes or more while its phase mates are not
+(flickering, so no single hold reaches the stuck-on limit) is reported as `stuck on`, e.g. "held ON 85 % of the time for
+2 h 10 min from Sun 20:20 while its phase mates were ON 1 % (flickering OFF and ON)". Mates that are themselves held ON
+do not count as traffic; when the mates are ON half as much or more it is congestion, not a finding; with no phase mates
+it is suspect at most. Limits in `health_limits.json` (`mostly_on`).
+
+**Busy at night**
+
+- Long zones and stop-bar queue zones (ON a quarter or more of their busiest hours) are no longer called busy at night
+  for a busy evening or a queue: the finding is kept only when the night occupancy share beats the phase mates', the
+  night / evening count ratio is 3.5 x the median mate's, or the detector alone brought up its phase's night greens.
+  Never excused on a detector that is stuck on or has no daily pattern.
+- A detector busy at night is no longer also reported as missing vehicles at night.
+
+**No daily pattern**
+
+- Phase mates that keep their day level at night no longer serve as the yardstick (two flat detectors on a phase hid
+  each other).
+- A busy zone (30 an hour or more) needs two night hours at its day level: one burst is not a whole night.
+- A detector busier at night than by day is now named busy at night ("busier at night than by day: ~240 an hour at
+  night, ~143 by day, ..."); same score and status.
+
+New options (all on; `OPTIONS_OFF` keeps 1.2.0): `busy_long_zone`, `night_drop_not_busy`, `flat_clean_mates`,
+`flat_two_hours`, `flat_busier_busy`, `mostly_on`, `silent_not_held`, `drop_not_held`; ped (`ped_health_duckdb.OPT`): `stop_not_held`,
+`walks_need_on`.
+
 ## 2.0.0 - one findings table, ped health, health kept up to date from chunks, time bins
 
 Phase, function, lanes, setback and night speed are unchanged.

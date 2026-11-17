@@ -108,12 +108,12 @@ def test_sudden_stop_against_its_own_level():
         for h in range(7, stop):
             for m in range(5):                                         # 5 separate presses an hour
                 r += _press(6, day * 86400 + (h - 6) * 3600 + m * 720 + (h * 37 + m * 91) % 200)
-    out, per = ped_health(_con(r), periods=True)
+    out, per = ped_health(_con(r), periods=True, options={"stop_history": False})    # the test on the window alone
     stop = per[per.condition == "sudden stop"]
     assert len(stop) == 1 and stop.iloc[0].start == pd.Timestamp("2026-09-29 10:00")
     assert out.iloc[0].status in ("suspect", "bad") and "no presses for" in out.iloc[0].reason
     assert "the end of the log" in out.iloc[0].reason
-    off = ped_health(_con(r), options={"stop_test": False})
+    off = ped_health(_con(r), options={"stop_history": False, "stop_test": False})
     assert off.iloc[0].status == "ok"
 
 
@@ -126,11 +126,29 @@ def test_a_stop_flagged_only_by_the_simple_rule_sits_at_the_suspect_limit():
     for h in range(7, 19):                                             # and again on the last day: the run has an end
         for m in range(4):
             r += _press(6, 2 * 86400 + (h - 6) * 3600 + m * 900 + (h * 37 + m * 91) % 200)
-    out, per = ped_health(_con(r), periods=True)
+    out, per = ped_health(_con(r), periods=True, options={"stop_history": False})
     stop = per[per.condition == "sudden stop"]
     assert len(stop) == 1 and out.iloc[0].status == "suspect"
     assert 1 / 1000 < 1 / float(re.search(r"chance about 1 in ([\d,]+)", out.iloc[0].reason).group(1).replace(",", ""))
     assert stop.iloc[0].severity == 0.5
+
+
+def test_one_burst_of_a_quiet_button_sets_no_simple_stop_level():
+    """2026-11-12 review (01066 ped 2): a button of ~7 presses a day with one burst of 50 in 15 minutes, quiet 41 logged hours: the
+    simple test's level is read with bursts capped (stop_simple_cap), so the burst no longer makes it a 30-a-day button that stopped"""
+    r = [(t, 1, 2) for t in range(0, 3 * 86400 - 6 * 3600, 30)]
+    for day in (0, 2):
+        for h in range(9, 16):                                         # one press an hour, 09:00-15:59, on days 0 and 2
+            r += _press(6, day * 86400 + (h - 6) * 3600 + 600 + (h * 37) % 300)
+    t = (15 - 6) * 3600 + 1000.0
+    for k in range(50):                                                # and a burst on day 0 at 15:00, irregular gaps
+        t += 5 + (k * 7) % 13
+        r += _press(6, round(t, 1))
+    stops = lambda o: ped_health(_con(r), periods=True, options={"stop_history": False, **o})[1].query("condition == 'sudden stop'")
+    assert len(stops({"stop_simple_cap": False})) == 1                  # as before: flagged by the simple test alone
+    assert stops({"stop_simple_cap": True}).empty
+    assert len(stops({})) == 1                                            # the cap stays off: stop_history took its place
+    assert ped_health(_con(r), periods=True)[1].query("condition == 'sudden stop'").empty    # the default: the silence ended
 
 
 def test_a_long_hold_sits_at_the_suspect_limit():
@@ -397,3 +415,101 @@ def test_periods_without_a_limited_finding():
         r += _press(3, 3000 + 60.0 * k)
     out, per = ped_health(_con(r), periods=True)
     assert per.condition.tolist() == ["machine-regular presses"] and per.limit_s.isna().all()
+
+
+# --- 2.1.0, option stop_history: a sudden stop against the button's own weeks, only while it is still silent -----------------
+def _history(days=18, quiet6=None):
+    """15-minute press counts and logged bins of signal S for the `days` days before T0: buttons 2 and 6 get 3 presses in each
+    hour 07:00-18:59 (36 a day; their longest quiet spell is the night); quiet6: (start, end) with no presses of button 6"""
+    bins = pd.date_range(T0 - pd.Timedelta(days=days), T0, freq="15min", inclusive="left")
+    logged = pd.DataFrame({"DeviceId": "S", "TimeStamp": bins})
+    busy = bins[(bins.hour >= 7) & (bins.hour < 19) & (bins.minute == 15)]
+    counts = pd.concat([pd.DataFrame({"DeviceId": "S", "Input": ch, "TimeStamp": busy, "presses": 3}) for ch in (2, 6)])
+    if quiet6:
+        counts = counts[~((counts.Input == 6) & (counts.TimeStamp >= quiet6[0]) & (counts.TimeStamp < quiet6[1]))]
+    return counts, logged
+
+
+def _stop_log(last6, back6=None, quiet2=False):
+    """three days of log from T0 (06:00): buttons 2 and 6 pressed 3 times in each hour 07:00-18:59; button 6 stops at second
+    `last6` (and is pressed again from `back6`); quiet2: button 2 stops with it"""
+    r = [(t, 1, 2) for t in range(0, 3 * 86400 - 6 * 3600, 30)]
+    for day in range(3):
+        for h in range(7, 19):
+            for m in range(3):
+                t = day * 86400 + (h - 6) * 3600 + m * 1100 + (h * 37 + m * 91) % 200
+                if not (quiet2 and t >= last6):
+                    r += _press(2, t)
+                if t < last6 or (back6 is not None and t >= back6):
+                    r += _press(6, t)
+    return r
+
+
+def _history_stops(r, counts, logged, **kw):
+    con = _con(r)
+    con.register("hc", counts)
+    con.register("hl", logged)
+    out, per = ped_health(con, periods=True, options={"stop_history": True}, history=("hc", "hl"), **kw)
+    return _by_input(out), per[per.condition == "sudden stop"]
+
+
+def test_stop_history_flags_a_button_still_silent_far_past_its_own_quiet_spells():
+    """button 6 stops on the first day at 12:00 and is still silent 60 logged hours later; its longest quiet spell in the 18 days
+    before is the night (13 h), a usual day brings 36 presses and button 2 carried on: bad at once, and the reason says why"""
+    out, stop = _history_stops(_stop_log(6 * 3600), *_history())
+    assert len(stop) == 1 and stop.iloc[0].Detector == 6 and stop.iloc[0].severity >= 0.8
+    assert pd.Timestamp("2026-09-28 11:45") <= stop.iloc[0].start <= pd.Timestamp("2026-09-28 12:15")
+    assert out.loc[6].status == "bad" and out.loc[2].status == "ok"
+    reason = out.loc[6].reason
+    assert reason.startswith("no presses for 6") and "to the end of the log" in reason
+    assert "its longest quiet spell in the 28 days before was 13 h" in reason and "a usual day brings ~36 presses" in reason
+    assert re.search(r"the signal's other buttons kept (9\d|100) % of their usual presses", reason)
+
+
+def test_stop_history_needs_two_weeks_before_the_silence():
+    """three days of log and no history: nothing to measure the silence against, so no stop"""
+    r = _stop_log(6 * 3600)
+    assert ped_health(_con(r), periods=True, options={"stop_history": True})[1].query("condition == 'sudden stop'").empty
+
+
+def test_stop_history_a_silence_that_ended_is_no_stop():
+    """the same stop, but the button is pressed again on the last afternoon: it came back by itself"""
+    assert _history_stops(_stop_log(6 * 3600, back6=2 * 86400 + 8 * 3600), *_history())[1].empty
+
+
+def test_stop_history_a_button_that_was_this_quiet_before_is_no_stop():
+    """button 6 went 4 days without a press two weeks earlier: 60 hours of silence is not twice that"""
+    quiet = (T0 - pd.Timedelta(days=12), T0 - pd.Timedelta(days=8))
+    assert _history_stops(_stop_log(6 * 3600), *_history(quiet6=quiet))[1].empty
+
+
+def test_stop_history_no_stop_when_the_whole_signal_went_quiet():
+    """button 2 stops at the same time: nobody walked there, so neither button is called broken"""
+    assert _history_stops(_stop_log(6 * 3600, quiet2=True), *_history())[1].empty
+
+
+def test_stop_history_names_a_button_silent_through_the_whole_window():
+    """button 6 has not been pressed since two days before the window: no press in the log, still one row and one stop"""
+    counts, logged = _history()
+    counts = counts[~((counts.Input == 6) & (counts.TimeStamp >= T0 - pd.Timedelta(days=2)))]
+    out, stop = _history_stops(_stop_log(0), counts, logged)
+    assert len(stop) == 1 and stop.iloc[0].start == T0               # the period starts with the window; the reason says since when
+    assert out.loc[6].status == "bad" and out.loc[6].presses == 0 and "Fri 09-25 18:30" in out.loc[6].reason
+    assert "walks" not in out.loc[6].reason                           # no press in the window to tell its phase from: no word on walks
+
+
+def test_stop_history_judges_a_signal_whose_only_button_is_silent_through_the_window():
+    """no button event of the signal in three days of log: the history names the button, and with no other button to compare
+    it still flags (its level and its own quiet spells carry it); through health() too, where the windows must agree"""
+    from atspm_detector import health
+    counts, logged = _history()
+    counts = counts[(counts.Input == 6) & (counts.TimeStamp < T0 - pd.Timedelta(days=2))]
+    r = [(t, 1, 2) for t in range(0, 3 * 86400 - 6 * 3600, 30)]
+    out, stop = _history_stops(r, counts, logged)
+    assert len(stop) == 1 and out.loc[6].status == "bad" and "other buttons" not in out.loc[6].reason
+    assert ped_health(_con(r), periods=True)[1].empty                   # without the option the signal is not a ped signal at all
+    con = _con(r)
+    con.register("hc", counts)
+    con.register("hl", logged)
+    f = health(con, "events", vehicle=False, ped=True, ped_options={"stop_history": True}, ped_history=("hc", "hl"))
+    assert list(f.Label) == ["sudden stop"] and f.Confidence.iloc[0] >= 0.8 and f.Detail.iloc[0].startswith("no presses for")

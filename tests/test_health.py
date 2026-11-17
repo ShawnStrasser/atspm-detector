@@ -235,3 +235,55 @@ def test_signal_silent_run_goes_on_across_a_logging_hole():
     win = con.execute("SELECT min(Timestamp) FROM events").fetchone()[0]
     start, end = (pd.Timestamp(win) + run[c].iloc[0] * five for c in "az")
     assert abs(start - a) <= five and abs(end - z) <= five, (start, end)
+
+
+def _held_in_phase_drop(opt):
+    """P2 (dets 1, 2, 9, 17) silent 08-14 on day 2 while det 17 is held ON 11-14: a whole phase dropped, one detector held inside it"""
+    ev, det = synth.make(n_signals=1, days=3, seed=2)
+    day = ev.Timestamp.min().normalize() + pd.Timedelta(days=1)
+    a, h, z = (day + pd.Timedelta(hours=x) for x in (8, 11, 14))
+    p2 = ev.EventId.isin([81, 82]) & ev.Parameter.isin([1, 2, 9, 17]) & (ev.Timestamp >= a) & (ev.Timestamp < z)
+    held = pd.DataFrame({"DeviceId": "S00", "Timestamp": [h, z], "EventId": [82, 81], "Parameter": [17, 17]})
+    con = duckdb.connect()
+    con.register("e_df", pd.concat([ev[~p2], held]).sort_values("Timestamp"))
+    con.register("d_df", det)
+    con.execute("CREATE TABLE events AS SELECT * FROM e_df; CREATE TABLE detectors AS SELECT * FROM d_df")
+    per = hq.health(con, "events", "detectors", periods=True, options=opt)[1]
+    return per[per.condition == "silent"].set_index("Detector"), per[per.condition == "stuck on"].set_index("Detector"), (a, h, z)
+
+
+def test_a_held_detector_is_not_also_silent_over_its_hold():
+    """note 158 (silent_not_held, on): a detector held ON sends no actuations, so the silence check leaves its hold out -- one fault,
+    not two (10075, 2026-11-06 to 11-08); its silence before the hold and its mates' silence stay"""
+    assert hq.OPTIONS["silent_not_held"] is True
+    sil, stuck, (a, h, z) = _held_in_phase_drop({})
+    assert (stuck.loc[17, "start"], stuck.loc[17, "end"]) == (h, z)
+    assert (sil.loc[17, "start"], sil.loc[17, "end"]) == (a, h)                 # silent up to the hold only
+    for d in (1, 2, 9):
+        assert (sil.loc[d, "start"], sil.loc[d, "end"]) == (a, z)
+    off, _, _ = _held_in_phase_drop({"silent_not_held": False})                # as before: the silence ran over the hold
+    assert (off.loc[17, "start"], off.loc[17, "end"]) == (a, z)
+
+
+def test_a_held_detector_is_not_also_a_count_drop_over_its_hold():
+    """note 158 (drop_not_held, on): det 17 held ON 09-15 on day 2 counts nothing then; that is its stuck on, not also a count drop
+    (the hours a hold >= 15 min touches are no low hours and end a run)"""
+    assert hq.OPTIONS["drop_not_held"] is True
+    ev, det = synth.make(n_signals=1, days=3, seed=2)
+    day = ev.Timestamp.min().normalize() + pd.Timedelta(days=1)
+    h, z = day + pd.Timedelta(hours=9), day + pd.Timedelta(hours=15)
+    d17 = ev.EventId.isin([81, 82]) & (ev.Parameter == 17) & (ev.Timestamp >= h) & (ev.Timestamp < z)
+    held = pd.DataFrame({"DeviceId": "S00", "Timestamp": [h, z], "EventId": [82, 81], "Parameter": [17, 17]})
+    con = duckdb.connect()
+    con.register("e_df", pd.concat([ev[~d17], held]).sort_values("Timestamp"))
+    con.register("d_df", det)
+    con.execute("CREATE TABLE events AS SELECT * FROM e_df; CREATE TABLE detectors AS SELECT * FROM d_df")
+
+    def periods(opt):
+        r, per = hq.health(con, "events", "detectors", periods=True, options=opt)
+        return r.set_index("Detector").loc[17], per[per.Detector == 17]
+    r, per = periods({})
+    assert (per.condition == "stuck on").any() and not (per.condition == "counts dropped").any() and "Counts fall" not in r.health_reason
+    r, per = periods({"drop_not_held": False})                                   # as before: the same hours twice
+    q = per[per.condition == "counts dropped"]
+    assert len(q) == 1 and (q.start.iloc[0], q.end.iloc[0]) == (h, z)

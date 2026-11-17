@@ -254,58 +254,51 @@ FROM pq_press p JOIN pq_wpart w USING (dev) WHERE p.t_on > w.s GROUP BY ALL;
 -- stopl
 SELECT dev, make_timestamp(q * 900000000) AS b FROM pq_logq;
 
--- stop
-WITH inp AS (SELECT dev, ch, sum(n) AS tot FROM pq_stopc GROUP BY ALL HAVING sum(n) > 0),
-grid AS (SELECT l.dev, i.ch, l.b, coalesce(c.n, 0) AS n,
-                row_number() OVER (PARTITION BY l.dev, i.ch ORDER BY l.b) AS k
+-- stoph
+SELECT dev, ch, make_timestamp((q * 900 * 1000000)::BIGINT) AS b FROM (
+  SELECT dev, ch, unnest(range(floor(a / 900)::BIGINT, ceil(z / 900)::BIGINT)) AS q FROM (
+    SELECT dev, ch, a, z FROM pq_f_stuck UNION ALL SELECT dev, ch, a, z FROM pq_f_hold) WHERE z > a);
+
+-- hstop
+WITH inp AS (SELECT dev, ch FROM pq_stopc GROUP BY ALL HAVING sum(n) > 0),
+grid AS (SELECT l.dev, i.ch, l.b, coalesce(c.n, 0) AS n, row_number() OVER (PARTITION BY l.dev, i.ch ORDER BY l.b) AS k, hd.b IS NOT NULL AS held
          FROM (SELECT DISTINCT dev, b FROM pq_stopl) l JOIN inp i USING (dev)
-         LEFT JOIN pq_stopc c ON c.dev = l.dev AND c.ch = i.ch AND c.b = l.b),
-runs AS (SELECT dev, ch, min(b) AS r0, max(b) AS r1, count(*) AS bins
-         FROM (SELECT dev, ch, b, k - row_number() OVER (PARTITION BY dev, ch ORDER BY b) AS g FROM grid WHERE n = 0)
+         LEFT JOIN (SELECT dev, ch, b, sum(n) AS n FROM pq_stopc GROUP BY ALL) c ON c.dev = l.dev AND c.ch = i.ch AND c.b = l.b LEFT JOIN (SELECT DISTINCT dev, ch, b FROM pq_stoph) hd ON hd.dev = l.dev AND hd.ch = i.ch AND hd.b = l.b),
+runs AS (SELECT dev, ch, min(b) AS r0, max(b) AS r1, max(k) AS k1, count(*) AS bins
+         FROM (SELECT dev, ch, b, k, k - row_number() OVER (PARTITION BY dev, ch ORDER BY b) AS g FROM grid WHERE n = 0 AND NOT held)
          GROUP BY dev, ch, g),
-first_ AS (SELECT dev, ch, min(b) AS firstb FROM grid GROUP BY ALL),
-best AS (SELECT * FROM runs QUALIFY row_number() OVER (PARTITION BY dev, ch ORDER BY bins DESC, r0 DESC) = 1),
-nxt AS (SELECT g.dev, g.ch, min(g.b) AS next_b FROM grid g JOIN best b USING (dev, ch) WHERE g.b > b.r1 AND g.n > 0 GROUP BY ALL),
-out0 AS (SELECT g.dev, g.ch, g.b, g.n, hour(g.b) AS hh FROM grid g JOIN best b USING (dev, ch) WHERE g.b < b.r0 OR g.b > b.r1),
-hours AS (SELECT dev, ch, date_trunc('hour', b) AS h, hour(b) AS hh, sum(n) AS n, count(*) AS m FROM out0 GROUP BY ALL),
-capv AS (SELECT dev, ch, 3.0 * quantile_cont(n, 0.5) FILTER (n > 0) AS cap FROM hours GROUP BY ALL),
-hod AS (SELECT h.dev, h.ch, h.hh, sum(h.n) AS s, sum(least(h.n, coalesce(c.cap, h.n))) AS sc, sum(h.m) AS m
-        FROM hours h LEFT JOIN capv c USING (dev, ch) GROUP BY ALL),
--- level per bin at each hour of day, smoothed 1-2-1 over the neighbouring hours (circular); only over hours seen
-lvl AS (SELECT a.dev, a.ch, x.hh, sum(a.s * (2 - x.d)) / sum(a.m * (2 - x.d)) AS lam, sum(a.sc * (2 - x.d)) / sum(a.m * (2 - x.d)) AS lamc
-        FROM hod a, LATERAL (SELECT (a.hh + o + 24) % 24 AS hh, abs(o) AS d FROM (VALUES (-1), (0), (1)) t(o)) x
-        WHERE x.hh IN (SELECT hh FROM hod h WHERE h.dev = a.dev AND h.ch = a.ch)
-        GROUP BY ALL),
-disp AS (SELECT h.dev, h.ch, sum(pow(h.n - h.m * l.lam, 2)) AS ss, sum(h.m * l.lam) AS mu,
-                count(*) AS nh, count(DISTINCT h.hh) AS nhh
-         FROM hours h JOIN lvl l USING (dev, ch, hh) WHERE l.lam > 0 GROUP BY ALL),
-runb AS (SELECT g.dev, g.ch, sum(coalesce(l.lam, 0)) AS expected, sum(coalesce(l.lamc, 0)) AS expected_cap
-         FROM grid g JOIN best b USING (dev, ch)
-         LEFT JOIN lvl l ON l.dev = g.dev AND l.ch = g.ch AND l.hh = hour(g.b)
-         WHERE g.b BETWEEN b.r0 AND b.r1 GROUP BY ALL),
-dayl AS (SELECT dev, ch, 4 * sum(lam) AS level FROM lvl GROUP BY ALL),
-outn AS (SELECT dev, ch, sum(n) AS n_out, count(*) AS bins_out,
-                count(DISTINCT date_trunc('hour', b)) FILTER (n > 0) AS active_h FROM out0 GROUP BY ALL),
-s AS (SELECT b.dev, b.ch, coalesce(o.n_out, 0) AS n_out, coalesce(o.bins_out, 0) AS bins_out, coalesce(o.active_h, 0) AS active_h,
-             b.bins * 15 / 60.0 AS run_h, b.r0 AS run_start, b.r1 + INTERVAL 15 MINUTE AS run_end, x.next_b,
-             b.r0 = z.firstb AS starts_window, coalesce(y.level, 0) AS level,
-             coalesce(r.expected, 0) AS expected, coalesce(r.expected_cap, 0) AS expected_cap,
-             greatest(1.0, (coalesce(d.ss / nullif(d.mu, 0), 0) * greatest(coalesce(d.nh - d.nhh, 0), 0) + 6.0 * 12) / (greatest(coalesce(d.nh - d.nhh, 0), 0) + 12)) AS clump
-      FROM best b JOIN first_ z USING (dev, ch) LEFT JOIN nxt x USING (dev, ch) LEFT JOIN runb r USING (dev, ch)
-      LEFT JOIN outn o USING (dev, ch) LEFT JOIN disp d USING (dev, ch) LEFT JOIN dayl y USING (dev, ch))
-SELECT *, pow(1 + 0.25 * expected / clump, -1.0 / 0.25) AS chance, pow(1 + 0.25 * expected_cap / clump, -1.0 / 0.25) AS chance_cap,
-       exp(-expected) AS chance_poisson, level, coalesce(run_h >= 24.0 AND level >= 30.0, false) AS simple FROM s;
+-- the silence that reaches the end of the signal's log
+cur AS (SELECT r.* FROM runs r JOIN (SELECT dev, ch, max(k) AS kz FROM grid GROUP BY ALL) z USING (dev, ch)
+        WHERE r.k1 = z.kz AND r.bins * 15 / 60.0 >= 24.0),
+-- its longest quiet spell that ended in the look-back (whole length, also what began before it)
+quiet AS (SELECT r.dev, r.ch, max(r.bins) AS bins FROM runs r JOIN cur c USING (dev, ch)
+          WHERE r.r1 < c.r0 AND r.r1 >= c.r0 - INTERVAL 28 DAY GROUP BY ALL),
+days AS (SELECT c.dev, c.ch, g.b::DATE AS d, sum(g.n) AS n, count(*) AS bins FROM cur c JOIN grid g USING (dev, ch)
+         WHERE g.b < c.r0 AND g.b >= c.r0 - INTERVAL 28 DAY GROUP BY ALL),
+lvl AS (SELECT dev, ch, count(*) AS days, quantile_cont(n, 0.5) AS usual FROM days WHERE bins * 15 >= 720 GROUP BY ALL),
+-- the signal's other inputs over the silence against their own level at those hours of day in the look-back
+oth AS (SELECT c.dev, c.ch, g.ch AS ch2, hour(g.b) AS hh, avg(g.n) FILTER (g.b < c.r0) AS lam,
+               coalesce(sum(g.n) FILTER (g.b >= c.r0), 0) AS obs, count(*) FILTER (g.b >= c.r0) AS m
+        FROM cur c JOIN grid g ON g.dev = c.dev AND g.ch <> c.ch AND g.b >= c.r0 - INTERVAL 28 DAY GROUP BY ALL),
+o AS (SELECT dev, ch, sum(obs) AS others_obs, sum(coalesce(lam, 0) * m) AS others_exp FROM oth GROUP BY ALL),
+s AS (SELECT c.dev, c.ch, c.r0 AS run_start, c.r1 + INTERVAL 15 MINUTE AS run_end, c.bins * 15 / 60.0 AS silent_h,
+             coalesce(q.bins, 0) * 15 / 60.0 AS quiet_h, coalesce(l.days, 0) AS hist_days, coalesce(l.usual, 0) AS usual,
+             coalesce(o.others_obs, 0) AS others_obs, coalesce(o.others_exp, 0) AS others_exp
+      FROM cur c LEFT JOIN quiet q USING (dev, ch) LEFT JOIN lvl l USING (dev, ch) LEFT JOIN o USING (dev, ch))
+SELECT *, silent_h >= 2.0 * quiet_h AND hist_days >= 14 AND usual >= 10.0
+          AND (others_exp < 10.0 OR others_obs >= 0.5 * others_exp) AS flagged FROM s;
 
 -- f_stop
-SELECT 'sudden stop' AS kind, s.dev, s.ch, floor(epoch(s.run_start) / 86400)::BIGINT AS day, epoch(s.run_start) AS a,
-       epoch(coalesce(s.next_b, s.run_end)) AS z, s.expected / s.clump AS x, s.run_h AS n, s.chance AS every_s, s.expected AS held,
-       s.chance_cap AS chance_cap, s.next_b IS NOT NULL AS ended, s.starts_window AS before,
+SELECT 'sudden stop' AS kind, s.dev, s.ch, floor(greatest(epoch(s.run_start), w.s) / 86400)::BIGINT AS day,
+       greatest(epoch(s.run_start), w.s) AS a, epoch(s.run_end) AS z, s.silent_h / greatest(s.quiet_h, 1) AS x, s.silent_h AS n,
+       0.0 AS chance_cap, false AS ended, false AS before, epoch(s.run_start) AS since, s.quiet_h, s.usual,
+       CASE WHEN s.others_exp >= 10.0 THEN s.others_obs / s.others_exp END AS others,
        (SELECT CASE arg_max(e.ev, e.ts) WHEN 90 THEN 'on' ELSE 'off' END FROM pq_ev e WHERE e.dev = s.dev AND e.p = s.ch AND e.ev IN (89, 90)
-        AND e.ts < epoch(coalesce(s.next_b, s.run_end))) AS last_ev,
-       (SELECT count(*) FROM pq_walk w JOIN pq_inp i ON i.dev = w.dev AND i.ph = w.ph
-        WHERE i.dev = s.dev AND i.ch = s.ch AND w.t21 >= epoch(s.run_start) AND w.t21 < epoch(s.run_end)) AS other
-FROM pq_stop s WHERE true AND (s.chance <= 0.001 OR s.simple) AND s.run_h >= 6.0
-  AND s.n_out >= 20 AND s.active_h >= 6;
+        AND e.ts < epoch(s.run_end)) AS last_ev,
+       CASE WHEN EXISTS (SELECT 1 FROM pq_inp i WHERE i.dev = s.dev AND i.ch = s.ch AND i.ph IS NOT NULL) THEN
+       (SELECT count(*) FROM pq_walk k JOIN pq_inp i ON i.dev = k.dev AND i.ph = k.ph
+        WHERE i.dev = s.dev AND i.ch = s.ch AND k.t21 >= epoch(s.run_start) AND k.t21 < epoch(s.run_end)) END AS other
+FROM pq_hstop s JOIN pq_wpart w USING (dev) WHERE true AND s.flagged;
 
 -- uniq
 WITH g AS (SELECT p.dev, p.ch, p.t_on, p.t_on - lag(p.t_on) OVER (PARTITION BY p.dev, p.ch ORDER BY p.t_on) AS gap
@@ -347,7 +340,9 @@ n AS (SELECT p.dev, p.ch, f.q0, min(p.q) AS q_next FROM f JOIN pq_pbin p ON p.de
 h AS (SELECT p.dev, p.ch, f.q0, count(*) / 4.0 AS walk_h FROM f JOIN pq_pbin p ON p.dev = f.dev AND p.ch = f.ch AND p.q BETWEEN f.q0 AND f.q1
       WHERE p.grn > 0 AND p.w >= 8.0 / 4.0 AND p.w >= 0.8 * p.grn GROUP BY ALL)
 SELECT 'walks without presses' AS kind, f.dev, f.ch, (f.q0 // 96)::BIGINT AS day, f.q0 * 900.0 AS a, coalesce(n.q_next, f.q1 + 1) * 900.0 AS z, f.w_fire / f.rho0 AS x, f.w_fire AS n,
-       f.m_fire / 4.0 AS held, f.e_fire AS every_s, f.walks AS other, n.q_next IS NOT NULL AS ended, coalesce(h.walk_h, 0.0) AS walk_h
+       f.m_fire / 4.0 AS held, f.e_fire AS every_s, f.walks AS other, n.q_next IS NOT NULL AS ended, coalesce(h.walk_h, 0.0) AS walk_h,
+       (SELECT CASE arg_max(e.ev, e.ts) WHEN 90 THEN 'on' ELSE 'off' END FROM pq_ev e WHERE e.dev = f.dev AND e.p = f.ch AND e.ev IN (89, 90)
+        AND e.ts < coalesce(n.q_next, f.q1 + 1) * 900.0) AS last_ev
 FROM f LEFT JOIN n USING (dev, ch, q0) LEFT JOIN h USING (dev, ch, q0)
 WHERE NOT EXISTS (SELECT 1 FROM f o WHERE o.dev = f.dev AND o.ch <> f.ch AND abs(o.q_fire - f.q_fire) <= 2)
   AND NOT EXISTS (SELECT 1 FROM pq_f_stuck s WHERE s.dev = f.dev AND s.ch = f.ch AND s.a < (f.q_fire + 1) * 900.0 AND s.z > f.q0 * 900.0);

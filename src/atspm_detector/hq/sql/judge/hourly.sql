@@ -24,10 +24,10 @@ LEFT JOIN (SELECT * FROM p1part x WHERE NOT EXISTS (SELECT 1 FROM ntraf t WHERE 
   ON pa.kind = 'n' AND pa.id = k.dev * 128 + k.det
 WHERE NOT EXISTS (SELECT 1 FROM ntraf t WHERE t.dev = k.dev AND t.det = k.det)
 -- @step gh mat
-SELECT m.dev, m.det, x.j, x.hod, x.ch, x.H, m.M, m.O, y.p IS NOT NULL OR y.isph AS has_m,
+SELECT m.dev, m.det, x.j, x.hod, {{ "x.ch AND hd.hid IS NULL AS ch, hd.hid IS NOT NULL AS hd" if opt['drop_not_held'] else "x.ch" }}, x.H, m.M, m.O, y.p IS NOT NULL OR y.isph AS has_m,
        CASE WHEN y.p IS NULL AND NOT y.isph THEN CASE WHEN y.cl THEN s.SMc ELSE s.SM END - m.M ELSE coalesce(r.RM, 0) END
        AS R, coalesce(r.RO, 0) AS Om
-FROM mh m JOIN hix x USING (dev, hid) JOIN yk y USING (dev, det)
+FROM mh m JOIN hix x USING (dev, hid) JOIN yk y USING (dev, det){{ ' LEFT JOIN hheld hd USING (dev, det, hid)' if opt['drop_not_held'] else '' }}
 JOIN (SELECT m.dev, m.hid, sum(m.M) AS SM, sum(m.M) FILTER (t.det IS NULL) AS SMc FROM mh m LEFT JOIN ntraf t USING (dev, det)
       GROUP BY m.dev, m.hid) s USING (dev, hid)
 LEFT JOIN (SELECT a.dev, a.det, b.hid, sum(b.M) AS RM, sum(b.O) AS RO
@@ -40,9 +40,9 @@ LEFT JOIN (SELECT a.dev, a.det, b.hid, sum(b.M) AS RM, sum(b.O) AS RO
 -- @step yk mat
 SELECT k.dev, k.det, pa.p, k.isph FROM p1kd k LEFT JOIN p1part pa ON pa.kind = 'n' AND pa.id = k.dev * 128 + k.det
 -- @step gh mat
-SELECT m.dev, m.det, x.j, x.hod, x.ch, x.H, m.M, m.O, y.p IS NOT NULL OR y.isph AS has_m,
+SELECT m.dev, m.det, x.j, x.hod, {{ "x.ch AND hd.hid IS NULL AS ch, hd.hid IS NOT NULL AS hd" if opt['drop_not_held'] else "x.ch" }}, x.H, m.M, m.O, y.p IS NOT NULL OR y.isph AS has_m,
        CASE WHEN y.p IS NULL AND NOT y.isph THEN s.SM - m.M ELSE coalesce(r.RM, 0) END AS R, coalesce(r.RO, 0) AS Om
-FROM mh m JOIN hix x USING (dev, hid) JOIN yk y USING (dev, det)
+FROM mh m JOIN hix x USING (dev, hid) JOIN yk y USING (dev, det){{ ' LEFT JOIN hheld hd USING (dev, det, hid)' if opt['drop_not_held'] else '' }}
 JOIN (SELECT dev, hid, sum(M) AS SM FROM mh GROUP BY dev, hid) s USING (dev, hid)
 LEFT JOIN (SELECT a.dev, a.det, b.hid, sum(b.M) AS RM, sum(b.O) AS RO
            FROM (SELECT dev, det, p AS r FROM yk WHERE p IS NOT NULL

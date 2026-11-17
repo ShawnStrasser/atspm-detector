@@ -65,11 +65,20 @@ Checks (per calendar day; the input's status is its worst day: bad > suspect > c
   sudden stop       suspect / bad  its longest run of zero presses while the signal logs, against the presses its own level
                              at those times of day expects, allowing for clumps and for day-to-day swings (ped_stop.py):
                              flagged at a chance <= 1 in 1,000 OR zero for >= 24 logged hours at >= 30 presses a day
-                             (suspect); bad at <= 1 in 1,000 with bursts capped; run >= 6 logged hours, >= 20 presses
-                             in >= 6 separate hours outside it.  Inferred only from the window; no list of buttons
+                             (that level with bursts capped: option stop_simple_cap, 2.1.0, off) (suspect); bad at <= 1 in
+                             1,000 with bursts capped; run >= 6 logged hours, >= 20 presses
+                             in >= 6 separate hours outside it.  Inferred only from the window; no list of buttons.  Option stop_not_held
+                             (2.1.0): the 15-min bins the button is stuck on / on a long hold are no part of the run or its level.
+                             Option stop_history (2.1.0): the test against the button's own weeks instead (ped_stop.history_stop_sql):
+                             bad when it is still silent at the window's end after >= 24 logged hours, >= 2 x its longest quiet spell
+                             of the 28 days before, a usual day there brings >= 10 presses and the signal's other inputs carried on;
+                             a silence that ended is no finding.  Needs >= 14 logged days before the silence: a longer window, or
+                             history= (15-minute press counts and logged bins from before the window)
   walks without presses  suspect / bad  its phase's walks jump while its presses stop, for >= 1 logged hour after >= 24 logged hours of the window (limits in ped_stop.py, NP_*): needs no ON or
-                             OFF of the button, so it also finds a stuck ON whose ON was lost; recall turned on reads the same.  Another button of the signal firing within 30 minutes, or a stuck ON
-                             over it: no finding.  Bad once the run holds >= 2.5 logged hours of walks at nearly every green
+                             OFF of the button to find the run.  Another button of the signal firing within 30 minutes, or a stuck ON
+                             over it: no finding.  Bad once the run holds >= 2.5 logged hours of walks at nearly every green.  Option walks_need_on (2.1.0):
+                             a finding only when the button's last ON / OFF up to the run's end is an ON with no OFF (a failed button); otherwise
+                             recall, inferred from the log only (never from settings): the config note "P# walks every cycle with no presses: recall (inferred)"
   sustained pressing  suspect  (option sustained_press, on) a day with >= 1,000 presses, >= 5 x the median of the window's other logged days (itself >= 20) and >= 5 15-minute periods of
                              >= 30 presses and >= 10 presses per walk; the period runs from the first such 15 minutes to the last.  Limits in ped_stop.py (SP_*)
 Config notes (status stays ok, user review 2026-10): served by a ped overlap (no ped call; >= 80 % of presses followed
@@ -122,7 +131,18 @@ OPT = {"regular_bad": True, "config_issue": True, "preempt_wait": True, "stuck_2
        # stuck-on periods of an input at most LIM["hold_gap_s"] apart read as one hold (see _join_holds)
        "hold_join": True,
        # far more presses than usual, kept up for hours (approved 2026-11-04)
-       "sustained_press": True}
+       "sustained_press": True,
+       # 2.1.0 (note 158): a sudden stop leaves out the time the button is held ON (stuck on, long hold): one fault, not two
+       "stop_not_held": True,
+       # 2.1.0 (note 158): walks without presses is a fault only with a sign of a failed button (its last ON / OFF up to the
+       # run's end is an ON with no OFF); otherwise recall, inferred from the log only: a config note, never a status
+       "walks_need_on": True,
+       # 2.1.0 (2026-11-12; off, not approved: stop_history does more): a sudden stop's simple test (24 logged hours at 30 presses a day) reads the level with bursts
+       # capped, as the bad rating does: one burst of a quiet button set a 30-a-day level from a few hours (ped_stop.stop_sql simple_cap)
+       "stop_simple_cap": False,
+       # 2.1.0 (approved in the review of 2026-11-12): a sudden stop is judged against the button's own earlier weeks and only while
+       # it is still silent (ped_stop.history_stop_sql): of 241 stops the window test flagged in six weeks, 192 had ended by themselves
+       "stop_history": True}
 # a preemption (user review 2026-10-29): from 102 / 105 to the first 104 / 110 / 111 of its number after it (Sep 2026:
 # 111 missing after 1,676 of 2,425 entries, the 104 is there); none logged: still on, at most 6 h; recovery 120 s as
 # the atspm package's phase-wait check (preempt_recovery_seconds)
@@ -151,12 +171,16 @@ COLS =["DeviceId", "Input", "Phase", "Type", "presses", "status", "reason", "con
 PERIOD_COLS = ["DeviceId", "Detector", "start", "end", "condition", "severity", "limit_s", "in_closure", "whole_window"]
 
 
-def _steps(E: str, opt: dict | None = None, carry: bool = False, store: str = "") -> list:
+def _steps(E: str, opt: dict | None = None, carry: bool = False, store: str = "", history=None) -> list:
     """the temp tables, in order: (name, SELECT) -- the template hq/sql/ped/judge.sql.  pq_wpart (dev, DeviceId, s, e,
     lo, hi) holds the signals of one group and their windows; times are epoch seconds (DOUBLE), days / hours count
-    from the epoch (local time).  store: E is that store's ped log, not the raw log."""
+    from the epoch (local time).  store: E is that store's ped log, not the raw log.  history: (counts, logged), see ped_health."""
+    held = "pq_stoph" if {**OPT, **(opt or {})}.get("stop_not_held") else None
     ctx = dict(E=E, opt={**OPT, **(opt or {})}, L=LIM, PRE=PRE, NOTE=NOTE, CODES=CODES, PRE_CODES=PRE_CODES, carry=carry, store=store,
-               STOP=_stop.stop_sql("pq_stopc", "pq_stopl"),
+               hist=tuple(history) if history else None, HL={"others_min": _stop.HIST_OTHERS_MIN},
+               HSTOP=_stop.history_stop_sql(*(("pq_hstopc", "pq_hstopl") if history else ("pq_stopc", "pq_stopl")), held=held),
+               STOP=_stop.stop_sql("pq_stopc", "pq_stopl", held="pq_stoph" if {**OPT, **(opt or {})}.get("stop_not_held") else None,
+                                   simple_cap=bool({**OPT, **(opt or {})}.get("stop_simple_cap"))),
                STOPLIM={"p_suspect": _stop.P_SUSPECT, "min_run_h": _stop.MIN_RUN_H, "min_presses": _stop.MIN_PRESSES,
                         "min_active_h": _stop.MIN_ACTIVE_H},
                UN={"uniq_s": _stop.UNIQ_S, "np_h": _stop.NP_H, "np_walks_h": _stop.NP_WALKS_H, "np_jump": _stop.NP_JUMP, "np_implied": _stop.NP_IMPLIED, "np_calls": _stop.NP_CALLS,
@@ -203,9 +227,10 @@ def _ts(x):
     return pd.to_datetime((pd.Series(x, dtype="float64") * 1000).round().astype("int64"), unit="ms")
 
 
-def _reason(kind, g, registers, presence, opt=OPT, pre_any=True):
+def _reason(kind, g, registers, presence, opt=OPT, pre_any=True, stuck=False):
     """plain words for one check's findings of one input (g: its rows).  pre_any: the log holds a preempt event of
-    some signal (none: that part of the check could not run)."""
+    some signal (none: that part of the check could not run).  stuck: the input has a stuck-on finding (a sudden stop
+    whose last button event is an ON is then that stuck ON, not lost data)."""
     if kind == "stuck on":
         r = g.loc[g.held.idxmax()]
         before = bool(r.before)     # a numpy bool when only stuck rows came: "is True" would drop the "at least"
@@ -230,14 +255,18 @@ def _reason(kind, g, registers, presence, opt=OPT, pre_any=True):
     if kind == "walks without presses":
         r = g.loc[g.walk_h.astype(float).idxmax()]
         return (f"walks jumped with no presses from {_ts([r.a])[0]:%a %m-%d %H:%M}: {int(r.n)} walks in the next {r.held:g} h where those hours usually bring ~{r.every_s:.0f}; at its "
-                f"earlier walks per press they would mean ~{r.x:.0f} presses; walks at nearly every green for {float(r.walk_h):g} logged hours with no press: stuck ON, or recall turned on")
+                f"earlier walks per press they would mean ~{r.x:.0f} presses; walks at nearly every green for {float(r.walk_h):g} logged hours with no press: "
+                + ("its last button event is an ON with no OFF: stuck ON" if opt.get("walks_need_on") else "stuck ON, or recall turned on"))
     if kind == "sustained pressing":
         r = g.loc[g.x.astype(float).idxmax()]
         return (f"sustained pressing: {int(r.n):,} presses on {_ts([r.a])[0]:%a %m-%d}, {r.x:.1f} x its usual ~{r.every_s:,.0f} a day, with {int(r.other)} 15-minute periods of "
                 f"{_stop.SP_BIN}+ presses at {_stop.SP_PER_WALK}+ a walk")
     r = g.loc[g.x.idxmax()]
+    if pd.notna(r.quiet_h):
+        return history_stop_reason(r.n, _ts([r.since])[0], r.quiet_h, r.usual, r.others, None if pd.isna(r.other) else int(r.other), r.last_ev,
+                                   stuck=bool(stuck) and r.last_ev == "on")
     return stop_reason(r.n, _ts([r.a])[0], r.held, r.every_s, int(r.other), _ts([r.z])[0] if r.ended else None, r.last_ev,
-                       bool(r.before))
+                       bool(r.before), stuck=bool(stuck) and r.last_ev == "on")
 
 
 def stop_cause(last_ev, walks, stuck=False):
@@ -260,6 +289,24 @@ def stop_reason(run_h, start, expected, chance, walks, end=None, last_ev=None, b
             f"(chance about 1 in {1 / max(chance, 1e-12):,.0f} allowing for clumps); {stop_cause(last_ev, walks, stuck)}")
 
 
+def history_stop_reason(run_h, start, quiet_h, usual, others, walks, last_ev=None, stuck=False):
+    """plain words for one stop against the button's own weeks (option stop_history): what makes it more than a quiet day.
+    walks: of its phase over the silence in the window; None: the window holds no press to tell its phase from."""
+    quiet = f"its longest quiet spell in the {_stop.HIST_DAYS} days before was {quiet_h:.0f} h" if quiet_h >= 1 else \
+        f"it had no quiet spell in the {_stop.HIST_DAYS} days before"
+    mates = "" if pd.isna(others) else f"; the signal's other buttons kept {100 * min(float(others), 1.0):.0f} % of their usual presses"
+    if stuck:
+        cause = "its last button event is an ON with no OFF and the phase walks every cycle from it: stuck ON"
+    elif last_ev == "on":
+        cause = "its last button event is an ON with no OFF"
+    elif walks is None:
+        cause = ""
+    else:
+        cause = f"{walks:,} walks of its phase came with no press" if walks else "no walks of its phase came"
+    return (f"no presses for {run_h:.0f} logged hours, {start:%a %m-%d %H:%M} to the end of the log; {quiet}, "
+            f"and a usual day brings ~{usual:.0f} presses{mates}" + (f"; {cause}" if cause else ""))
+
+
 def _wait_note(g, pre_any, opt):
     """the note for one input's call-dropped rows: never a status."""
     r = g.loc[g.x.idxmax()]
@@ -274,7 +321,7 @@ def _wait_note(g, pre_any, opt):
     return f"{len(g)} ped calls for P{int(r.other)} waited, up to {int(r.x)} greens without a walk{pre} (not a fault)"
 
 
-def _config(inp, mirror, joint, recall, stuck, notes=None, nov=None, waits=None, pre_any=True, opt=OPT, no_walks=()):
+def _config(inp, mirror, joint, recall, stuck, notes=None, nov=None, waits=None, pre_any=True, opt=OPT, no_walks=(), rec_nop=None):
     """config notes per input (dev, ch) -> text; no recall note for a stuck input (its held call brings the walks).
     notes: the "omitted during preemption" rows (not a fault, a note); nov: the "never calls a walk" rows of a log
     without any ped overlap walk (not judged); no_walks: inputs whose every stuck period has 0 walks."""
@@ -298,6 +345,13 @@ def _config(inp, mirror, joint, recall, stuck, notes=None, nov=None, waits=None,
     for k in no_walks:
         add(k, "possible configuration issue: stuck ON through 0 walks, no walk comes from this input")
     rec = set(map(tuple, recall[["dev", "ph"]].itertuples(index=False)))
+    if rec_nop is not None:     # walks without presses with no sign of a failed button (walks_need_on): recall, inferred
+        what = {(r.dev, r.ch): (f"P{int(r.ph)}" if pd.notna(r.ph) else f"ped overlap {int(r.ov)}" if pd.notna(r.ov) else "its phase", r.ph)
+                for r in inp.itertuples(index=False)}
+        for dev, ch in dict.fromkeys(zip(rec_nop.dev, rec_nop.ch)):
+            name, ph = what.get((dev, ch), ("its phase", None))
+            if (dev, ch) not in stuck and not (pd.notna(ph) and (dev, ph) in rec):
+                add((dev, ch), f"{name} walks every cycle with no presses: recall (inferred)")
     for r in inp.itertuples(index=False):
         if pd.notna(r.ov):
             add((r.dev, r.ch), f"serves ped overlap {int(r.ov)}: its presses bring that overlap's walk "
@@ -320,7 +374,7 @@ def _config(inp, mirror, joint, recall, stuck, notes=None, nov=None, waits=None,
 
 
 def ped_health(con, events_table: str = "events", start=None, end=None, periods: bool = False,
-               max_events: int | None = 3_000_000, options: dict | None = None, assign: bool = False, carry=None):
+               max_events: int | None = 3_000_000, options: dict | None = None, assign: bool = False, carry=None, history=None):
     """Push-button health of every ped input in `events_table` (DeviceId, Timestamp, EventId, Parameter; local time)
     on an existing DuckDB connection; nothing is copied out.  start / end: the window (end exclusive); default each
     signal's first event to one second past its last.  Returns a DataFrame (COLS: DeviceId, Input, Phase, Type,
@@ -330,23 +384,27 @@ def ped_health(con, events_table: str = "events", start=None, end=None, periods:
     stuck_2walks, orphan_clearance, log_gaps, late_call).  assign=True also runs the ped movement model
     (ped_assign.add_assignments): + Phases, Overlaps, assign_confidence per input; an input with >= 10 presses whose
     presses call nothing gets a config note and, when it was ok, the status config_issue; an input in ped recall gets the
-    config note "ped in recall" only."""
-    return judge_log(con, events_table, start, end, periods, max_events, options, assign, carry)
+    config note "ped in recall" only.  history: (counts, logged), two tables or views from before the window for the option
+    stop_history -- counts: DeviceId, Input, TimeStamp, presses (15-minute press counts); logged: DeviceId, TimeStamp (the
+    15-minute bins the signal logged anything).  Rows from the window on are not read: the window's own come from the log."""
+    return judge_log(con, events_table, start, end, periods, max_events, options, assign, carry, history=history)
 
 
 def judge_log(con, log: str, start=None, end=None, periods: bool = False, max_events: int | None = 3_000_000,
-              options: dict | None = None, assign: bool = False, carry=None, store: str = ""):
+              options: dict | None = None, assign: bool = False, carry=None, store: str = "", history=None):
     """ped_health over `log`: the raw events, or with store (its name and a dot) that store's ped log and what it kept of the signal's
     logging (design 6): the one ped judge."""
     if carry is not None:  # ONs still open from an earlier chunk (ped_stop.open_ons): DeviceId, Input, t_on, Phase
         con.register("pq_carry", carry)
     events_table = log
-    wall = _plan.steps(_render.render("ped/windows.sql", E=events_table, start=start, end=end, CODES=CODES, carry=carry is not None))[0][1]
+    opt = {**OPT, **(options or {})}
+    history = history if history and opt.get("stop_history") else None
+    wall = _plan.steps(_render.render("ped/windows.sql", E=events_table, start=start, end=end, CODES=CODES, carry=carry is not None,
+                                      hist=history[0] if history else None))[0][1]
     con.execute(f"CREATE OR REPLACE TEMP TABLE {PREFIX}wall AS {wall}")
     sig = con.execute(f"SELECT dev, n FROM {PREFIX}wall ORDER BY dev").fetchall()
     groups = _run.groups(sig, max_events)
-    opt = {**OPT, **(options or {})}
-    steps = _steps(events_table, opt, carry is not None, store)
+    steps = _steps(events_table, opt, carry is not None, store, history)
     keep = {"inp": "dev, ch, presses, registers, type, ph, ph2, ov", "mirror": "*", "joint": "*", "recall": "*",
             "prelog": "*", "ovlog": "*", **{f: "*" for f in _findings(opt)}}
     parts = []
@@ -399,13 +457,20 @@ def _join_holds(fnd: pd.DataFrame, gap_s: float) -> pd.DataFrame:
 
 def _assemble(T: dict, devs: pd.DataFrame, periods: bool, opt: dict = OPT):
     inp = T["inp"]
-    if inp.empty:
+    if inp.empty and T["f_stop"].empty:
         out = pd.DataFrame(columns=COLS)
         return (out, pd.DataFrame(columns=PERIOD_COLS)) if periods else out
     # every finding column, also when no finding of a kind that has it was made (each kind has its own columns)
-    cols = ["kind", "dev", "ch", "day", "a", "z", "x", "n", "other", "held", "every_s", "lim", "pre_log", "chance_cap", "ended", "before", "last_ev", "walk_h"]
+    cols = ["kind", "dev", "ch", "day", "a", "z", "x", "n", "other", "held", "every_s", "lim", "pre_log", "chance_cap", "ended", "before", "last_ev", "walk_h",
+            "since", "quiet_h", "usual", "others"]
     parts = [T[f] for f in _findings(opt) if not T[f].empty]
     fnd = pd.concat(parts, ignore_index=True).reindex(columns=cols) if parts else pd.DataFrame(columns=cols)
+    # a button silent through the whole window has no presses to make an input row from: its stop against its own weeks
+    # (stop_history) still names it
+    gone = fnd.loc[fnd.quiet_h.notna(), ["dev", "ch"]].drop_duplicates().merge(inp[["dev", "ch"]], how="left", indicator=True)
+    gone = gone.loc[gone._merge == "left_only", ["dev", "ch"]].assign(presses=0, registers=False, type="unknown")
+    if len(gone):
+        inp = pd.concat([inp, gone], ignore_index=True)
     if opt.get("hold_join"):
         fnd = _join_holds(fnd, LIM["hold_gap_s"])
     pre_any, ov_any = not T["prelog"].empty, not T["ovlog"].empty
@@ -423,17 +488,24 @@ def _assemble(T: dict, devs: pd.DataFrame, periods: bool, opt: dict = OPT):
     # loss never makes a finding): never calls a walk is a config note, not a finding
     nov = fnd[fnd.kind == "never calls a walk"] if opt["log_gaps"] and not ov_any else None
     fnd = fnd if nov is None else fnd[fnd.kind != "never calls a walk"]
+    # walks every cycle with no presses is a fault only when a failed button causes it (walks_need_on): its last ON / OFF up
+    # to the run's end an ON with no OFF.  Otherwise recall (newly turned on, or a plan): a config note, never a finding
+    rec_nop = None
+    if opt.get("walks_need_on"):
+        nop = fnd.kind == "walks without presses"
+        rec_nop = fnd[nop & (fnd.last_ev != "on")]
+        fnd = fnd[~(nop & (fnd.last_ev != "on"))]
     stuck = set(zip(fnd.dev[fnd.kind == "stuck on"], fnd.ch[fnd.kind == "stuck on"]))
     held = fnd[fnd.kind == "stuck on"]
     no_walks = [k for k, n in held.groupby(["dev", "ch"]).n.max().items() if n == 0]
-    cfg = _config(inp, T["mirror"], T["joint"], T["recall"], stuck, notes, nov, waits, pre_any, opt, no_walks)
+    cfg = _config(inp, T["mirror"], T["joint"], T["recall"], stuck, notes, nov, waits, pre_any, opt, no_walks, rec_nop)
     by = {k: g for k, g in fnd.groupby(["dev", "ch"])}
     rows = []
     for r in inp.itertuples(index=False):
         g = by.get((r.dev, r.ch))
         if g is not None:
             status = "bad" if g.bad.any() else "config_issue" if g.cfg.all() else "suspect"
-            reason = "; ".join(_reason(k, g[g.kind == k], r.registers, r.type == "presence", opt, pre_any)
+            reason = "; ".join(_reason(k, g[g.kind == k], r.registers, r.type == "presence", opt, pre_any, (g.kind == "stuck on").any())
                                for k in
                                ("stuck on", "long hold", "machine-regular presses", "never calls a walk", "sudden stop", "walks without presses", "sustained pressing")
                                if (g.kind == k).any())

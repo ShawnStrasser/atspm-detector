@@ -60,13 +60,14 @@ JOIN mhqa a ON a.dev = p.dev AND a.det = p.det AND a.mate = p.mate AND a.dband =
 WHERE h.q_hod IS NOT NULL AND p.Mm >= 5 GROUP BY p.dev, p.det, p.hid
 -- @step mhf mat
 SELECT g.dev, g.det, g.hid, g.M, g.O, v.E, o.occ_ref,
-       coalesce(v.nv >= 1 AND v.E >= {{ M['min_exp']|dbl }}, false) AS jl, coalesce(v.nv >= 1, false) AS jh,
+       coalesce(v.nv >= 1 AND v.E >= {{ M['min_exp']|dbl }}, false){{ ' OR hd.hid IS NOT NULL' if opt['drop_not_held'] else '' }} AS jl, coalesce(v.nv >= 1, false) AS jh,
        coalesce(v.nv >= 1 AND v.E >= {{ M['min_exp']|dbl }} AND v.wlo >= 0.5 AND g.M <= {{ M['own_low']|dbl }} * o.own_ref{{ zolo }},
-                false) AS lo,
+                false){{ ' AND hd.hid IS NULL' if opt['drop_not_held'] else '' }} AS lo,
        coalesce(v.nv >= 1 AND v.nhi >= least(2, v.nv) AND v.nhi >= {{ M['high_share']|dbl }} * v.nv
                 AND g.M >= {{ M['own_high']|dbl }} * o.own_ref + 10{{ zohi }}, false) AS hi
-FROM mhg g LEFT JOIN mhv v USING (dev, det, hid) LEFT JOIN mhoh o USING (dev, det, dy, hod)
-{# runs: hours not judged (too few expected) do not break a run #}
+FROM mhg g LEFT JOIN mhv v USING (dev, det, hid) LEFT JOIN mhoh o USING (dev, det, dy, hod){{ ' LEFT JOIN hheld hd USING (dev, det, hid)' if opt['drop_not_held'] else '' }}
+{# runs: hours not judged (too few expected) do not break a run; drop_not_held (note 158): an hour the detector is held ON
+   is no low hour and breaks a run #}
 -- @step {{ 'mhrun0' if opt['rise_dead_days'] else 'mhrun' }} mat
 SELECT * , sqrt(2 * (M - E) ^ 2 / greatest(M + E, 1e-9)) AS rgeh FROM (
   SELECT dev, det, 'drop' AS kind, min(hid) FILTER (lo) AS a, max(hid) FILTER (lo) + 1 AS z, count(*) FILTER (lo) AS hours,

@@ -11,6 +11,9 @@ from atspm_detector.findings import health
 from test_ped_incremental import batch, con_of, fed, ped_of, same_ped
 
 T0 = pd.Timestamp("2026-09-28 06:00")
+# the logs here lose the held button's ON (walk_every_from): the detection itself is tested with walks_need_on off; with it on (2.1.0)
+# such a run is recall, a config note (the tests at the end)
+OLD = {"walks_need_on": False}
 DAY = 86400
 FIRE = 2 * DAY + 3 * 3600    # 09:00 on day 3
 
@@ -78,6 +81,7 @@ def _log(days=3.0, persons_day=40, presses_each=1, walk_every_from=None, walk_ev
 
 
 def _periods(rows, ch=2, days=3, **kw):
+    kw["options"] = {**OLD, **kw.get("options", {})}
     i, p = P.ped_health(con_of(rows), start=T0, end=T0 + pd.Timedelta(days=days), periods=True, **kw)
     return i[i.Input == ch].iloc[0], p[p.Detector == ch]
 
@@ -92,22 +96,24 @@ def test_the_check_is_on_and_can_be_switched_off():
     assert len(_walks(_periods(rows)[1])) == 1
     assert _walks(_periods(rows, options={"walks_no_press": False})[1]).empty
     assert not {"uniq", "pbin", "f_nop"} & {n for n, _ in P._steps("events", {"walks_no_press": False})}
+    assert P.OPT["walks_need_on"] is True
 
 
 def test_walks_jump_while_presses_stop_flags_within_about_an_hour_as_suspect():
     rows = _log(persons_day=120, stop_at=FIRE, walk_every_from=FIRE)
     # the first judge able to see it: 1 h 15 min after the walks began
-    i, p = P.ped_health(con_of(rows), start=T0, end=T0 + pd.Timedelta(seconds=FIRE + 4500), periods=True)
+    i, p = P.ped_health(con_of(rows), start=T0, end=T0 + pd.Timedelta(seconds=FIRE + 4500), periods=True, options=OLD)
     q = _walks(p[p.Detector == 2])
     assert len(q) == 1 and i[i.Input == 2].status.iloc[0] == "suspect"
     assert "walks jumped with no presses" in i[i.Input == 2].reason.iloc[0]
     assert (T0 + pd.Timedelta(seconds=FIRE) - q.start.iloc[0]) <= pd.Timedelta(minutes=30)
     # and 30 minutes in it does not yet
-    _, p2 = P.ped_health(con_of(rows), start=T0, end=T0 + pd.Timedelta(seconds=FIRE + 1800), periods=True)
+    _, p2 = P.ped_health(con_of(rows), start=T0, end=T0 + pd.Timedelta(seconds=FIRE + 1800), periods=True, options=OLD)
     assert _walks(p2).empty
 
 
 def _judged_at(rows, seconds, **kw):
+    kw["options"] = {**OLD, **kw.get("options", {})}
     i, p = P.ped_health(con_of(rows), start=T0, end=T0 + pd.Timedelta(seconds=seconds), periods=True, **kw)
     return i[i.Input == 2].iloc[0], _walks(p[p.Detector == 2])
 
@@ -147,7 +153,7 @@ def test_the_confidence_of_every_rule_rated_by_a_floor_is_at_least_a_half():
 
 def test_a_flagged_stop_with_a_weak_score_reaches_the_report_limit():
     # zero for 36 logged hours from about 34 presses a day, flagged by the simple test only: its score alone is far under 0.5
-    i, p = _periods(_log(persons_day=34, stop_at=1.5 * DAY))
+    i, p = _periods(_log(persons_day=34, stop_at=1.5 * DAY), options={"stop_history": False})
     q = p[p.condition == "sudden stop"]
     assert len(q) == 1 and i.status == "suspect" and q.severity.iloc[0] == 0.5
 
@@ -184,8 +190,8 @@ def test_walks_brought_by_ped_calls_of_another_input_are_not_this_rule():
 def test_all_buttons_of_a_signal_jumping_together_is_a_plan_not_a_button():
     a = _log(persons_day=120, stop_at=FIRE, walk_every_from=FIRE)
     b = _log(persons_day=120, stop_at=FIRE, walk_every_from=FIRE, ch=6, ph=6, seed=2)
-    assert _walks(P.ped_health(con_of(a + b), start=T0, end=T0 + pd.Timedelta(days=3), periods=True)[1]).empty
-    assert not _walks(P.ped_health(con_of(a), start=T0, end=T0 + pd.Timedelta(days=3), periods=True)[1]).empty
+    assert _walks(P.ped_health(con_of(a + b), start=T0, end=T0 + pd.Timedelta(days=3), periods=True, options=OLD)[1]).empty
+    assert not _walks(P.ped_health(con_of(a), start=T0, end=T0 + pd.Timedelta(days=3), periods=True, options=OLD)[1]).empty
 
 
 def test_a_stuck_on_with_its_on_in_the_log_stays_stuck_on_alone():
@@ -203,7 +209,7 @@ def test_any_cutting_into_updates_gives_the_batch_answer(seed):
     cuts = sorted(T0 + pd.to_timedelta(rng.uniform(0, 3 * DAY, 30), unit="s")) + [end]
     fed(con, cuts, horizon_days=3)
     got, want = ped_of(con, end, 3), batch(con, end, 3)
-    assert not _walks(want[1]).empty
+    assert _walks(want[1]).empty and "walks every cycle with no presses: recall (inferred)" in want[0][want[0].Input == 2].config.iloc[0]
     same_ped(got, want, f"seed {seed}")
 
 
@@ -234,11 +240,11 @@ def test_a_button_on_recall_all_along_with_almost_no_presses_does_not_flag():
 
 def test_the_findings_table_reads_the_check():
     con = con_of(_log(persons_day=120, stop_at=FIRE, walk_every_from=FIRE))
-    f = health(con, "events", start=T0, end=T0 + pd.Timedelta(days=3), vehicle=False, ped=True)
+    f = health(con, "events", start=T0, end=T0 + pd.Timedelta(days=3), vehicle=False, ped=True, ped_options=OLD)
     q = f[(f.Detector == 2) & (f.Label == "walks without presses")]
     assert len(q) == 1 and q.Detail.iloc[0].startswith("walks jumped with no presses") and q.Confidence.iloc[0] >= 0.8
     # judged after an hour and a quarter it is suspect
-    f = health(con, "events", start=T0, end=T0 + pd.Timedelta(seconds=FIRE + 4500), vehicle=False, ped=True)
+    f = health(con, "events", start=T0, end=T0 + pd.Timedelta(seconds=FIRE + 4500), vehicle=False, ped=True, ped_options=OLD)
     q = f[(f.Detector == 2) & (f.Label == "walks without presses")]
     assert len(q) == 1 and 0.5 <= q.Confidence.iloc[0] < 0.8
 
@@ -249,6 +255,77 @@ def test_the_rows_do_not_read_a_number():
     b = [(t, e, {2: 11, 4: 3}.get(n, n)) for t, e, n in a]
     xp, yp = _periods(a)[1], _periods(b, ch=11)[1]
     assert len(_walks(xp)) == 1 == len(_walks(yp)) and _walks(xp).start.iloc[0] == _walks(yp).start.iloc[0]
+
+
+# --- 2.1.0: walking every cycle is a fault only when a failed button causes it -----------------------------------------------------
+def _now(rows, **kw):
+    i, p = P.ped_health(con_of(rows), start=T0, end=T0 + pd.Timedelta(days=3), periods=True, **kw)
+    return i[i.Input == 2].iloc[0], p[p.Detector == 2]
+
+
+def test_walks_every_cycle_with_no_sign_of_a_failed_button_is_recall_a_note_only():
+    # presses stop (each with its OFF) and the phase walks every cycle from then: recall turned on reads the same, so no alert
+    i, p = _now(_log(persons_day=120, stop_at=FIRE, walk_every_from=FIRE))
+    # (the presses themselves stopping is the sudden stop's own question, judged by itself)
+    assert _walks(p).empty and "walks jumped" not in i.reason
+    i, p = _now(_log(persons_day=120, stop_at=FIRE, walk_every_from=FIRE), options={"stop_test": False})
+    assert p.empty and i.status == "ok" and "recall (inferred)" in i.config
+    assert "P2 walks every cycle with no presses: recall (inferred)" in i.config
+    f = health(con_of(_log(persons_day=120, stop_at=FIRE, walk_every_from=FIRE)), "events", start=T0, end=T0 + pd.Timedelta(days=3),
+               vehicle=False, ped=True)
+    q = f[(f.Detector == 2) & (f.Label == "recall (inferred)")]
+    assert len(q) >= 1 and (q.Confidence == 0).all() and f[(f.Detector == 2) & (f.Label == "walks without presses")].empty
+
+
+def test_the_run_reads_the_buttons_last_on_or_off():
+    con = con_of(_log(persons_day=120, stop_at=FIRE, walk_every_from=FIRE))
+    con.execute(f"""CREATE OR REPLACE TEMP TABLE pq_wpart AS SELECT 0 AS dev, 'S' AS DeviceId, {T0.timestamp()} AS s, {T0.timestamp() + 3 * DAY} AS e,
+                    make_timestamp(({T0.timestamp()} * 1e6)::BIGINT) AS lo, make_timestamp(({T0.timestamp() + 3 * DAY} * 1e6)::BIGINT) AS hi""")
+    f = P._run_group(con, P._steps("events"), {"f_nop": "ch, last_ev"})["f_nop"]
+    assert list(f[f.ch == 2].last_ev) == ["off"]
+
+
+def test_with_the_button_left_on_it_stays_a_finding(monkeypatch):
+    # the run's last button event an ON with no OFF (no stuck-on finding of its own): a failed button, so it alerts
+    orig = P._assemble
+    monkeypatch.setattr(P, "_assemble", lambda T, devs, periods, opt=P.OPT: orig({**T, "f_nop": T["f_nop"].assign(last_ev="on")}, devs, periods, opt))
+    i, p = _now(_log(persons_day=120, stop_at=FIRE, walk_every_from=FIRE))
+    assert len(_walks(p)) == 1 and i.status == "bad" and "its last button event is an ON with no OFF: stuck ON" in i.reason
+    assert "recall (inferred)" not in i.config
+
+
+def test_no_recall_note_twice_on_a_phase_already_on_ped_recall():
+    i, _ = _now(_log(persons_day=30, recall=True, stop_at=FIRE))
+    assert "recall (inferred)" not in i.config
+
+
+# --- 2.1.0: a held button is not also a sudden stop over its hold; a stop of a stuck button is not "lost data" ------------------------
+def _held_then_quiet():
+    """presses until 21:00 on day 2, then the button held ON 6 h (the phase walking every cycle), then no presses to the end"""
+    fire = FIRE - 12 * 3600
+    rows = _log(persons_day=120, stop_at=fire, walk_every_from=fire, walk_every_until=fire + 6 * 3600)
+    return rows + [(float(fire), 90, 2), (float(fire) + 0.05, 45, 2), (float(fire + 6 * 3600), 89, 2)], fire
+
+
+def test_a_sudden_stop_leaves_out_the_time_the_button_is_held_on():
+    assert P.OPT["stop_not_held"] is True
+    rows, fire = _held_then_quiet()
+    i, p = _now(rows, options={"stop_history": False})
+    held, stop = p[p.condition == "stuck on"].iloc[0], p[p.condition == "sudden stop"].iloc[0]
+    assert held.end == T0 + pd.Timedelta(seconds=fire + 6 * 3600) and stop.start >= held.end    # the silence after the hold is still reported
+    _, p = _now(rows, options={"stop_not_held": False, "stop_history": False})                # as before: the stop ran over the hold
+    assert p[p.condition == "sudden stop"].start.iloc[0] < held.end
+
+
+def test_a_stop_of_a_stuck_button_does_not_read_as_lost_data():
+    # held ON from 21:00 on day 2 to the end of the log, the phase walking every cycle: stuck on; the stop (rated over the hold with
+    # stop_not_held off) has an ON with no OFF as its last button event, which is that stuck ON
+    fire = FIRE - 12 * 3600
+    rows = _log(persons_day=120, stop_at=fire, walk_every_from=fire) + [(float(fire), 90, 2), (float(fire) + 0.05, 45, 2)]
+    i, p = _now(rows, options={"stop_not_held": False, "stop_history": False})
+    assert (p.condition == "stuck on").any() and (p.condition == "sudden stop").any()
+    assert "lost data, not stuck" not in i.reason and "ON with no OFF and the phase walks every cycle from it: stuck ON" in i.reason
+    assert "lost data, not stuck" in P.stop_cause("on", 5)                                     # without a stuck-on finding: as before
 
 
 # --- a very long ON of a presence input over a log hole ---------------------------------------------------------------------------

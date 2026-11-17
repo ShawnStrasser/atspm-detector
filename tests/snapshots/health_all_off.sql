@@ -547,12 +547,22 @@ SELECT dev, det, min(b) AS a, max(b) + 1 AS z FROM (
   FROM hq_g5 g JOIN hq_dstat s USING (dev, det) WHERE s.n_on > 0 AND g.n = 0 AND (g.occ + g.unk) < 1 AND g.cov)
 GROUP BY dev, det, grp
 ),
+hq_hold AS MATERIALIZED (
+SELECT h.*, row_number() OVER (ORDER BY h.dev, h.det, h.s) AS hid FROM (
+  SELECT dev, det, s / 1e9 AS s, f / 1e9 AS f, false AS open_end, f / 1e9 - s / 1e9 AS dur FROM hq_rhold
+  UNION ALL
+  SELECT c.dev, c.det, c.s / 1e9, w.T, true, c.dur FROM hq_fch c JOIN hq_win w USING (dev) WHERE NOT c.gap AND c.dur >= 300) h
+),
+hq_hold_co AS MATERIALIZED (
+SELECT a.hid, count(DISTINCT b.det) FILTER (least(a.f, b.f) - greatest(a.s, b.s) >= 0.5 * a.dur) AS co
+FROM hq_hold a LEFT JOIN hq_hold b ON a.dev = b.dev AND a.det <> b.det GROUP BY a.hid
+),
 hq_lvl0 AS (
 SELECT dev, det, k, n15, S15, c15,
        sum(n15) OVER w AS cx, sum(S15) OVER w AS cs, row_number() OVER w AS pos,
        count(*) OVER (PARTITION BY dev, det) AS nl, sum(n15) OVER (PARTITION BY dev, det) AS X,
        sum(S15) OVER (PARTITION BY dev, det) AS SS
-FROM (SELECT dev, det, k, n15, sum(n15) OVER (PARTITION BY dev, k) - n15 AS S15, c15 FROM hq_a15) WHERE c15
+FROM (SELECT dev, det, k, n15, sum(n15) OVER (PARTITION BY dev, k) - n15 AS S15, c15 FROM hq_a15) a WHERE c15
 WINDOW w AS (PARTITION BY dev, det ORDER BY k ROWS UNBOUNDED PRECEDING)
 ),
 hq_lvlshift AS (
@@ -569,16 +579,6 @@ FROM (SELECT dev, det, pos,
                    X / greatest(SS, 1) AS p0
             FROM hq_lvl0 WHERE nl >= 8 AND X >= 20 AND pos >= 2 AND pos <= nl - 2))
 GROUP BY dev, det
-),
-hq_hold AS MATERIALIZED (
-SELECT h.*, row_number() OVER (ORDER BY h.dev, h.det, h.s) AS hid FROM (
-  SELECT dev, det, s / 1e9 AS s, f / 1e9 AS f, false AS open_end, f / 1e9 - s / 1e9 AS dur FROM hq_rhold
-  UNION ALL
-  SELECT c.dev, c.det, c.s / 1e9, w.T, true, c.dur FROM hq_fch c JOIN hq_win w USING (dev) WHERE NOT c.gap AND c.dur >= 300) h
-),
-hq_hold_co AS MATERIALIZED (
-SELECT a.hid, count(DISTINCT b.det) FILTER (least(a.f, b.f) - greatest(a.s, b.s) >= 0.5 * a.dur) AS co
-FROM hq_hold a LEFT JOIN hq_hold b ON a.dev = b.dev AND a.det <> b.det GROUP BY a.hid
 ),
 hq_p1ph AS MATERIALIZED (
 SELECT d.dev, d.det, c.ph FROM hq_dets d LEFT JOIN hq_dcl c USING (dev, det)

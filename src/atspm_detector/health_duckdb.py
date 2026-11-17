@@ -88,7 +88,28 @@ OPTIONS = {"silent_limits": True, "silent_merge": True, "no_recovery_cap": True,
            "occ_strict": True,
            # approved 2026-10-28 (notes 154t, 154w, 154aa): detectors that do not look like traffic are nobody's yardstick
            # for the night checks (True) and the count checks (hourly yardstick gh, mate_drop / count_rise mates: "all")
-           "clean_yardsticks": "all"}
+           "clean_yardsticks": "all",
+           # approved 2026-11-10 (notes 157-157d, 2.1.0): busy at night on a zone ON >= busy.lz_occ of its busiest 4 h (long zones,
+           # stop-bar queues: day counts capped) is kept only if its night occupancy share beats the mates' by
+           # mates_delta or its night counts per mate vehicle are >= busy.lz_k x its evening's; never for a stuck-on one
+           "busy_long_zone": True,
+           # approved 2026-11-10 (note 157c): no "misses vehicles at night" on a detector busy at night (its yardstick broke with it)
+           "night_drop_not_busy": True,
+           # approved 2026-11-10 (note 157c): no daily pattern judges the phase mates without the detectors that do not look like
+           # traffic (ntraf; needs clean_yardsticks)
+           "flat_clean_mates": True,
+           # approved 2026-11-10 (note 157f): no daily pattern on a busy zone needs two night hours at its day level (one burst is not a night)
+           "flat_two_hours": True,
+           # approved 2026-11-10 (note 157f): a detector with no daily pattern that is busier at night than by day is named busy at night
+           "flat_busier_busy": True,
+           # approved 2026-11-10 (note 157f): mostly ON (>= mostly_on.occ of 10-min bins, flickering) for >= 30 min while the phase mates
+           # are not: reported as stuck on (key count_on); no phase mates = suspect at most
+           "mostly_on": True,
+           # note 158 (2.1.0): a silence leaves out the time the detector is held ON (stuck on, count zone held ON,
+           # mostly ON): one fault, not two
+           "silent_not_held": True,
+           # note 158 (2.1.0): a count drop leaves out the hours the detector is held ON (no low hours; they end a run)
+           "drop_not_held": True}
 OPTIONS_OFF = {k: (None if k == "lane_pairs" else k == "occ_strict") for k in OPTIONS}   # 1.2.0, time ON not imputed
 NEMA_PAIRS = ((2, 5), (1, 6), (3, 8), (4, 7))
 # note 154n: hour-by-hour drop / rise against each phase mate (options mate_drop, count_rise)

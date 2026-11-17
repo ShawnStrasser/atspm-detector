@@ -11,9 +11,15 @@
 {% if opt['mate_drop'] %}{% set md %}CASE WHEN x.fn = 'Bike' THEN NULL {{ 'WHEN x.lc_l OR x.lc_md THEN 0.0' if lc else '' }} WHEN x.md_h IS NOT NULL THEN {{ lib.sc('x.md_geh', g0, g1) }} WHEN x.mh_ok THEN 0.0 END{% endset %}{% else %}{% set md = 'NULL::DOUBLE' %}{% endif %}
 {% if opt['count_rise'] %}{% set rise %}CASE WHEN x.fn = 'Bike' THEN NULL {{ 'WHEN x.lc_mr THEN 0.0' if lc else '' }} WHEN x.mr_h IS NOT NULL THEN {{ lib.sc('x.mr_geh', g0, g1) }} WHEN x.mh_ok THEN 0.0 END{% endset %}{% else %}{% set rise = 'NULL::DOUBLE' %}{% endif %}
 {% set lvl = lib.sc('x.geh_drop', 'l.lim_level', 'l.bad_level') %}
+{# note 157 (busy_long_zone): busy at night excused on a long zone / queue zone -- never no daily pattern, never a stuck-on
+   detector (its occupancy is the fault, not a long zone); note 157c (night_drop_not_busy): a detector busy at night is
+   not judged for missing vehicles at night (its yardstick usually broke with it) #}
+{% set lzx %}{% if opt['busy_long_zone'] %}(coalesce(x.tod_lz, false) AND coalesce(s.s_stuck_v, 0) < 0.35{{ ' AND NOT coalesce(x.flat, false)' if opt['no_daily_pattern'] else '' }}){% else %}false{% endif %}{% endset %}
 -- @step {{ p }}S mat
 SELECT x.dev, x.det, s.s_stuck_v AS v_stuck,
-  CASE WHEN x.count_on_ok THEN {{ lib.sc('coalesce(x.hi_min_c, 0)', 'l.lim_count_on', 'l.bad_count_on') }} END AS v_count_on,
+{% if opt['mostly_on'] %}{% set MO = LJ['mostly_on'] %}{% set mo %}CASE WHEN x.fn <> 'Bike' AND x.mo_min IS NOT NULL THEN CASE WHEN coalesce(x.mo_nm, 0) = 0 THEN least({{ lib.sc('x.mo_min', MO['min'][0]|dbl, MO['min'][1]|dbl) }}, {{ MO['no_mates_max']|dbl }}) ELSE {{ lib.sc('x.mo_min', MO['min'][0]|dbl, MO['min'][1]|dbl) }} END END{% endset %}  CASE WHEN x.count_on_ok THEN greatest({{ lib.sc('coalesce(x.hi_min_c, 0)', 'l.lim_count_on', 'l.bad_count_on') }}, coalesce({{ mo }}, 0.0)) ELSE {{ mo }} END AS v_count_on,
+{% else %}  CASE WHEN x.count_on_ok THEN {{ lib.sc('coalesce(x.hi_min_c, 0)', 'l.lim_count_on', 'l.bad_count_on') }} END AS v_count_on,
+{% endif %}
   CASE WHEN x.fn = 'Bike' THEN NULL WHEN x.silent THEN 0.0 {{ 'WHEN x.lc_d THEN 0.0' if lc else '' }}
        {{ 'WHEN x.drop_b1 - x.drop_b0 < 3 THEN least(x.sd, 0.5)' if opt['silent_limits'] else '' }} ELSE x.sd END AS v_dropout,
   CASE WHEN x.fn = 'Bike' OR NOT x.geh_ok THEN NULL {{ 'WHEN x.lc_l THEN 0.0' if lc else '' }}
@@ -29,8 +35,8 @@ SELECT x.dev, x.det, s.s_stuck_v AS v_stuck,
   CASE WHEN x.fn = 'Bike' THEN NULL {{ 'WHEN x.moved AND x.lc_d THEN 0.0' if lc else '' }}
        {{ 'WHEN x.moved AND coalesce(x.drop_lam, 0) < 50 THEN 0.0' if opt['silent_limits'] else '' }}
        WHEN x.moved AND coalesce(x.drop_lam, 0) < 100 THEN least(x.sd, 0.5)
-       WHEN x.moved THEN x.sd ELSE x.nd END AS v_night_drop,
-  CASE WHEN x.fn <> 'Bike' AND coalesce(CASE WHEN x.silent THEN 0.0 ELSE x.sd END, 0)
+       WHEN x.moved THEN x.sd{{ ' WHEN coalesce(x.pv, 0) >= 0.35 AND NOT ' ~ lzx ~ ' THEN 0.0' if opt['night_drop_not_busy'] else '' }} ELSE x.nd END AS v_night_drop,
+  CASE {{ 'WHEN ' ~ lzx ~ ' THEN CASE WHEN x.pv IS NOT NULL THEN 0.0 END ' if opt['busy_long_zone'] else '' }}WHEN x.fn <> 'Bike' AND coalesce(CASE WHEN x.silent THEN 0.0 ELSE x.sd END, 0)
             >= {{ '0.42' if opt['no_recovery_cap'] else '0.35' }}
        THEN CASE WHEN x.pv IS NOT NULL THEN 0.0 END ELSE x.pv END AS v_prof,
   CASE WHEN x.N >= 50 THEN {{ lib.sc('x.xr + 1e-9 * (x.xr > 0)::INT', '1.0', 'l.bad_rapid / l.lim_rapid') }} END AS v_rapid,
