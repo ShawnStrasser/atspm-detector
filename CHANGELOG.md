@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased - no data from a signal in flash, saved ped configuration
+
+- No data from a signal in flash is used, by any check or model (new `flash.py`): from a unit flash status change (173)
+  other than 2 to the next 173 = 2, and from a coordination pattern change to 255 to the next pattern change; a log that
+  opens mid-flash counts as in flash up to its first 173 = 2 when no begin green came before it. `health()`, the ped
+  rules, `ped_assignments` / `ped_detectors` and `predict()` drop every event of the signal in those periods, so the
+  time reads as a signal that logged nothing. Found at two signals in ped recall whose night-flash presses made their
+  buttons read as calling no phase.
+- `health(ped_config=...)` / `ped_health(config=...)`: a saved ped configuration (DeviceId, Detector = the ped input,
+  phase, function 'Ped' / 'Ped_Overlap', in_recall), e.g. the movement model's answers kept with the vehicle
+  detectors. A button with a saved row takes its phases / ped overlap from it instead of the window; a saved in-recall
+  button never reads as calling no phase. Buttons without a row are judged from the window, as before.
+
 ## 2.1.0 - mostly ON, busy at night on long zones, no daily pattern, one fault reported once, ped recall
 
 Phase, function, lanes, setback and night speed are unchanged. Health only.

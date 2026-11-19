@@ -110,6 +110,7 @@ import math
 import pandas as pd
 
 from . import ped_stop as _stop
+from .flash import without_flash
 from .hq import plan as _plan
 from .hq import render as _render
 from .hq import run as _run
@@ -171,12 +172,13 @@ COLS =["DeviceId", "Input", "Phase", "Type", "presses", "status", "reason", "con
 PERIOD_COLS = ["DeviceId", "Detector", "start", "end", "condition", "severity", "limit_s", "in_closure", "whole_window"]
 
 
-def _steps(E: str, opt: dict | None = None, carry: bool = False, store: str = "", history=None) -> list:
+def _steps(E: str, opt: dict | None = None, carry: bool = False, store: str = "", history=None, config: str | None = None) -> list:
     """the temp tables, in order: (name, SELECT) -- the template hq/sql/ped/judge.sql.  pq_wpart (dev, DeviceId, s, e,
     lo, hi) holds the signals of one group and their windows; times are epoch seconds (DOUBLE), days / hours count
-    from the epoch (local time).  store: E is that store's ped log, not the raw log.  history: (counts, logged), see ped_health."""
+    from the epoch (local time).  store: E is that store's ped log, not the raw log.  history: (counts, logged), see ped_health.  config: the saved
+    configuration table, see ped_health."""
     held = "pq_stoph" if {**OPT, **(opt or {})}.get("stop_not_held") else None
-    ctx = dict(E=E, opt={**OPT, **(opt or {})}, L=LIM, PRE=PRE, NOTE=NOTE, CODES=CODES, PRE_CODES=PRE_CODES, carry=carry, store=store,
+    ctx = dict(E=E, opt={**OPT, **(opt or {})}, L=LIM, PRE=PRE, NOTE=NOTE, CODES=CODES, PRE_CODES=PRE_CODES, carry=carry, store=store, cfg=config,
                hist=tuple(history) if history else None, HL={"others_min": _stop.HIST_OTHERS_MIN},
                HSTOP=_stop.history_stop_sql(*(("pq_hstopc", "pq_hstopl") if history else ("pq_stopc", "pq_stopl")), held=held),
                STOP=_stop.stop_sql("pq_stopc", "pq_stopl", held="pq_stoph" if {**OPT, **(opt or {})}.get("stop_not_held") else None,
@@ -360,6 +362,8 @@ def _config(inp, mirror, joint, recall, stuck, notes=None, nov=None, waits=None,
             add((r.dev, r.ch), f"calls P{int(r.ph)} and P{int(r.ph2)} at once")
         if pd.notna(r.ph) and (r.dev, r.ph) in rec and (r.dev, r.ch) not in stuck:
             add((r.dev, r.ch), f"P{int(r.ph)} on ped recall: it walks without presses")
+        elif pd.isna(r.ph) and pd.isna(r.ov) and pd.notna(r.cfg_recall) and bool(r.cfg_recall):
+            add((r.dev, r.ch), "ped in recall (saved configuration): the log cannot show which phase this button calls")
     for r in mirror.sort_values("share", ascending=False).drop_duplicates(["dev", "ch"]).itertuples(index=False):
         if r.full_pair and r.share >= LIM["mirror_share"]:
             add((r.dev, r.ch), f"same button as ped {int(r.o)} (one button wired to two inputs)")
@@ -374,7 +378,8 @@ def _config(inp, mirror, joint, recall, stuck, notes=None, nov=None, waits=None,
 
 
 def ped_health(con, events_table: str = "events", start=None, end=None, periods: bool = False,
-               max_events: int | None = 3_000_000, options: dict | None = None, assign: bool = False, carry=None, history=None):
+               max_events: int | None = 3_000_000, options: dict | None = None, assign: bool = False, carry=None, history=None,
+               config: str | None = None):
     """Push-button health of every ped input in `events_table` (DeviceId, Timestamp, EventId, Parameter; local time)
     on an existing DuckDB connection; nothing is copied out.  start / end: the window (end exclusive); default each
     signal's first event to one second past its last.  Returns a DataFrame (COLS: DeviceId, Input, Phase, Type,
@@ -386,16 +391,23 @@ def ped_health(con, events_table: str = "events", start=None, end=None, periods:
     presses call nothing gets a config note and, when it was ok, the status config_issue; an input in ped recall gets the
     config note "ped in recall" only.  history: (counts, logged), two tables or views from before the window for the option
     stop_history -- counts: DeviceId, Input, TimeStamp, presses (15-minute press counts); logged: DeviceId, TimeStamp (the
-    15-minute bins the signal logged anything).  Rows from the window on are not read: the window's own come from the log."""
-    return judge_log(con, events_table, start, end, periods, max_events, options, assign, carry, history=history)
+    15-minute bins the signal logged anything).  Rows from the window on are not read: the window's own come from the log.
+    config: a saved configuration table or view (DeviceId, Detector = the ped input, phase, function 'Ped' / 'Ped_Overlap',
+    in_recall), e.g. the movement model's answers kept with the vehicle detectors: an input with a saved row takes its
+    phases / ped overlap from it instead of the window; a saved in_recall input never reads as calling nothing.  Inputs
+    without a saved row: from the window.  Events of a signal in flash are never used (flash.py)."""
+    return judge_log(con, events_table, start, end, periods, max_events, options, assign, carry, history=history, config=config)
 
 
 def judge_log(con, log: str, start=None, end=None, periods: bool = False, max_events: int | None = 3_000_000,
-              options: dict | None = None, assign: bool = False, carry=None, store: str = "", history=None):
+              options: dict | None = None, assign: bool = False, carry=None, store: str = "", history=None,
+              config: str | None = None):
     """ped_health over `log`: the raw events, or with store (its name and a dot) that store's ped log and what it kept of the signal's
     logging (design 6): the one ped judge."""
     if carry is not None:  # ONs still open from an earlier chunk (ped_stop.open_ons): DeviceId, Input, t_on, Phase
         con.register("pq_carry", carry)
+    if not store:       # no data from a signal in flash (flash.py); a store keeps its own log
+        log = without_flash(con, log, "ph_noflash")
     events_table = log
     opt = {**OPT, **(options or {})}
     history = history if history and opt.get("stop_history") else None
@@ -404,8 +416,8 @@ def judge_log(con, log: str, start=None, end=None, periods: bool = False, max_ev
     con.execute(f"CREATE OR REPLACE TEMP TABLE {PREFIX}wall AS {wall}")
     sig = con.execute(f"SELECT dev, n FROM {PREFIX}wall ORDER BY dev").fetchall()
     groups = _run.groups(sig, max_events)
-    steps = _steps(events_table, opt, carry is not None, store, history)
-    keep = {"inp": "dev, ch, presses, registers, type, ph, ph2, ov", "mirror": "*", "joint": "*", "recall": "*",
+    steps = _steps(events_table, opt, carry is not None, store, history, config)
+    keep = {"inp": "dev, ch, presses, registers, type, ph, ph2, ov, cfg_recall", "mirror": "*", "joint": "*", "recall": "*",
             "prelog": "*", "ovlog": "*", **{f: "*" for f in _findings(opt)}}
     parts = []
     try:
@@ -468,7 +480,7 @@ def _assemble(T: dict, devs: pd.DataFrame, periods: bool, opt: dict = OPT):
     # a button silent through the whole window has no presses to make an input row from: its stop against its own weeks
     # (stop_history) still names it
     gone = fnd.loc[fnd.quiet_h.notna(), ["dev", "ch"]].drop_duplicates().merge(inp[["dev", "ch"]], how="left", indicator=True)
-    gone = gone.loc[gone._merge == "left_only", ["dev", "ch"]].assign(presses=0, registers=False, type="unknown")
+    gone = gone.loc[gone._merge == "left_only", ["dev", "ch"]].assign(presses=0, registers=False, type="unknown", cfg_recall=False)
     if len(gone):
         inp = pd.concat([inp, gone], ignore_index=True)
     if opt.get("hold_join"):

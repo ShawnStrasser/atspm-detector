@@ -128,10 +128,23 @@ f AS (SELECT pp.*, o.ts FROM pp ASOF LEFT JOIN pq_ovw o ON o.dev = pp.dev AND o.
 SELECT dev, ch, arg_max(ov, share * 1000 - ov) AS ov FROM (
   SELECT dev, ch, ov, avg(CASE WHEN ts - t_on <= {{ L['follow_s'] }} THEN 1 ELSE 0 END) AS share FROM f GROUP BY ALL)
 WHERE share >= {{ L['overlap_share'] }} GROUP BY ALL
+{# a saved configuration (cfg: DeviceId, Detector, phase, function 'Ped' / 'Ped_Overlap', in_recall) is used in place of
+   what the window shows: its phases (lowest first) and ped overlap; in_recall: the log cannot show the button's phase,
+   so it never reads as calling nothing.  An input without a saved row: from the window, as before #}
 -- @step inp
-SELECT i.dev, i.ch, i.presses, i.registers, i.type, CASE WHEN i.registers THEN i.ph45 ELSE f.ph END AS ph,
-       CASE WHEN i.registers THEN i.ph2 END AS ph2, o.ov
-FROM pq_inp0 i LEFT JOIN pq_fb f USING (dev, ch) LEFT JOIN pq_ovl o USING (dev, ch)
+{% if cfg %}WITH c AS (SELECT w.dev, k.Detector::INT AS ch,
+                  list(DISTINCT k.phase::INT ORDER BY k.phase::INT) FILTER (k.function = 'Ped' AND k.phase IS NOT NULL) AS phs,
+                  min(k.phase::INT) FILTER (k.function = 'Ped_Overlap') AS cov, bool_or(coalesce(k.in_recall, false)) AS rec
+           FROM {{ cfg }} k JOIN pq_wpart w ON lower(CAST(k.DeviceId AS VARCHAR)) = lower(CAST(w.DeviceId AS VARCHAR))
+           GROUP BY ALL)
+{% endif %}SELECT i.dev, i.ch, i.presses, i.registers, i.type,
+{% if cfg %}       CASE WHEN len(c.phs) > 0 OR c.cov IS NOT NULL THEN c.phs[1] WHEN i.registers THEN i.ph45 ELSE f.ph END AS ph,
+       CASE WHEN len(c.phs) > 0 OR c.cov IS NOT NULL THEN c.phs[2] WHEN i.registers THEN i.ph2 END AS ph2,
+       CASE WHEN len(c.phs) > 0 OR c.cov IS NOT NULL THEN c.cov ELSE o.ov END AS ov, coalesce(c.rec, false) AS cfg_recall
+{% else %}       CASE WHEN i.registers THEN i.ph45 ELSE f.ph END AS ph, CASE WHEN i.registers THEN i.ph2 END AS ph2, o.ov,
+       false AS cfg_recall
+{% endif %}FROM pq_inp0 i LEFT JOIN pq_fb f USING (dev, ch) LEFT JOIN pq_ovl o USING (dev, ch){% if cfg %} LEFT JOIN c USING (dev, ch){% endif %}
+
 {# every ON with its phase's walk state, the 45 it placed, the gap since the input's previous ON, the log-limit mark and
    the waiting-group key (don't walk: its cycle; before any walk: a new group after a 120-s gap) #}
 -- @step pa
@@ -225,7 +238,7 @@ FROM r JOIN pq_pa p USING (dev, ch, day) GROUP BY ALL
 -- @step f_never
 SELECT 'never calls a walk' AS kind, p.dev, p.ch, p.day, min(p.t_on) AS a, max(p.t_on) AS z, count(*) AS x, count(*) AS n
 FROM pq_pa p JOIN pq_inp i USING (dev, ch)
-WHERE i.ph IS NULL AND i.ov IS NULL AND i.type <> 'presence'
+WHERE i.ph IS NULL AND i.ov IS NULL AND i.type <> 'presence' AND NOT i.cfg_recall
   AND NOT EXISTS (SELECT 1 FROM pq_f_regular r WHERE r.dev = p.dev AND r.ch = p.ch AND r.day = p.day)
 GROUP BY ALL HAVING count(*) >= {{ L['no_call'] }}
 {# standing calls (45 outside the walk) of phases that walk: ended by the next walk or the next 45 (dropped) #}

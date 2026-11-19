@@ -67,6 +67,7 @@ import numpy as np
 import pandas as pd
 
 from . import trees_onnx
+from .flash import without_flash
 from .hq import plan as _plan
 from .hq import render as _render
 
@@ -159,6 +160,7 @@ def ped_assignments(con, events_table: str = "events", start=None, end=None, thr
     model_dir = Path(model_dir) if model_dir is not None else WEIGHTS
     man = _manifest(model_dir)
     thr = float(man["threshold"] if threshold is None else threshold)
+    events_table = without_flash(con, events_table, "pa_noflash")   # no data from a signal in flash (flash.py)
     C, inputs = _features(con, events_table, start, end)
     if inputs.empty:
         out = pd.DataFrame(columns=COLS)
@@ -285,6 +287,7 @@ def ped_detectors(con, events_table: str = "events", start=None, end=None, healt
     from .ped_health_duckdb import ped_health
     from .pipeline import EXTRA_COLS, OUT_COLS
     cols = OUT_COLS + EXTRA_COLS
+    events_table = without_flash(con, events_table, "pd_noflash")   # no data from a signal in flash (flash.py)
     assigned = _assigned(con, events_table, start, end, threshold, model_dir)
     a, C, overlap_seen = assigned
     if a.empty:

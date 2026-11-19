@@ -49,6 +49,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from .flash import without_flash
 from .hq import plan as _plan
 from .hq import render as _render
 from .hq import run as _run
@@ -343,6 +344,7 @@ def health(con, events_table: str = "events", detectors_table: str = "detectors"
         raise ValueError(f"bin_origin must be one of {BIN_ORIGINS}")
     if start is not None and end is not None and pd.Timestamp(end) - pd.Timestamp(start) > pd.Timedelta(days=MAX_DAYS):
         raise ValueError(f"window longer than {MAX_DAYS} days; split it")
+    events_table = without_flash(con, events_table, "vh_noflash")   # no data from a signal in flash (flash.py)
     cols = _cols(con, detectors_table)
     probs, cfg = set(PROB.values()) <= cols, "configured_function" in cols
     if windows_table is None:

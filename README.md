@@ -66,6 +66,11 @@ function and number of lanes. Use `predict`'s output as below, or your own detec
 columns. It runs in DuckDB, on tables in your connection:
 
 ```python
+Nothing a signal logs while it is in flash is used, by any check or model: those hours read as a signal that logged
+nothing. To judge ped buttons against a saved configuration instead of the phase their presses show in the window, pass
+`health(..., ped_config="table")` (DeviceId, Detector = the ped input, phase, function `Ped` / `Ped_Overlap`,
+in_recall), for example the answers of `ped_detectors` kept from an earlier run.
+
 import duckdb
 from atspm_detector import health
 

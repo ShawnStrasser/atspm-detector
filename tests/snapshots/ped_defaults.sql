@@ -112,8 +112,9 @@ SELECT dev, ch, arg_max(ov, share * 1000 - ov) AS ov FROM (
 WHERE share >= 0.8 GROUP BY ALL;
 
 -- inp
-SELECT i.dev, i.ch, i.presses, i.registers, i.type, CASE WHEN i.registers THEN i.ph45 ELSE f.ph END AS ph,
-       CASE WHEN i.registers THEN i.ph2 END AS ph2, o.ov
+SELECT i.dev, i.ch, i.presses, i.registers, i.type,
+       CASE WHEN i.registers THEN i.ph45 ELSE f.ph END AS ph, CASE WHEN i.registers THEN i.ph2 END AS ph2, o.ov,
+       false AS cfg_recall
 FROM pq_inp0 i LEFT JOIN pq_fb f USING (dev, ch) LEFT JOIN pq_ovl o USING (dev, ch);
 
 -- pa
@@ -208,7 +209,7 @@ FROM r JOIN pq_pa p USING (dev, ch, day) GROUP BY ALL;
 -- f_never
 SELECT 'never calls a walk' AS kind, p.dev, p.ch, p.day, min(p.t_on) AS a, max(p.t_on) AS z, count(*) AS x, count(*) AS n
 FROM pq_pa p JOIN pq_inp i USING (dev, ch)
-WHERE i.ph IS NULL AND i.ov IS NULL AND i.type <> 'presence'
+WHERE i.ph IS NULL AND i.ov IS NULL AND i.type <> 'presence' AND NOT i.cfg_recall
   AND NOT EXISTS (SELECT 1 FROM pq_f_regular r WHERE r.dev = p.dev AND r.ch = p.ch AND r.day = p.day)
 GROUP BY ALL HAVING count(*) >= 10;
 

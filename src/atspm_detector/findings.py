@@ -223,7 +223,7 @@ def health(con, events_table: str = "events", detectors_table: str = "detectors"
            windows_table: str | None = None, max_events: int | None = 4_000_000,
            ped_max_events: int | None = 3_000_000, distinct: bool = True, options: dict | None = None,
            ped_options: dict | None = None, ped_assign: bool = False, workers: int = 1, bin_origin: str = "window",
-           ped_history=None):
+           ped_history=None, ped_config: str | None = None):
     """The health of the vehicle detectors and ped buttons of `events_table` on an existing DuckDB connection (nothing is
     copied out): the findings table (FINDING_COLS), or with summary=True (findings, status).
 
@@ -244,7 +244,11 @@ def health(con, events_table: str = "events", detectors_table: str = "detectors"
     bin_origin        "window" (default): bins from each signal's window start; "clock": from the quarter-hour at or
                       before it, as an incremental store bins (its judge then gives this run's answers)
     ped_history       (counts, logged): 15-minute press counts and logged bins from before the window, for the ped option
-                      stop_history (ped_health_duckdb.ped_health history=)"""
+                      stop_history (ped_health_duckdb.ped_health history=)
+    ped_config        a saved ped configuration table or view (DeviceId, Detector = ped input, phase, function 'Ped' /
+                      'Ped_Overlap', in_recall): used in place of the phase each button's presses show in the window
+                      (ped_health_duckdb.ped_health config=)
+    Events of a signal in flash are never used, by any check (flash.py)."""
     if not vehicle and ped is False:
         raise ValueError("vehicle=False and ped=False leave nothing to judge")
     if windows_table is not None:
@@ -258,7 +262,8 @@ def health(con, events_table: str = "events", detectors_table: str = "detectors"
         pin = event_windows(con, events_table, start=start, end=end, ped=True, ped_hist=ped_history[0] if ped_history else None)
         if len(pin):
             ped_in, ped_per = _ped.ped_health(con, events_table, start, end, periods=True, max_events=ped_max_events,
-                                              options=ped_options, assign=ped_assign, history=ped_history)
+                                              options=ped_options, assign=ped_assign, history=ped_history,
+                                              config=ped_config)
     if vehicle:
         det, per = _hq.health(con, events_table, detectors_table, start, end, windows_table=windows_table,
                               max_events=max_events, distinct=distinct, options=options, periods=True, workers=workers,

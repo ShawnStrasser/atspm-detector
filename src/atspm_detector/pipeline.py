@@ -78,6 +78,7 @@ import pandas as pd
 from . import blend as gb
 from . import decode as dec
 from . import features as f1
+from .flash import drop_flash
 from . import features_expert as fx
 from . import features_lag as f3
 from . import features_partner as f2
@@ -349,6 +350,16 @@ def load_events(con, events, device_ids=None, start=None, end=None):
         FROM {src} e JOIN devmap m USING (DeviceId) WHERE e.good""")
     con.execute("CREATE OR REPLACE TEMP VIEW ev AS SELECT DeviceId, Timestamp, EventId, Parameter FROM evd")
     w0, w1, info = _window(con)
+    if drop_flash(con, "evd"):     # no data from a signal in flash (flash.py); a signal left with none drops out
+        left = sorted(str(r[0]) for r in con.execute("SELECT DISTINCT DeviceId FROM evd").fetchall())
+        if len(left) < len(ids):
+            con.execute("CREATE OR REPLACE TEMP TABLE devmap (DeviceId VARCHAR, dev SMALLINT)")
+            if left:
+                con.executemany("INSERT INTO devmap VALUES (?, ?)", [(d, i + 1) for i, d in enumerate(left)])
+            con.execute("CREATE OR REPLACE TEMP TABLE evd_fl AS SELECT m.dev, e.DeviceId, e.Timestamp, e.EventId, e.Parameter "
+                        "FROM evd e JOIN devmap m USING (DeviceId)")
+            con.execute("DROP TABLE evd")
+            con.execute("ALTER TABLE evd_fl RENAME TO evd")
     info["n_invalid"] = n_bad
     return w0, w1, info
 
