@@ -93,10 +93,11 @@ def test_cli_out_atspm(tmp_path):
     from atspm_detector.pipeline import main
     main(["--events", str(SAMPLE), "--out", str(tmp_path / "det.csv"), "--out-atspm", str(tmp_path / "cfg.csv"),
           "--quiet"])
-    cfg = pd.read_csv(tmp_path / "cfg.csv", dtype={"DeviceId": str})
+    cfg = pd.read_csv(tmp_path / "cfg.csv", dtype={"DeviceId": str, "Lanes": str})
     assert list(cfg.columns) == CONFIG_COLUMNS
     ref = dc.to_atspm_config(dc.predict(SAMPLE))
-    assert cfg.astype({"Phase": "int16", "Parameter": "int16"}).equals(ref)
+    # Lanes is object (None where missing); read back from CSV it is text (str dtype on pandas 3)
+    assert cfg.astype({"Phase": "int16", "Parameter": "int16", "Lanes": object}).equals(ref)
 
 
 def test_one_per_lane_synthetic():
