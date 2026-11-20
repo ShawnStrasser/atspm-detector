@@ -64,7 +64,8 @@ STOPBAR = ("Presence", "Count", "Yellow_Red")
 HEALTH = ("ok", "watch", "suspect", "bad", "not_enough_data", "lane_closure", "timing_plan")
 # outputs that carry no phase number and must not move at all when the phases are renumbered
 INVARIANT = ["lanes", "lane_conf", "phase_n_lanes", "phase_n_lanes_conf", "distance_ft",
-             "setback_confidence", "night_speed_mph", "night_speed_vehicles", "health_status"]
+             "setback_confidence", "travel_time_s", "red_departure_share", "night_speed_mph", "night_speed_vehicles",
+             "health_status"]
 HEALTH_TEXT = ("review_reason",)
 PROB_TOL = 1e-6          # float noise only
 PERM_SEEDS = (0, 1, 2)
@@ -163,6 +164,10 @@ def check_new_outputs(out: pd.DataFrame, phases: pd.DataFrame) -> None:
     adv = ans[ans.function_pred.isin(["Advance", "Mid"])]
     assert (adv.distance_ft.dropna() >= 0).all() and adv.distance_ft.notna().any()
     assert out.setback_confidence.dropna().isin(["high", "medium", "low"]).all()
+    assert ans[~ans.function_pred.isin(["Advance", "Mid"])].travel_time_s.isna().all(),         "only an Advance / Mid detector has a travel time"
+    assert (out.travel_time_s.dropna() > 0).all() and (out.travel_time_s.dropna() <= 20).all()
+    assert ans[~ans.function_pred.isin(["Advance", "Mid"])].red_departure_share.isna().all(),         "only an Advance / Mid detector has a red departure share"
+    assert out.red_departure_share.dropna().between(0, 1).all()
     assert out[out.function_pred.isna()].distance_ft.isna().all(), "a withheld detector has a setback"
     assert ans[ans.function_pred.eq("Bike")].lanes.isna().all(), "a Bike detector got a lane"
     ln = ans[ans.lanes.notna()]

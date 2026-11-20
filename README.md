@@ -46,6 +46,14 @@ One row per detector: phase and function (each with a probability), lanes, setba
 (ok / watch / suspect / bad / not_enough_data / lane_closure / timing_plan). Under 5 actuations there is no answer.
 `predict` also takes a parquet or CSV path or glob, and `start` / `end` times.
 
+`travel_time_s` is the time a free-flowing car takes from an Advance or Mid detector to the stop line, measured against a
+stop-bar zone in the same lane (empty without one). `red_departure_share` pools the OFFs of every stop-bar count zone (Count /
+Yellow_Red) in the lanes the detector covers, and gives the share 2 s or more after the phase's red started: cars leaving
+on red. A detector over a through-right and a through lane pools both lanes' zones. Stop-bar presence zones are not
+used: their share ran higher than the count zones' and did not track them. `to_atspm_config(results)` turns the results into the `detector_config` of the
+[atspm](https://pypi.org/project/atspm/) package: `DeviceId`, `Phase`, `Parameter`, `Function`, `DistanceFromStopBar`,
+`Lanes`, `TravelTime` and `RedDepartures`; atspm's arrival-on-green Queue Model reads the last three.
+
 ## How it works
 
 * The model sees detector on / off, signal phasing and calls. It scores each
@@ -61,16 +69,16 @@ Each detector gets a status and findings in plain words, judged against what is 
 misses vehicles at night, busy at night, too fast / too many, spiky counts, no daily pattern, counts too high. Lane closures and timing plans are reported, not counted as faults.
 Ped push buttons are judged the same way. Not field-verified.
 
-`predict` already runs health on its own answers. To run it yourself, give `health` each detector's phase,
-function and number of lanes. Use `predict`'s output as below, or your own detector configuration with the same
-columns. It runs in DuckDB, on tables in your connection:
-
-```python
 Nothing a signal logs while it is in flash is used, by any check or model: those hours read as a signal that logged
 nothing. To judge ped buttons against a saved configuration instead of the phase their presses show in the window, pass
 `health(..., ped_config="table")` (DeviceId, Detector = the ped input, phase, function `Ped` / `Ped_Overlap`,
 in_recall), for example the answers of `ped_detectors` kept from an earlier run.
 
+`predict` already runs health on its own answers. To run it yourself, give `health` each detector's phase,
+function and number of lanes. Use `predict`'s output as below, or your own detector configuration with the same
+columns. It runs in DuckDB, on tables in your connection:
+
+```python
 import duckdb
 from atspm_detector import health
 

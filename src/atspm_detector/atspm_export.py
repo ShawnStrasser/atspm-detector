@@ -2,20 +2,25 @@
 
     from atspm_detector import predict, to_atspm_config
     det = predict(events)
-    config = to_atspm_config(det)          # DeviceId, Phase, Parameter, Function
+    config = to_atspm_config(det)          # DeviceId, Phase, Parameter, Function, DistanceFromStopBar, Lanes, TravelTime,
+                                           # RedDepartures
     # then: atspm.SignalDataProcessor(raw_data=events, detector_config=config, ...)
 
 Command line: `atspm-detector --events events.parquet --out detectors.csv --out-atspm detector_config.csv`.
 
-What atspm reads from `detector_config`: four columns selected by name -- `DeviceId`, `Phase`, `Parameter` (the
-detector channel) and `Function` (text, matched exactly and case-sensitively). Extra columns are ignored. One row per
-(detector, phase). The measures that use it:
+What atspm (3.0.1) reads from `detector_config`, by name: `DeviceId`, `Phase`, `Parameter` (the detector channel) and
+`Function` (text, matched exactly and case-sensitively), and the optional `DistanceFromStopBar` (feet), `Lanes` (the lane
+numbers a detector covers, "1,2"; atspm counts them) and `TravelTime` (seconds a free-flowing car takes from the
+detector to the stop line, measured) and `RedDepartures` (share of the OFFs of the stop-bar count zones in the detector's
+lanes that come in red). The last four feed arrival_on_green on Advance rows: the distance projects arrivals; Lanes, TravelTime and
+RedDepartures serve its Queue Model (queue_model=True), which falls back to 1 lane and to a travel time from the
+distance where they are empty, and is turned off for a detector whose RedDepartures is over 0.25. Other columns are ignored. One row per (detector, phase). The measures:
 
     Function 'Advance'    -> arrival_on_green, platoon_ratio
     Function 'Presence'   -> split_failures
     Function 'Yellow_Red' -> yellow_red
-    any other Function    -> carried, never read (atspm's own sample config
-                             spells it 'stop bar count' -- neither is read)
+    Function 'Count'      -> left_turn_gaps
+    any other Function    -> carried, never read
 
 atspm's other measures (actuations, has_data, timeline, detector_health, ...) read the raw events only.
 
@@ -29,7 +34,7 @@ import numpy as np
 import pandas as pd
 
 ATSPM_COLUMNS = ["DeviceId", "Phase", "Parameter", "Function"]
-CONFIG_COLUMNS = ATSPM_COLUMNS + ["DistanceFromStopBar"]
+CONFIG_COLUMNS = ATSPM_COLUMNS + ["DistanceFromStopBar", "Lanes", "TravelTime", "RedDepartures"]
 
 # our function class -> atspm Function text.  atspm measures read only Advance, Presence and Yellow_Red.
 DEFAULT_FUNCTION_NAMES = {
@@ -50,7 +55,7 @@ ATSPM_CLASSES = ("Advance", "Presence", "Count", "Yellow_Red")      # at most on
 DEFAULT_INCLUDE = ("Advance", "Presence", "Yellow_Red", "Count")
 
 _NEEDED = ["DeviceId", "Detector", "phase_pred", "function_pred"]
-EXTRA_OUT = ["Lanes", "PhaseProb", "FunctionProb", "HealthStatus"]
+EXTRA_OUT = ["PhaseProb", "FunctionProb", "HealthStatus"]
 REPORT_COLS = ["DeviceId", "Detector", "phase_pred", "function_pred", "Function", "exported", "reason"]
 COVERAGE_COLS = ["DeviceId", "Phase", "arrival_on_green", "split_failures", "yellow_red"]
 
@@ -92,10 +97,15 @@ def to_atspm_config(results, *,
                     device_id_dtype=None,
                     extra_columns: bool = False,
                     return_report: bool = False):
-    """predict() output -> atspm `detector_config` (columns DeviceId, Phase, Parameter, Function, DistanceFromStopBar).
+    """predict() output -> atspm `detector_config` (columns DeviceId, Phase, Parameter, Function, DistanceFromStopBar,
+    Lanes, TravelTime, RedDepartures).
 
     DistanceFromStopBar is the distance found in feet, empty where none was.  atspm 3 uses it on Advance rows for arrival on
-    green and platoon ratio, and its own default where it is empty.
+    green and platoon ratio, and its own default where it is empty.  Lanes is predict()'s lane answer as text ("1,2"),
+    empty where there is none.  TravelTime is predict()'s travel_time_s on Advance rows (seconds from the detector to the
+    stop line, measured against a same-lane stop-bar zone), empty elsewhere.  RedDepartures is predict()'s
+    red_departure_share on Advance rows (share of the OFFs of the stop-bar count zones in its lanes that come in red),
+    empty elsewhere.  atspm's Queue Model reads all three.
 
     results            the DataFrame returned by predict(), or a CSV / parquet path to one.
     include            function classes to export.  Default: the four ATSPM classes.  atspm's measures read Advance,
@@ -115,7 +125,7 @@ def to_atspm_config(results, *,
     device_id_dtype    cast DeviceId (e.g. "int64") to the type of the events you give atspm.  predict() returns
                        DeviceId as text; atspm's joins work either way, but its output tables then carry text ids.
                        None = keep as returned.
-    extra_columns      also return Lanes, PhaseProb, FunctionProb, HealthStatus.  atspm ignores them.
+    extra_columns      also return PhaseProb, FunctionProb, HealthStatus.  atspm ignores them.
     return_report      also return one row per input detector: exported or not, and why (column `reason`).
 
     Returns the config (sorted by DeviceId, Phase, Function, Parameter; no duplicate rows), or (config, report).
@@ -134,7 +144,8 @@ def to_atspm_config(results, *,
 
     d = r.reset_index(drop=True).copy()
     for c, default in (("phase_prob", np.nan), ("function_prob", np.nan), ("health_status", None),
-                       ("lanes", None), ("distance_ft", np.nan), ("status", None)):
+                       ("lanes", None), ("distance_ft", np.nan), ("travel_time_s", np.nan),
+                       ("red_departure_share", np.nan), ("status", None)):
         if c not in d.columns:
             d[c] = default
     fn = d["function_pred"].astype(object).where(d["function_pred"].notna(), None)
@@ -192,9 +203,11 @@ def to_atspm_config(results, *,
         "Parameter": pd.to_numeric(k["Detector"]).astype("int16"),
         "Function": function[keep].astype(str),
         "DistanceFromStopBar": pd.to_numeric(k["distance_ft"], errors="coerce").astype(float),
+        "Lanes": k["lanes"].astype(object).where(k["lanes"].notna(), None),
+        "TravelTime": pd.to_numeric(k["travel_time_s"], errors="coerce").astype(float).where(fn[keep].eq("Advance").to_numpy()),
+        "RedDepartures": pd.to_numeric(k["red_departure_share"], errors="coerce").astype(float).where(fn[keep].eq("Advance").to_numpy()),
     })
     if extra_columns:
-        cfg["Lanes"] = k["lanes"].astype(object).where(k["lanes"].notna(), None)
         cfg["PhaseProb"] = pd.to_numeric(k["phase_prob"], errors="coerce").astype(float)
         cfg["FunctionProb"] = fprob[keep].astype(float)
         cfg["HealthStatus"] = k["health_status"]

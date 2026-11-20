@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased - no data from a signal in flash, saved ped configuration
+## 2.1.0 - travel time and red departures for atspm's queue model, no data from flash, mostly ON, busy at night, one fault reported once, ped recall
+
+Phase, function, lanes, setback distance and night speed are unchanged, except that time a signal spends in flash is no
+longer used. New outputs `travel_time_s` and `red_departure_share`; the atspm config carries lanes; health reworked.
+
+**Travel time to the stop bar, and the atspm config carries lanes**
+
+- New output `travel_time_s`: seconds a free-flowing car takes from an Advance or Mid detector to the stop line. It is the
+  advance-to-stop-bar time the setback step already measured against a same-lane stop-bar zone (median of isolated green
+  vehicles), plus the zone's upstream edge at the vehicle's speed. Empty where no same-lane stop-bar zone was found.
+- New output `red_departure_share`: of the OFFs of every same-lane stop-bar count zone (Count / Yellow_Red), pooled, the
+  share 2 s or more after the phase's red started (cars leaving on red: a right turn on red, a permissive left). A
+  detector over two lanes pools both lanes' zones. 50 OFFs or more. Stop-bar presence zones are not used. atspm turns its
+  Queue Model off for an advance detector over 0.25.
+- `to_atspm_config` always returns `Lanes` (the lane answer, "1,2"), the new `TravelTime` (travel_time_s on Advance
+  rows) and `RedDepartures` (red_departure_share on Advance rows), for the queue model of atspm 3.0.1's
+  arrival_on_green. `extra_columns=True` no longer adds `Lanes`.
+
+**No data from a signal in flash, saved ped configuration**
 
 - No data from a signal in flash is used, by any check or model (new `flash.py`): from a unit flash status change (173)
   other than 2 to the next 173 = 2, and from a coordination pattern change to 255 to the next pattern change; a log that
@@ -12,10 +30,6 @@
   phase, function 'Ped' / 'Ped_Overlap', in_recall), e.g. the movement model's answers kept with the vehicle
   detectors. A button with a saved row takes its phases / ped overlap from it instead of the window; a saved in-recall
   button never reads as calling no phase. Buttons without a row are judged from the window, as before.
-
-## 2.1.0 - mostly ON, busy at night on long zones, no daily pattern, one fault reported once, ped recall
-
-Phase, function, lanes, setback and night speed are unchanged. Health only.
 
 **One fault, reported once**
 

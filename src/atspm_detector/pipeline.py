@@ -50,8 +50,11 @@ The raw opinion is always kept in phase_guess / function_guess.
 Output columns: DeviceId, Detector, phase_pred, phase_prob, phase_2nd, phase_2nd_prob, function_pred, function_prob,
 status, review_flag, n_actuations, minutes_of_data, phase_guess, phase_guess_prob, function_guess, function_guess_prob,
 phase_margin, p_advance, p_presence, p_count, p_yellow_red, p_other, p_mid, p_bike, n_candidate_phases, lanes,
-lane_conf, phase_n_lanes, phase_n_lanes_conf, distance_ft, setback_confidence, night_speed_mph, night_speed_vehicles,
-health_status, review_reason.
+lane_conf, phase_n_lanes, phase_n_lanes_conf, distance_ft, setback_confidence, travel_time_s, red_departure_share,
+night_speed_mph, night_speed_vehicles, health_status, review_reason.
+travel_time_s = the measured free-flow seconds from the detector's ON to the stop line (setback.py), Advance / Mid with a
+same-lane stop-bar zone only.  red_departure_share = the share of the OFFs in red of every same-lane stop-bar count zone (Count /
+Yellow_Red, pooled; setback.py).
 health_status ok / watch / suspect / bad / not_enough_data / lane_closure / timing_plan (bad = one finding past its bad limit,
 two independent findings, or one lasting 4 h or more of the day).
 `return_phases=True` also returns the per-phase table (n_detectors, n_lanes, n_lanes_conf, lane volumes, night speed);
@@ -76,9 +79,9 @@ import numpy as np
 import pandas as pd
 
 from . import blend as gb
+from .flash import drop_flash
 from . import decode as dec
 from . import features as f1
-from .flash import drop_flash
 from . import features_expert as fx
 from . import features_lag as f3
 from . import features_partner as f2
@@ -125,8 +128,8 @@ EXTRA_COLS = ["phase_guess", "phase_guess_prob", "function_guess", "function_gue
               "phase_margin", "p_advance", "p_presence", "p_count", "p_yellow_red",
               "p_other", "p_mid", "p_bike", "n_candidate_phases",
               "lanes", "lane_conf", "phase_n_lanes", "phase_n_lanes_conf",
-              "distance_ft", "setback_confidence", "night_speed_mph", "night_speed_vehicles",
-              "health_status", "review_reason"]
+              "distance_ft", "setback_confidence", "travel_time_s", "red_departure_share", "night_speed_mph",
+              "night_speed_vehicles", "health_status", "review_reason"]
 PHASE_COLS = ["DeviceId", "phase", "n_detectors", "n_lanes", "n_lanes_conf",
               "lane_volumes_per_hour", "night_speed_mph", "night_speed_vehicles"]
 PHASE_STEM = "phase_lgbm_v5"
@@ -348,8 +351,6 @@ def load_events(con, events, device_ids=None, start=None, end=None):
         SELECT DISTINCT m.dev, e.DeviceId, e.Timestamp, CAST(e.EventId AS USMALLINT) AS EventId,
                         CAST(e.Parameter AS USMALLINT) AS Parameter
         FROM {src} e JOIN devmap m USING (DeviceId) WHERE e.good""")
-    con.execute("CREATE OR REPLACE TEMP VIEW ev AS SELECT DeviceId, Timestamp, EventId, Parameter FROM evd")
-    w0, w1, info = _window(con)
     if drop_flash(con, "evd"):     # no data from a signal in flash (flash.py); a signal left with none drops out
         left = sorted(str(r[0]) for r in con.execute("SELECT DISTINCT DeviceId FROM evd").fetchall())
         if len(left) < len(ids):
@@ -360,6 +361,8 @@ def load_events(con, events, device_ids=None, start=None, end=None):
                         "FROM evd e JOIN devmap m USING (DeviceId)")
             con.execute("DROP TABLE evd")
             con.execute("ALTER TABLE evd_fl RENAME TO evd")
+    con.execute("CREATE OR REPLACE TEMP VIEW ev AS SELECT DeviceId, Timestamp, EventId, Parameter FROM evd")
+    w0, w1, info = _window(con)
     info["n_invalid"] = n_bad
     return w0, w1, info
 
@@ -784,7 +787,8 @@ def _top_phase(ph: pd.DataFrame | None) -> pd.DataFrame:
 # ------------------------------------------------------------ lanes, setback, health, night speed
 FUNC_CLASSES = ["Advance", "Presence", "Count", "Yellow_Red", "Other", "Mid", "Bike"]   # PROB_COLS order
 POST_COLS = ["lanes", "lane_conf", "phase_n_lanes", "phase_n_lanes_conf", "distance_ft",
-             "setback_confidence", "night_speed_mph", "night_speed_vehicles", "health_status"]
+             "setback_confidence", "travel_time_s", "red_departure_share", "night_speed_mph", "night_speed_vehicles",
+             "health_status"]
 FN_COLS = ["function_pred", "function_prob"] + PROB_COLS     # what _assemble takes from the function stage
 
 
@@ -876,8 +880,8 @@ def _setback(con, d: pd.DataFrame, W: pd.DataFrame, model_dir: Path, notes: dict
         one(b0, b1, devs)
     parts = [p for p in parts if len(p)]
     if not parts:
-        return pd.DataFrame(columns=key + ["distance_ft", "setback_confidence"])
-    return pd.concat(parts, ignore_index=True)[key + ["distance_ft", "setback_confidence"]]
+        return pd.DataFrame(columns=key + ["distance_ft", "setback_confidence", "travel_time_s", "red_departure_share"])
+    return pd.concat(parts, ignore_index=True)[key + ["distance_ft", "setback_confidence", "travel_time_s", "red_departure_share"]]
 
 
 def post_outputs(con, W: pd.DataFrame, univ: pd.DataFrame,
@@ -1095,7 +1099,7 @@ def _assemble(univ, facts, gate, top, fn, post, model_note,
     res.loc[dead, ["phase_pred", "phase_prob", "phase_2nd", "phase_2nd_prob",
                    "function_pred", "function_prob", "phase_margin"] + PROB_COLS +
             ["lanes", "lane_conf", "phase_n_lanes", "phase_n_lanes_conf", "distance_ft",
-             "setback_confidence", "night_speed_mph", "night_speed_vehicles"]] = np.nan
+             "setback_confidence", "travel_time_s", "red_departure_share", "night_speed_mph", "night_speed_vehicles"]] = np.nan
     if isinstance(model_note, dict):           # {DeviceId: note}: each signal's own notes
         nd = {k: v for k, v in model_note.items() if v}
         if nd:

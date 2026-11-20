@@ -27,7 +27,10 @@ def test_export_contract(sample_pred):
     cfg, rep = dc.to_atspm_config(sample_pred, return_report=True)
     assert list(cfg.columns) == CONFIG_COLUMNS
     assert str(cfg.Phase.dtype) == "int16" and str(cfg.Parameter.dtype) == "int16"
-    assert cfg.notna().all().all() and len(cfg) > 0
+    assert cfg[ATSPM_COLUMNS + ["DistanceFromStopBar"]].notna().all().all() and len(cfg) > 0
+    assert cfg.loc[cfg.Function.ne("Advance"), "TravelTime"].isna().all()
+    assert (cfg.TravelTime.dropna() > 0).all()
+    assert cfg.Lanes.dropna().map(lambda x: all(v.strip().isdigit() for v in str(x).split(","))).all()
     assert not cfg.duplicated(["DeviceId", "Parameter"]).any()             # one phase per detector
     assert set(cfg.Function) <= ATSPM_FUNCTIONS
     ev = read_parquet(SAMPLE)
@@ -124,6 +127,33 @@ def test_distance_and_count_columns():
                          "function_pred": ["Advance", "Count", "Advance"], "phase_prob": 0.9, "function_prob": 0.9,
                          "distance_ft": [513.45, 0.0, float("nan")]})
     cfg = dc.to_atspm_config(pred).set_index("Parameter")
-    assert list(dc.to_atspm_config(pred).columns) == ["DeviceId", "Phase", "Parameter", "Function", "DistanceFromStopBar"]
+    assert list(dc.to_atspm_config(pred).columns) == ["DeviceId", "Phase", "Parameter", "Function", "DistanceFromStopBar",
+                                                      "Lanes", "TravelTime", "RedDepartures"]
     assert cfg.Function.to_dict() == {1: "Advance", 2: "Count", 3: "Advance"}
     assert cfg.DistanceFromStopBar[1] == 513.45 and pd.isna(cfg.DistanceFromStopBar[3])
+
+
+def test_lanes_and_travel_time_columns():
+    """Lanes is the lane answer as text (atspm counts the numbers: "1,2" is two lanes, "3" one); TravelTime is travel_time_s
+    on Advance rows only, empty where none was measured."""
+    pred = pd.DataFrame({"DeviceId": ["A"] * 4, "Detector": [1, 2, 3, 4], "phase_pred": [2, 2, 2, 4],
+                         "function_pred": ["Advance", "Advance", "Count", "Advance"], "phase_prob": 0.9, "function_prob": 0.9,
+                         "lanes": ["1,2", "3", "1", None], "distance_ft": [220.0, 75.0, 0.0, 120.0],
+                         "travel_time_s": [5.1, 3.2, float("nan"), float("nan")]})
+    cfg = dc.to_atspm_config(pred).set_index("Parameter")
+    assert cfg.Lanes.to_dict() == {1: "1,2", 2: "3", 3: "1", 4: None}
+    assert cfg.TravelTime[1] == 5.1 and cfg.TravelTime[2] == 3.2
+    assert pd.isna(cfg.TravelTime[3]) and pd.isna(cfg.TravelTime[4])
+    # a stop-bar row never carries a travel time, even if one is passed
+    assert pd.isna(dc.to_atspm_config(pred.assign(travel_time_s=1.0)).set_index("Parameter").TravelTime[3])
+
+
+def test_red_departures_column():
+    """RedDepartures is red_departure_share on Advance rows only, empty where none was measured."""
+    pred = pd.DataFrame({"DeviceId": ["A"] * 3, "Detector": [1, 2, 3], "phase_pred": [2, 2, 4],
+                         "function_pred": ["Advance", "Count", "Advance"], "phase_prob": 0.9, "function_prob": 0.9,
+                         "red_departure_share": [0.35, 0.5, float("nan")]})
+    cfg = dc.to_atspm_config(pred).set_index("Parameter")
+    assert cfg.RedDepartures[1] == 0.35
+    assert pd.isna(cfg.RedDepartures[2]) and pd.isna(cfg.RedDepartures[3])
+    assert dc.to_atspm_config(pred.drop(columns=["red_departure_share"])).RedDepartures.isna().all()

@@ -5,6 +5,16 @@ One number per detector, `distance_ft` = the model's median estimate of the dist
 Other / Bike -> no answer.  Estimates under 15 ft -> 0.  `setback_confidence` = high / medium / low from
 the width of the model's internal 10-90 % interval (terciles over all predicted Advance / Mid in training;
 no truth used).  The interval itself is internal, not an output.
+`travel_time_s` = the measured free-flow time from the detector's ON to the stop line: the same-lane stop-bar travel
+time `tau` (below) plus the stop-bar zone's upstream edge at the vehicle speed (tau + edge / v_user).  Only where a
+same-lane stop-bar partner was found (`covered`), and only if distance_ft / travel_time_s is 10 to 60 mph (a time that
+puts a car at 400 mph came from the wrong partner); empty otherwise and for every stop-bar zone.
+`red_departure_share` = of the OFFs of every same-lane stop-bar count zone (Count / Yellow_Red, P(same lane) >= .5
+with a travel time; an advance detector over two lanes pools both lanes' zones), the share 2 s or more after its phase's
+red started (cars leaving on red: a right turn on red, a permissive left the phase does not show), with 50 OFFs or more.
+Presence zones are left out: their share ran higher than the count zones' and turned the Queue Model off where it
+helped.  atspm's Queue Model is turned off for an advance detector above 0.25 (note 161).  The travel time: on 319 ODOT lanes with
+a stop-bar count (Nov 2026) it came within 0.1 s of the lane's own measured time (median), 0.5 s or better at 86 %.
 
 Hi-res log only, phase-anonymous: the predicted phase is only a grouping key (which stop-bar zones share
 a phase with the advance loop, which cycles to measure against), never a feature.  Inputs:
@@ -30,6 +40,10 @@ from .common import read_json
 
 
 V40 = 58.7                      # 40 mph in ft/s
+FT_PER_S_PER_MPH = 5280.0 / 3600.0
+TT_MPH = (10.0, 60.0)           # travel_time_s is kept only if distance_ft / travel_time_s is in this range
+RED_AFTER = 2.0                 # an OFF this many seconds after red started counts as a departure on red
+RED_MIN_OFF = 50
 VMIN, VMAX = 22.0, 88.0
 L_VEH = 20.0
 ZONE = {"Count": 6.0, "Yellow_Red": 6.0, "Presence": 20.0}
@@ -147,6 +161,18 @@ FROM g JOIN h USING (dev, det, hr) JOIN hm USING (dev, det)
 ASOF JOIN sb_cyc c ON g.dev = c.dev AND g.phase = c.phase AND g.t >= c.t_g
 WHERE g.t < c.t_next
 """
+
+SQL_RED = """
+WITH o AS (
+  SELECT i.dev, i.det, ad.phase, i.t + i.dur AS t_off
+  FROM sb_iv i JOIN sb_ad ad ON i.dev = ad.dev AND i.det = ad.det
+  WHERE ad.is_s
+)
+SELECT o.dev, o.det AS db, count(*) AS n_off, count(*) FILTER (o.t_off >= c.t_red + %s) AS n_off_red
+FROM o ASOF JOIN sb_cyc c ON o.dev = c.dev AND o.phase = c.phase AND o.t_off >= c.t_g
+WHERE o.t_off < c.t_next
+GROUP BY ALL
+""" % RED_AFTER
 
 SQL_SPEED = """
 SELECT dev, det, count(*) AS n_iso, avg((dur <= 0.15)::INT) AS pulse,
@@ -360,7 +386,7 @@ def _pick(g: pd.DataFrame) -> dict:
                         ascending=[False, True, False, False, False, True], kind="stable").iloc[0]
     a = acc.sort_values(["pk_strength", "n_in", "p_same", "tau"], ascending=[False, False, False, True],
                         kind="stable").iloc[0]
-    r.update(tau=b.tau, role=b.fn, same=float(b.same), p_same=b.p_same, n_in=b.n_in,
+    r.update(db=b.db, tau=b.tau, role=b.fn, same=float(b.same), p_same=b.p_same, n_in=b.n_in,
              pk_strength=b.pk_strength, v_self=b.v_self, d_veh=b.get("d_veh", np.nan),
              tau_raw_med=b.tau_med_raw, tau_any=a.tau, pk_any=a.pk_strength,
              p_same_any=a.p_same)
@@ -433,6 +459,7 @@ def features(con, dets: pd.DataFrame, hours: float, pair_model: HGBNumpy) -> pd.
     con.execute("CREATE OR REPLACE TEMP TABLE sb_ad AS SELECT * FROM sb_ad_df")
     con.unregister("sb_ad_df")
     con.execute(SQL_ONC)
+    red = con.sql(SQL_RED).df()
     spd = con.sql(SQL_SPEED).df()
     spd["dur"] = np.where(spd.n_low >= 20, spd.dur50_low, spd.dur50_all)
     spd = spd.set_index(["dev", "det"])
@@ -471,7 +498,7 @@ def features(con, dets: pd.DataFrame, hours: float, pair_model: HGBNumpy) -> pd.
     F = d[d.is_t].merge(beh, on=["dev", "det"], how="left")
     if len(best):
         F = F.merge(best.rename(columns={"da": "det"}), on=["dev", "det"], how="left")
-    for c in ("tau", "role", "same", "p_same", "n_in", "pk_strength", "v_self", "tau_any",
+    for c in ("db", "tau", "role", "same", "p_same", "n_in", "pk_strength", "v_self", "tau_any",
               "pk_any", "p_same_any", "n_cand", "n_acc", "d_veh", "tau_raw_med"):
         if c not in F:
             F[c] = np.nan
@@ -499,6 +526,14 @@ def features(con, dets: pd.DataFrame, hours: float, pair_model: HGBNumpy) -> pd.
     F["v_user"] = (F.v_self.fillna(F.v_phase_count).fillna(F.v_phase_pres)
                    .fillna(F.v_adv).fillna(V40))
     F["d_user"] = np.where(F.covered, F.tau * F.v_user + F.edge, np.nan)
+    # pooled over every same-lane stop-bar count zone, not only the picked partner: one advance detector over a
+    # through-right and a through lane sees both lanes' zones
+    pr = cand[cand.tau.notna() & (cand.p_same >= 0.5) & cand.fn.isin(["Count", "Yellow_Red"])][["dev", "da", "db"]]
+    pr = pr.astype({"db": "int64"}).merge(red.astype({"db": "int64"}), on=["dev", "db"])
+    pool = pr.groupby(["dev", "da"], as_index=False)[["n_off", "n_off_red"]].sum()
+    pool = pool[pool.n_off >= RED_MIN_OFF]
+    pool = pd.DataFrame({"dev": pool.dev, "det": pool.da.astype("int64"), "red_share": pool.n_off_red / pool.n_off})
+    F = F.astype({"det": "int64"}).merge(pool, on=["dev", "det"], how="left")
     F["hours"] = hours
     return F
 
@@ -528,7 +563,7 @@ def setback(con, w0: float, w1: float, dets: pd.DataFrame, model: SetbackModel, 
     phase (predicted), function (predicted, 7 classes), p_mid.  -> DeviceId, Detector, distance_ft,
     setback_confidence (+ internal p10 / p50 / p90).  [w0, w1) = the sample window shared by the signals
     `devices` (None = every signal loaded)."""
-    cols = ["DeviceId", "Detector", "distance_ft", "setback_confidence"]
+    cols = ["DeviceId", "Detector", "distance_ft", "setback_confidence", "travel_time_s", "red_departure_share"]
     p = dets.rename(columns={"DeviceId": "dev", "Detector": "det", "function": "fn"}).copy()
     p = p[p.phase.notna() & p.fn.notna()].copy()
     if not len(p):
@@ -563,13 +598,21 @@ def setback(con, w0: float, w1: float, dets: pd.DataFrame, model: SetbackModel, 
             con.execute(f"DROP TABLE IF EXISTS {t}")
     if len(F):
         E = model.apply(F, hours)
-        F = pd.concat([F[["dev", "det"]].astype({"det": int}), E[["p10", "p50", "p90"]]], axis=1)
+        tt = np.where(F.covered.to_numpy(bool), F.tau.to_numpy(float) + F.edge.to_numpy(float) / F.v_user.to_numpy(float),
+                      np.nan)
+        F = pd.concat([F[["dev", "det"]].astype({"det": int}).assign(travel_time_s=tt, red_departure_share=F.red_share.to_numpy(float)),
+                       E[["p10", "p50", "p90"]]], axis=1)
     else:
-        F = pd.DataFrame(columns=["dev", "det", "p10", "p50", "p90"])
+        F = pd.DataFrame(columns=["dev", "det", "travel_time_s", "red_departure_share", "p10", "p50", "p90"])
     out = p[["dev", "det", "fn"]].merge(F, on=["dev", "det"], how="left")
     sb = out.fn.isin(STOPBAR)
     out.loc[sb, ["p10", "p50", "p90"]] = 0.0
+    out["travel_time_s"] = out.travel_time_s.astype(float).round(1).where(~sb)
     out["distance_ft"] = out.p50.astype(float).round(0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mph = out.distance_ft / out.travel_time_s / FT_PER_S_PER_MPH
+    out["travel_time_s"] = out.travel_time_s.where(mph.between(*TT_MPH))
+    out["red_departure_share"] = out.red_departure_share.astype(float).round(3).where(~sb)
     out["setback_confidence"] = confidence(out.p10, out.p50, out.p90, model.meta["conf_cuts"])
     out.loc[sb, "setback_confidence"] = "high"
     out = out.rename(columns={"dev": "DeviceId", "det": "Detector"})
