@@ -570,22 +570,6 @@ USABLE = f"EventId IN ({','.join(map(str, H.ALLOWED))}) AND (EventId NOT IN (81,
 
 
 
-def fall_back_log():
-    """the fall clock change on zone-free local stamps: 01:00-02:00 comes twice.  second: a second pass with its own events
-    (the first pass's, 3 s later), all before the first pass's last event of each signal."""
-    ev, det = base()
-    a = ev.Timestamp.min().normalize()
-    h1, h2 = a + pd.Timedelta(hours=1), a + pd.Timedelta(hours=2)
-    second = ev[(ev.Timestamp >= h1) & (ev.Timestamp < h2 - pd.Timedelta(minutes=5))].assign(Timestamp=lambda x: x.Timestamp + pd.Timedelta(seconds=3))
-    return ev, second, det, a, h1, h2
-
-
-
-
-
-
-
-
 # --- T4.8 ---------------------------------------------------------------------------------------------------------------------
 class FailBefore:
     """a connection that fails at the first statement starting with `word` (after `skip` of them)"""

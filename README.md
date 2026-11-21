@@ -128,7 +128,7 @@ total". Give a day or more of log for the full set of checks.
 
 ## More
 
-Embedding, incremental and every-run health, and the limits: [docs/embedding.md](https://github.com/ShawnStrasser/atspm-detector/blob/main/docs/embedding.md).
+Embedding, incremental and every-run health (each signal on its own), and the limits: [docs/embedding.md](https://github.com/ShawnStrasser/atspm-detector/blob/main/docs/embedding.md).
 Changes: [CHANGELOG.md](https://github.com/ShawnStrasser/atspm-detector/blob/main/CHANGELOG.md).
 
 ## License

@@ -1,5 +1,41 @@
 # Changelog
 
+## 2.2.0 - live health tracked per signal, ped history for the sudden stop
+
+Phase, function, lanes, setback, night speed and every health rule are unchanged. `atspm_detector.live` now tracks every signal on its own.
+
+**Breaking (`live`)**
+
+- Each signal's bins are written by the run its own events reach them, and its whole-day check runs at the first run its own events pass
+  midnight. The shared marker and the rules that used other signals are gone: no "1 in 10 of the run's signals past it", no "9 in 10 of the
+  signals heard from". A signal that reports late gets, when its events arrive, the rows it would have had on time; in 2.1 its bins already
+  written for the others were never judged for it.
+- The state has per-signal rows only (markers 9602 / 9603 / 9604, run list 9605 and version 9606 with a `DeviceId`), so a run over some
+  signals reads and replaces only theirs. History rows count for a signal when the state lists their run for that signal.
+- New `now` and `complete_through`. `now`: events at or after `now + clock_ahead_minutes` are left out and counted (`held_back`); a
+  midnight is over for every signal once `now` is `clock_ahead_minutes` past it. `complete_through` (a time, or `DeviceId, Through`): the
+  caller knows a signal's events are all in up to then, so its bins and midnights up to then close without waiting for its next event.
+  Without them, nothing but a signal's own events moves it on.
+- `live_run` returns `LiveResult(findings, checked, held_back)`, which still unpacks as `(findings, checked)`. `findings` holds every
+  whole-day check of the run, each with its midnight as `TimeStamp`; a run can check signals at different midnights.
+- A whole-day check skips a signal with none of its data in the check's window (a signal silent the whole horizon), keeping its limits.
+- Each signal's rows are trimmed at its own watermark less the horizon (incremental stores with the meta `per_device`, as live's).
+- Migration: a 2.1 state is converted on reading (each signal takes the shared markers; its run list is listed for each signal and checked
+  by run). Nothing to do.
+
+**Ped history for the sudden stop**
+
+- `live_run(ped_history=, ped_history_days=28)` and the new table `hl_ped`: per signal and 15 minutes, the presses of each ped input and the
+  15 minutes it logged anything, the only rows the sudden stop against the button's own weeks (option `stop_history`) reads. Kept for
+  `ped_history_days` before the check window, it lets that check work with a 3-day horizon. Rows are read as the largest count per key, so a
+  retried run's rows count once.
+- `incremental.judge(ped_history=)` and `judge_rows(ped_history=)` pass `(counts, logged)` to the ped rules, as `health(ped_history=)` does.
+
+**Fixes**
+
+- `findings/held.sql` no longer calls `epoch_ms` on a nanosecond timestamp, which DuckDB 2.0.1 refuses ("Unimplemented type for cast
+  (INT64 -> INT64)"): a judge giving bins failed on it.
+
 ## 2.1.0 - travel time and red departures for atspm's queue model, no data from flash, mostly ON, busy at night, one fault reported once, ped recall
 
 Phase, function, lanes, setback distance and night speed are unchanged, except that time a signal spends in flash is no

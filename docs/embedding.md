@@ -97,8 +97,54 @@ sql_f, sql_s = health_sql("events", "detectors", summary=True)  # the two querie
   Python (`sys.executable`), without importing the rest of the package. The tables must be readable with `SELECT` from the
   connection (tables, views or files; a registered DataFrame works too, it is copied). Same answers as `workers=1`.
   A whole network over 3 days: `SET threads = 12; SET memory_limit = '12GB'` and `workers=12`.
-- Health kept up to date from chunks of events, and health in time bins: `atspm_detector.incremental` and `health_bins()`, in the
-  [README](https://github.com/ShawnStrasser/atspm-detector/blob/main/README.md#incremental-health). A store is a DuckDB file; a short-lived machine must keep it somewhere permanent between runs.
+- Health kept up to date from chunks of events, and health in time bins: `atspm_detector.incremental` and `health_bins()`. A store is a
+  DuckDB file; a short-lived machine must keep it somewhere permanent between runs. For a run every 15 minutes with the state kept as
+  tables, see the next section.
+
+## Live health: a run every 15 minutes, each signal on its own
+
+`atspm_detector.live.live_run` (what atspm's `detector_health` runs with a state) writes each 15-minute bin's rows from the checks that can
+answer at once, and a whole-day check per signal and midnight. Detector health is tracked per signal, like the performance measures: what
+a signal gets never depends on any other signal, on how runs are cut, or on which signals share a run.
+
+```python
+from atspm_detector import live
+r = live.live_run(con, "raw_data", "detectors", state=last_state, history="health_rows/*.parquet", ped_history="ped/*.parquet",
+                  horizon_days=3, now=None, complete_through=None, clock_ahead_minutes=60, ped_history_days=28)
+# tables on con: hl_final (the rows to add), hl_state (the next run's state), hl_rows (add to history), hl_ped (add to ped_history)
+# r.findings (each whole-day check's findings, TimeStamp = its midnight), r.checked, r.held_back
+```
+
+- **State**: `TimeStamp, DeviceId, EventId, Parameter, Value`, every row with a `DeviceId`. Per signal: the end of its last written bin
+  (9602), the midnight of its last whole-day check (9603), the quarter-hour of its first event (9604), the runs whose rows it has in history
+  (9605), its events past its last bin (9700), the version (9606), and the carry, limits and open ped ONs. A run over some signals reads
+  and writes only their rows: replace a signal's rows with the run's, keep the others, and separate runs over separate signals equal one
+  run over all of them.
+- **Bins**: a signal's bin is written by the run its own events reach the end of (its last event within a second of it), or
+  `complete_through` (a time for every signal, or a table `DeviceId, Through`: the caller knows the signal's events are all in up to then).
+  Its events after its last bin wait in the state, so every bin is judged whole in one run, with the rows it gets on time, however late
+  the signal reports. A bin with none of the signal's events gets no row.
+- **Midnight**: a signal's whole-day check runs at the first run its own events pass the midnight, or when the caller says the day is over
+  for it (`complete_through` at or past it, or `now` at least `clock_ahead_minutes` past it). It needs a whole day of the signal's data since
+  its first event and some of its data in the check's window. A day the caller closes before the signal's events reach it stays closed:
+  later events still go into the store and the later checks, but its bins before that midnight are not written.
+- **Clocks**: with `now` (the time now, on the controllers' clock), events stamped at or after `now + clock_ahead_minutes` are left out and
+  counted in `r.held_back`, so a clock running ahead moves nothing on. Without `now` each signal's stamps are believed; a wrong clock moves
+  only its own signal. Pass `now` in production.
+- **Trim**: each signal's rows are trimmed at its own watermark less the horizon, so a signal days behind the others keeps its rows.
+- **Equal to one big run**: the same events cut into any runs, each in its own process carrying only these tables, give each signal the same
+  rows, findings, ped history and state, whatever the other signals do (tested with one signal 3 hours behind, one in hourly bursts, one 26
+  hours behind with a 1-day horizon, subsets with their own cuts, and a signal alone).
+- **Ped history**: the ped sudden stop against the button's own weeks (option `stop_history`) needs 14 logged days of the 28 before a
+  silence, longer than the usual 3-day horizon. Each run's `hl_ped` holds only what that check reads: per signal and 15 minutes, the presses
+  of each ped input (`Input`, `Presses`) and a row with no `Input` for each 15 minutes the signal logged anything. Keep the last
+  `horizon_days + ped_history_days` days of it and pass it as `ped_history`; a check reads the `ped_history_days` before its window. Rows are
+  read as the largest count per key, so a retried run's rows count once. About 0.4 kB of parquet per signal-day (about 250 rows on a busy
+  signal: 96 logged quarter-hours and the press counts), against about 176 kB for `hl_rows`.
+- **From 2.1**: a state written by 2.1 (one set of markers with no `DeviceId`) is converted on reading: every signal in it takes those
+  markers, which is where each one was, and the runs it lists are listed for each of its signals and checked by run, as before. A signal that
+  was behind the others in 2.1 lost those bins then; it goes on from the shared markers.
+- **No fall-back hour handling**: atspm drops 1:00-2:00 on the November change day; nothing here treats that hour specially.
 
 ## atspm detector configuration
 

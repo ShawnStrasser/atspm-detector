@@ -20,17 +20,19 @@ GROUP BY DeviceId
 {# each signal in the chunk: its new events start after its watermark (design 3.3); an event at or before that is late.  e_ns: past
    the chunk's last event.  lo: the oldest stamp still believed, keep_ns before the latest stamp known.  A row older than lo and not
    late is a wrong clock, not processed; a signal whose watermark is older than lo starts over from its first believed row (stale: its
-   carry is not read; wm: the watermark to go on from, NULL then). #}
+   carry is not read; wm: the watermark to go on from, NULL then).  per_device: the latest stamp known of that signal itself, so no
+   other signal's clock counts (a store whose meta says per_device, as live.py's). #}
 {% macro watermarks(rows, code) %}
 WITH e AS ({{ rows }}),
 c AS (SELECT DeviceId, epoch_ns(TimeStamp) AS wm FROM {{ s }}health_carry WHERE EventId = {{ code }}),
-r AS (SELECT greatest((SELECT max(ns) FROM e), (SELECT max(wm) FROM c)) - {{ keep_ns }} AS lo)
-SELECT e.DeviceId, CASE WHEN any_value(c.wm) >= any_value(r.lo) THEN any_value(c.wm) + 1 ELSE min(e.ns) FILTER (e.ns >= r.lo) END AS s_ns,
+{% if per_device %}r AS (SELECT e.DeviceId, greatest(max(e.ns), any_value(c.wm)) - {{ keep_ns }} AS lo FROM e LEFT JOIN c USING (DeviceId) GROUP BY e.DeviceId)
+{% else %}r AS (SELECT greatest((SELECT max(ns) FROM e), (SELECT max(wm) FROM c)) - {{ keep_ns }} AS lo)
+{% endif %}SELECT e.DeviceId, CASE WHEN any_value(c.wm) >= any_value(r.lo) THEN any_value(c.wm) + 1 ELSE min(e.ns) FILTER (e.ns >= r.lo) END AS s_ns,
        max(e.ns) + 1 AS e_ns, count(*) FILTER (e.ns >= r.lo AND (c.wm IS NULL OR e.ns > c.wm)) AS n_new,
        count(*) FILTER (e.ns <= c.wm) AS n_late, count(*) FILTER (e.ns < r.lo AND (c.wm IS NULL OR e.ns > c.wm)) AS n_old,
        coalesce(any_value(c.wm) < any_value(r.lo), false) AS stale,
        CASE WHEN any_value(c.wm) >= any_value(r.lo) THEN any_value(c.wm) END AS wm
-FROM e LEFT JOIN c USING (DeviceId) CROSS JOIN r GROUP BY e.DeviceId{% endmacro %}
+FROM e LEFT JOIN c USING (DeviceId) {% if per_device %}JOIN r USING (DeviceId){% else %}CROSS JOIN r{% endif %} GROUP BY e.DeviceId{% endmacro %}
 {# the vehicle part: allowed events, its watermark the last allowed event it processed (9402) #}
 -- @step uwall
 CREATE OR REPLACE TEMP TABLE {{ P }}uwall AS

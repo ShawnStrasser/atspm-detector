@@ -55,10 +55,10 @@ WHERE CASE WHEN ev = 89 THEN NOT coalesce(ev1 = 90 AND gap1 <= {{ hold_gap_s }},
 {# where each rated ON stands: still open (f NULL), closed at f, or gone (no chain of it left: not scored, dropped) #}
 -- @step hstate
 SELECT a.*, CASE WHEN a.DetectorType = 'Vehicle' THEN (SELECT min(i.EndTime) FROM {{ s }}health_intervals i WHERE i.DeviceId = a.DeviceId AND i.Kind IN ('long_on', 'bad_chain')
-                      AND i.Channel = a.det AND abs(epoch_ms(i.StartTime) - epoch_ms(a.t0)) <= 1)
+                      AND i.Channel = a.det AND abs(epoch_us(i.StartTime) // 1000 - epoch_us(a.t0) // 1000) <= 1)
 {% if ped %}            ELSE (SELECT min(e.t) FROM pends e WHERE e.DeviceId = a.DeviceId AND e.det = a.det AND e.t > a.t0)
 {% endif %}            END AS f,
-       a.DetectorType = 'Ped' OR EXISTS (SELECT 1 FROM vopen v WHERE v.DeviceId = a.DeviceId AND v.det = a.det AND abs(epoch_ms(v.t0) - epoch_ms(a.t0)) <= 1) AS isopen
+       a.DetectorType = 'Ped' OR EXISTS (SELECT 1 FROM vopen v WHERE v.DeviceId = a.DeviceId AND v.det = a.det AND abs(epoch_us(v.t0) // 1000 - epoch_us(a.t0) // 1000) <= 1) AS isopen
 FROM hall a
 {# the 15-minute cells with evidence #}
 -- @step hvcell

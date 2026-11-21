@@ -127,10 +127,12 @@ def _horizon(horizon_days) -> pd.Timedelta:
 
 
 @lru_cache(maxsize=16)
-def _ops(s: str, upto=None, cut="2000-01-01", keep_ns=0, ped=False) -> dict:
+def _ops(s: str, upto=None, cut="2000-01-01", keep_ns=0, ped=False, per_device=False) -> dict:
     """the named statements of store_ops.sql for store s, up to time upto, with the trim's cut; keep_ns: how far before the
-    store's latest time a row is still believed; ped: the chunk's rows of every code are read."""
-    txt = _render.render("store_ops.sql", s=f"{s}.", P=P, ALLOWED=H.ALLOWED, upto=upto, cut=cut, keep_ns=keep_ns, ped=ped)
+    store's latest time a row is still believed; ped: the chunk's rows of every code are read; per_device: keep_ns counts back
+    from each signal's own latest time."""
+    txt = _render.render("store_ops.sql", s=f"{s}.", P=P, ALLOWED=H.ALLOWED, upto=upto, cut=cut, keep_ns=keep_ns, ped=ped,
+                         per_device=per_device)
     return {n: q for n, q, _ in _plan.steps(txt)}
 
 
@@ -257,8 +259,7 @@ def update(con, events_table: str, detectors_table: str, *, store: str = "health
 
     A row stamped more than the horizon + 92 days before the store's latest time is a wrong clock on a signal the store has
     not heard from in that long: not processed, counted, and if that signal's own last event is that old its carry starts
-    over (design 3.3).  A repeated hour of the fall clock change falls behind the watermark and is late like any other row;
-    the hour is then not mixed in, as a batch run over the same rows would do (design 3.3, 3.5).
+    over (design 3.3).
     horizon_days: None uses the store's; a value is recorded, and the next trim (this update's, if it has new rows) uses it.
     ped: None uses the store's setting.  The ped part has its own watermark, the signal's last event of any code (design 3.3).
 
@@ -288,7 +289,7 @@ def update(con, events_table: str, detectors_table: str, *, store: str = "health
     stats = UpdateStats()
     q = _update_plan(store, f"{P}uev", detectors_table, overlap, dtype, ped=with_ped)
     try:
-        ops = _ops(store, upto=upto, keep_ns=(horizon + STALE_MARGIN).value, ped=with_ped)
+        ops = _ops(store, upto=upto, keep_ns=(horizon + STALE_MARGIN).value, ped=with_ped, per_device=m.get("per_device") == "True")
         con.execute(ops["uev"].replace("@EVENTS@", events))
         left_out = con.execute(ops["unusable"].replace("@EVENTS@", events)).fetchall()
         stats.events_after_upto = {d: int(n) for d, _, n in left_out if n}
@@ -365,7 +366,11 @@ def _through(con, store: str) -> pd.Timestamp | None:
 
 def _trim(con, store: str, horizon: pd.Timedelta, through: pd.Timestamp, again: bool = False) -> None:
     """the deletes of a trim at C = floor_15min(through) - horizon (design 4.6), on the caller's transaction.  again: rows may
-    have come in before the earlier trim (rebuild): cut there at least."""
+    have come in before the earlier trim (rebuild): cut there at least.  A store whose meta says per_device (live.py's) cuts each
+    signal at its own watermark less the horizon instead: no other signal's time trims its rows."""
+    if _meta(con, store).get("per_device") == "True":
+        _trim_devices(con, store, horizon)
+        return
     cut = through.floor("15min") - horizon
     done = _meta(con, store).get("trimmed_before")
     if done is not None and pd.Timestamp(done) >= cut:
@@ -377,6 +382,29 @@ def _trim(con, store: str, horizon: pd.Timedelta, through: pd.Timestamp, again: 
         if n.startswith("trim_"):
             con.execute(st)
     _set_meta(con, store, trimmed_before=cut.isoformat())
+
+
+TRIM_DEVICE = {"health_signal_5min": "TimeStamp", "health_detector_5min": "TimeStamp", "health_phase_5min": "TimeStamp",
+               "health_phase_15min": "TimeStamp", "health_tick_counts": "TimeStamp", "health_intervals": "EndTime",
+               "health_ped_events": "TimeStamp", "health_log_15min": "TimeStamp"}
+
+
+def _trim_devices(con, store: str, horizon: pd.Timedelta) -> None:
+    """store_ops.sql's trim with each signal's own cut, floor_15min(its watermark) - horizon."""
+    us = int(horizon / pd.Timedelta(microseconds=1))
+    con.execute(f"""CREATE OR REPLACE TEMP TABLE {P}tcut AS SELECT DeviceId, time_bucket(INTERVAL 15 MINUTE, max(TimeStamp)::TIMESTAMP) - INTERVAL ({us}) MICROSECOND AS cut
+                    FROM {store}.health_carry WHERE EventId IN (9401, 9402) GROUP BY DeviceId""")
+    try:
+        for t, c in TRIM_DEVICE.items():
+            con.execute(f"DELETE FROM {store}.{t} USING {P}tcut x WHERE {t}.DeviceId = x.DeviceId AND {t}.{c} < x.cut")
+        con.execute(f"""DELETE FROM {store}.health_carry WHERE EventId IN (9201, 9202, 9221) AND (DeviceId, Parameter) IN (
+              SELECT h.DeviceId, h.Parameter FROM {store}.health_carry h JOIN {P}tcut x USING (DeviceId) WHERE h.EventId IN (9201, 9202, 9221, 9222)
+              GROUP BY h.DeviceId, h.Parameter HAVING max(h.TimeStamp) < any_value(x.cut) - INTERVAL 1 MINUTE AND count(*) FILTER (h.EventId = 9222) = 0)""")
+        con.execute(f"""DELETE FROM {store}.health_detector_phase USING {P}tcut x WHERE health_detector_phase.DeviceId = x.DeviceId
+              AND health_detector_phase.ValidFrom < x.cut AND (health_detector_phase.DeviceId, health_detector_phase.Detector, health_detector_phase.ValidFrom) NOT IN (
+              SELECT DeviceId, Detector, max(ValidFrom) FROM {store}.health_detector_phase GROUP BY DeviceId, Detector)""")
+    finally:
+        con.execute(f"DROP TABLE IF EXISTS {P}tcut")
 
 
 def trim(con, *, store: str = "health_store", horizon_days=None, compact: bool = False) -> None:
@@ -425,7 +453,7 @@ def _judge_window(con, store: str, m: dict, end, horizon_days) -> tuple:
 def judge(con, detectors_table: str, *, store: str = "health_store", end=None, horizon_days=None, options: dict | None = None,
           max_events: int | None = 4_000_000, ped: bool | None = None, ped_options: dict | None = None, ped_assign: bool = False,
           ped_max_events: int | None = 3_000_000, summary: bool = False, outputs: tuple = ("tables",), workers: int = 1,
-          bin_minutes: int = 15) -> HealthResult:
+          bin_minutes: int = 15, ped_history=None) -> HealthResult:
     """The health of the window [end - horizon, end) from the store, as health() gives it: r.findings, and with summary=True
     r.status.  end: on a quarter-hour and after every processed event; default the first quarter-hour after them (a window
     starting before the store's trim is refused).  horizon_days: None uses the store's.  ped: None follows the store; False
@@ -434,7 +462,8 @@ def judge(con, detectors_table: str, *, store: str = "health_store", end=None, h
     outputs: "tables" always; "15min" adds r.q15 (findings.q15, the quarter-hours since the previous judge); "active" adds
     r.active and keeps it in the store's health_active (off until reviewed; hq/sql/findings/active.sql has the states); "bins" adds r.bins
     (bins.py): the bins of bin_minutes since the last judge that gave bins, up to the last whole bin before end, and the problems it is the first to find in the window's released bins, with
-    their past TimeStamp; no bin, detector and label twice."""
+    their past TimeStamp; no bin, detector and label twice.  ped_history: (counts, logged), the ped option stop_history's earlier press counts
+    (judge_rows)."""
     unknown = set(outputs) - set(OUTPUTS)
     if unknown:
         raise ValueError(f"unknown outputs {sorted(unknown)}: choose from {OUTPUTS}")
@@ -442,7 +471,8 @@ def judge(con, detectors_table: str, *, store: str = "health_store", end=None, h
     m = _meta(con, store)
     start, end = _judge_window(con, store, m, end, horizon_days)
     r = judge_rows(con, detectors_table, store=store, end=end, horizon_days=horizon_days, options=options, max_events=max_events,
-                   ped=ped, ped_options=ped_options, ped_assign=ped_assign, ped_max_events=ped_max_events, workers=workers)
+                   ped=ped, ped_options=ped_options, ped_assign=ped_assign, ped_max_events=ped_max_events, workers=workers,
+                   ped_history=ped_history)
     with_status = summary or len(set(outputs) & {"15min", "active", "bins"}) > 0
     tabs = F.tables(con, r.detectors, r.periods, r.ped, r.ped_periods, r.windows, r.ped_windows, summary=with_status)
     findings, status = tabs if with_status else (tabs, None)
@@ -485,9 +515,12 @@ def judge(con, detectors_table: str, *, store: str = "health_store", end=None, h
 
 def judge_rows(con, detectors_table: str, *, store: str = "health_store", end=None, horizon_days=None, options: dict | None = None,
                periods: bool = True, max_events: int | None = 4_000_000, ped: bool | None = None, ped_options: dict | None = None,
-               ped_assign: bool = False, ped_max_events: int | None = 3_000_000, workers: int = 1, limits: bool = False) -> JudgeRows:
+               ped_assign: bool = False, ped_max_events: int | None = 3_000_000, workers: int = 1, limits: bool = False,
+               ped_history=None) -> JudgeRows:
     """The per-detector rows judge() makes its tables from: health_duckdb.health()'s (detectors, periods; with periods=False the
-    detectors only) and with ped on ped_health_duckdb.ped_health()'s (ped, ped_periods), with the windows they cover."""
+    detectors only) and with ped on ped_health_duckdb.ped_health()'s (ped, ped_periods), with the windows they cover.  ped_history:
+    (counts, logged), two tables or views of 15-minute press counts (DeviceId, Input, TimeStamp, presses) and logged bins (DeviceId,
+    TimeStamp) from before the window, for the ped option stop_history (ped_health_duckdb.ped_health history=)."""
     _check_name(store)
     opt = H._options(options)
     m = _meta(con, store)
@@ -517,9 +550,11 @@ def judge_rows(con, detectors_table: str, *, store: str = "health_store", end=No
         r.limits = pd.concat(parts, ignore_index=True) if parts else None
     if with_ped:
         log = f"{store}.health_ped_events"
-        p = PH.judge_log(con, log, start, end, periods, ped_max_events, ped_options, ped_assign, store=f"{store}.")
+        if not (ped_history and {**PH.OPT, **(ped_options or {})}.get("stop_history")):
+            ped_history = None
+        p = PH.judge_log(con, log, start, end, periods, ped_max_events, ped_options, ped_assign, store=f"{store}.", history=ped_history)
         r.ped, r.ped_periods = p if periods else (p, None)
-        r.ped_windows = F.event_windows(con, log, start=start, end=end, ped=True)
+        r.ped_windows = F.event_windows(con, log, start=start, end=end, ped=True, ped_hist=ped_history[0] if ped_history else None)
     return r
 
 
