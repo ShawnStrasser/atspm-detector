@@ -2,7 +2,14 @@
 
 ## 2.2.0 - live health tracked per signal, ped history for the sudden stop
 
-Phase, function, lanes, setback, night speed and every health rule are unchanged. `atspm_detector.live` now tracks every signal on its own.
+Phase, function, lanes, setback and night speed are unchanged, and so is every health rule but one (below). `atspm_detector.live` now tracks every signal on its own.
+
+**Health: no "counts too high" when the phase mates died with the detector**
+
+- A detector is no longer called "counts too high" on a day when, on the window's other days, it nearly stopped counting
+  (10 % or less of that day's 06-22 h count) and its phase mates nearly stopped with it (25 % or less of theirs): the
+  time-of-day yardstick was then two dead detectors, so a normal day read as a rise. New option `rise_dead_mates` (on),
+  with `rise_dead_days`.
 
 **Breaking (`live`)**
 
