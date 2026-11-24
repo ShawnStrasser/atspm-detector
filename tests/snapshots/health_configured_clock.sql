@@ -1536,7 +1536,8 @@ SELECT * FROM hq_mhrun0 u
 WHERE u.kind <> 'rise' OR NOT EXISTS (
   SELECT 1 FROM hq_mhday r JOIN hq_mhday d ON d.dev = r.dev AND d.det = r.det AND d.dy <> r.dy
   WHERE r.dev = u.dev AND r.det = u.det AND r.dy = u.a // 24
-    AND d.Md <= 0.1 * r.Md AND d.Mmd >= 0.5 * r.Mmd AND r.Mmd > 0)
+    AND d.Md <= 0.1 * r.Md AND r.Mmd > 0
+    AND (d.Mmd >= 0.5 * r.Mmd OR d.Mmd <= 0.25 * r.Mmd))
 ),
 hq_mhbest AS MATERIALIZED (
 SELECT d.dev, d.det, true AS mh_ok, r.hours AS md_h, r.rgeh AS md_geh, r.M / greatest(r.E, 1e-9) AS md_r, r.a AS md_a,

@@ -74,6 +74,9 @@ OPTIONS = {"silent_limits": True, "silent_merge": True, "no_recovery_cap": True,
            # approved 2026-10-28 (notes 154x-y, 154aa): no "counts too high" on a day when the detector nearly stopped
            # counting on the window's other days (judge/mate_hours.sql)
            "rise_dead_days": True,
+           # 2026-11-23 (with rise_dead_days): nor when its mates nearly stopped with it on those days (<= 25 % of their
+           # traffic): the yardstick is then two dead detectors (2B323 P5, 2026-11-20 to 11-22)
+           "rise_dead_mates": True,
            # approved 2026-10-29 (notes 154aa, 154ac): lane-closure candidates also from near-zero runs of >= 3
            # quarter-hours (any closure of an hour or more), not only of >= 2 judged hours; and no closure on a day when
            # the detector has faults of its own before and after it (LC_FAULT_DAY) (judge/closure.sql)

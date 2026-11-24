@@ -82,7 +82,9 @@ SELECT * , sqrt(2 * (M - E) ^ 2 / greatest(M + E, 1e-9)) AS rgeh FROM (
 {% if opt['rise_dead_days'] %}
 {# note 154x: a day that is "too high" only because the detector nearly stopped on the window's other days (the
    time-of-day yardstick, a median over the days, is then the dead level) is not a rise -- the other days
-   (<= 10 % of that day's 06-22 h count while its mates kept >= half their traffic) are the fault #}
+   (<= 10 % of that day's 06-22 h count while its mates kept >= half their traffic) are the fault; rise_dead_mates: so
+   are they when its mates nearly stopped with it (<= 25 % of theirs: one sensor failing, the yardstick two dead
+   detectors -- 2B323 P5, 2026-11-20 to 11-22) #}
 -- @step mhday mat
 SELECT g.dev, g.det, g.dy, g.Md, m.Mmd
 FROM (SELECT dev, det, dy, sum(M) AS Md FROM mhg WHERE hod >= 6 AND hod < 22 GROUP BY ALL) g
@@ -92,7 +94,8 @@ SELECT * FROM mhrun0 u
 WHERE u.kind <> 'rise' OR NOT EXISTS (
   SELECT 1 FROM mhday r JOIN mhday d ON d.dev = r.dev AND d.det = r.det AND d.dy <> r.dy
   WHERE r.dev = u.dev AND r.det = u.det AND r.dy = u.a // 24
-    AND d.Md <= 0.1 * r.Md AND d.Mmd >= 0.5 * r.Mmd AND r.Mmd > 0)
+    AND d.Md <= 0.1 * r.Md AND r.Mmd > 0
+    AND (d.Mmd >= 0.5 * r.Mmd{{ ' OR d.Mmd <= 0.25 * r.Mmd' if opt['rise_dead_mates'] else '' }}))
 {% endif %}
 {# the strongest run of each kind; a drop counts only when its time ON fell too (a queue over the zone holds it ON
    longer and counts fewer) or it nearly stopped counting #}

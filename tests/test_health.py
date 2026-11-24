@@ -175,7 +175,7 @@ def test_periods_table():
 
 def test_new_option_defaults():
     o = hq.OPTIONS
-    assert o["mate_drop"] and o["count_rise"] and o["mate_noise"] and o["rise_dead_days"]
+    assert o["mate_drop"] and o["count_rise"] and o["mate_noise"] and o["rise_dead_days"] and o["rise_dead_mates"]
     assert o["clean_yardsticks"] == "all" and o["occ_strict"] is True
     assert o["closure_1h"] is True and o["pulse_mode"] is True        # approved 2026-10-29 (note 154ac)
     assert hq.LC_FAULT_DAY == {"sides": 2, "all": True}
@@ -287,3 +287,27 @@ def test_a_held_detector_is_not_also_a_count_drop_over_its_hold():
     r, per = periods({"drop_not_held": False})                                   # as before: the same hours twice
     q = per[per.condition == "counts dropped"]
     assert len(q) == 1 and (q.start.iloc[0], q.end.iloc[0]) == (h, z)
+
+
+def test_no_counts_too_high_when_the_mates_nearly_stopped_with_it():
+    """rise_dead_mates (on): P6 counts normally on day 1, then det 3 keeps ~1 % of its calls and its mates ~10 % of theirs
+    on days 2-3 (one sensor failing, 2B323 2026-11-20 to 11-22): day 1 is no rise -- the yardstick of the other days is
+    two dead detectors"""
+    assert hq.OPTIONS["rise_dead_mates"] is True
+    ev, det = synth.make(n_signals=1, days=3, seed=2)
+    day = ev.Timestamp.min().normalize() + pd.Timedelta(days=1)
+    act = ev.EventId.isin([81, 82]) & ev.Parameter.isin([3, 4, 10, 18]) & (ev.Timestamp >= day)
+    a = ev[act].sort_values(["Parameter", "Timestamp"])
+    k = a.groupby("Parameter").EventId.transform(lambda e: (e == 82).cumsum())
+    keep = a[((k % 10 == 0) & (a.Parameter != 3)) | ((k % 100 == 0) & (a.Parameter == 3))]
+    con = duckdb.connect()
+    con.register("e_df", pd.concat([ev[~act], keep]).sort_values("Timestamp"))
+    con.register("d_df", det)
+    con.execute("CREATE TABLE events AS SELECT * FROM e_df; CREATE TABLE detectors AS SELECT * FROM d_df")
+
+    def rises(opt):
+        per = hq.health(con, "events", "detectors", periods=True, options=opt)[1]
+        return per[per.Detector.eq(3) & per.condition.eq("counts too high")]
+    assert rises({}).empty
+    off = rises({"rise_dead_mates": False})                                      # as before: day 1 "too high"
+    assert len(off) and (off.end <= day).all()
