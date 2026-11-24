@@ -65,7 +65,7 @@ GROUP BY dev, det, grp
    held ON (>= 5 min) through at least half of it #}
 {{ ad.hold() }}
 -- @step hold_co mat
-SELECT a.hid, count(DISTINCT b.det) FILTER (least(a.f, b.f) - greatest(a.s, b.s) >= 0.5 * a.dur) AS co
+SELECT a.hid, count(DISTINCT b.det) FILTER (least(a.f, b.f) - greatest(a.s, b.s) >= 0.5 * a.span) AS co
 FROM hold a LEFT JOIN hold b ON a.dev = b.dev AND a.det <> b.det GROUP BY a.hid
 {# level shift of the share of the signal's traffic (15-min, best single change point, Poisson LLR); drop_not_held (note
    158): the 15-min bins a hold >= 15 min touches are left out of it #}
@@ -74,7 +74,7 @@ SELECT dev, det, k, n15, S15, c15,
        sum(n15) OVER w AS cx, sum(S15) OVER w AS cs, row_number() OVER w AS pos,
        count(*) OVER (PARTITION BY dev, det) AS nl, sum(n15) OVER (PARTITION BY dev, det) AS X,
        sum(S15) OVER (PARTITION BY dev, det) AS SS
-FROM (SELECT dev, det, k, n15, sum(n15) OVER (PARTITION BY dev, k) - n15 AS S15, c15 FROM a15) a WHERE c15{{ ' AND NOT EXISTS (SELECT 1 FROM hold h WHERE h.dev = a.dev AND h.det = a.det AND h.dur >= 900 AND h.f > a.k * 900.0 AND h.s < (a.k + 1) * 900.0)' if opt['drop_not_held'] else '' }}
+FROM (SELECT dev, det, k, n15, sum(n15) OVER (PARTITION BY dev, k) - n15 AS S15, c15 FROM a15) a WHERE c15{{ ' AND NOT EXISTS (SELECT 1 FROM hold h WHERE h.dev = a.dev AND h.det = a.det AND h.span >= 900 AND h.f > a.k * 900.0 AND h.s < (a.k + 1) * 900.0)' if opt['drop_not_held'] else '' }}
 WINDOW w AS (PARTITION BY dev, det ORDER BY k ROWS UNBOUNDED PRECEDING)
 -- @step lvlshift
 SELECT dev, det, first(llr ORDER BY llr DESC, pos) AS level_llr, first(ratio ORDER BY llr DESC, pos) AS level_ratio,

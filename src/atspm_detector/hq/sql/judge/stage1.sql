@@ -66,7 +66,7 @@ WHERE n_on > 0 AND drop_lam >= 30 AND drop_b1 > drop_b0
 -- @step {{ p }}rc
 SELECT r.kind, r.id, c.c FROM {{ p }}rq r JOIN {{ p }}pc c ON c.dev = r.dev AND c.det = r.det
 WHERE r.kind <> 'e' OR NOT EXISTS (
-  SELECT 1 FROM hold e JOIN hold o ON o.dev = e.dev AND o.det = c.c AND o.dur >= 900 AND o.s < e.f AND o.f > e.s
+  SELECT 1 FROM hold e JOIN hold o ON o.dev = e.dev AND o.det = c.c AND o.span >= 900 AND o.s < e.f AND o.f > e.s
   WHERE e.hid = r.id)
 -- @step {{ p }}pxy
 SELECT r.kind, r.id, c.c, x.n15 AS x, y.n15 AS y, x.k + 1 AS w
@@ -120,7 +120,7 @@ LEFT JOIN {{ p }}rec r ON r.kind = 'e' AND r.id = h.hid WHERE h.dur >= 900 GROUP
 SELECT d.dev, d.det, coalesce(sum(greatest(least(h.f, d.drop_b1 * 300.0) - greatest(h.s, d.drop_b0 * 300.0), 0.0))
          FILTER (h.hid IS NOT NULL), 0)
        >= 0.5 * (d.drop_b1 - d.drop_b0) * 300.0 AS drop_in_stuck
-FROM {{ p }}drx d LEFT JOIN hold h ON h.dev = d.dev AND h.det = d.det AND h.dur >= 900
+FROM {{ p }}drx d LEFT JOIN hold h ON h.dev = d.dev AND h.det = d.det AND h.span >= 900
 WHERE d.n_on > 0 AND d.drop_lam >= 30 AND d.drop_b1 > d.drop_b0 GROUP BY d.dev, d.det, d.drop_b0, d.drop_b1
 {# night count (21-05) against the detector it tracks, else its phase, else the rest of the signal; clean_yardsticks
    (note 154t): the night yardsticks without the detectors that do not look like traffic (phase mates while >= 2 are

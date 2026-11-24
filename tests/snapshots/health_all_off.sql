@@ -548,13 +548,14 @@ SELECT dev, det, min(b) AS a, max(b) + 1 AS z FROM (
 GROUP BY dev, det, grp
 ),
 hq_hold AS MATERIALIZED (
-SELECT h.*, row_number() OVER (ORDER BY h.dev, h.det, h.s) AS hid FROM (
+SELECT h.*,
+       h.dur AS span, row_number() OVER (ORDER BY h.dev, h.det, h.s) AS hid FROM (
   SELECT dev, det, s / 1e9 AS s, f / 1e9 AS f, false AS open_end, f / 1e9 - s / 1e9 AS dur FROM hq_rhold
   UNION ALL
   SELECT c.dev, c.det, c.s / 1e9, w.T, true, c.dur FROM hq_fch c JOIN hq_win w USING (dev) WHERE NOT c.gap AND c.dur >= 300) h
 ),
 hq_hold_co AS MATERIALIZED (
-SELECT a.hid, count(DISTINCT b.det) FILTER (least(a.f, b.f) - greatest(a.s, b.s) >= 0.5 * a.dur) AS co
+SELECT a.hid, count(DISTINCT b.det) FILTER (least(a.f, b.f) - greatest(a.s, b.s) >= 0.5 * a.span) AS co
 FROM hq_hold a LEFT JOIN hq_hold b ON a.dev = b.dev AND a.det <> b.det GROUP BY a.hid
 ),
 hq_lvl0 AS (
@@ -645,7 +646,7 @@ WHERE n_on > 0 AND drop_lam >= 30 AND drop_b1 > drop_b0
 hq_p1rc AS (
 SELECT r.kind, r.id, c.c FROM hq_p1rq r JOIN hq_p1pc c ON c.dev = r.dev AND c.det = r.det
 WHERE r.kind <> 'e' OR NOT EXISTS (
-  SELECT 1 FROM hq_hold e JOIN hq_hold o ON o.dev = e.dev AND o.det = c.c AND o.dur >= 900 AND o.s < e.f AND o.f > e.s
+  SELECT 1 FROM hq_hold e JOIN hq_hold o ON o.dev = e.dev AND o.det = c.c AND o.span >= 900 AND o.s < e.f AND o.f > e.s
   WHERE e.hid = r.id)
 ),
 hq_p1pxy AS (
@@ -702,7 +703,7 @@ hq_p1dis AS (
 SELECT d.dev, d.det, coalesce(sum(greatest(least(h.f, d.drop_b1 * 300.0) - greatest(h.s, d.drop_b0 * 300.0), 0.0))
          FILTER (h.hid IS NOT NULL), 0)
        >= 0.5 * (d.drop_b1 - d.drop_b0) * 300.0 AS drop_in_stuck
-FROM hq_p1drx d LEFT JOIN hq_hold h ON h.dev = d.dev AND h.det = d.det AND h.dur >= 900
+FROM hq_p1drx d LEFT JOIN hq_hold h ON h.dev = d.dev AND h.det = d.det AND h.span >= 900
 WHERE d.n_on > 0 AND d.drop_lam >= 30 AND d.drop_b1 > d.drop_b0 GROUP BY d.dev, d.det, d.drop_b0, d.drop_b1
 ),
 hq_p1rsum AS (
@@ -813,7 +814,7 @@ WHERE n_on > 0 AND drop_lam >= 30 AND drop_b1 > drop_b0
 hq_p2rc AS (
 SELECT r.kind, r.id, c.c FROM hq_p2rq r JOIN hq_p2pc c ON c.dev = r.dev AND c.det = r.det
 WHERE r.kind <> 'e' OR NOT EXISTS (
-  SELECT 1 FROM hq_hold e JOIN hq_hold o ON o.dev = e.dev AND o.det = c.c AND o.dur >= 900 AND o.s < e.f AND o.f > e.s
+  SELECT 1 FROM hq_hold e JOIN hq_hold o ON o.dev = e.dev AND o.det = c.c AND o.span >= 900 AND o.s < e.f AND o.f > e.s
   WHERE e.hid = r.id)
 ),
 hq_p2pxy AS (
@@ -870,7 +871,7 @@ hq_p2dis AS (
 SELECT d.dev, d.det, coalesce(sum(greatest(least(h.f, d.drop_b1 * 300.0) - greatest(h.s, d.drop_b0 * 300.0), 0.0))
          FILTER (h.hid IS NOT NULL), 0)
        >= 0.5 * (d.drop_b1 - d.drop_b0) * 300.0 AS drop_in_stuck
-FROM hq_p2drx d LEFT JOIN hq_hold h ON h.dev = d.dev AND h.det = d.det AND h.dur >= 900
+FROM hq_p2drx d LEFT JOIN hq_hold h ON h.dev = d.dev AND h.det = d.det AND h.span >= 900
 WHERE d.n_on > 0 AND d.drop_lam >= 30 AND d.drop_b1 > d.drop_b0 GROUP BY d.dev, d.det, d.drop_b0, d.drop_b1
 ),
 hq_p2rsum AS (

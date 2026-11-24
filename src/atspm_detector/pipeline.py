@@ -362,6 +362,13 @@ def load_events(con, events, device_ids=None, start=None, end=None):
             con.execute("DROP TABLE evd")
             con.execute("ALTER TABLE evd_fl RENAME TO evd")
     con.execute("CREATE OR REPLACE TEMP VIEW ev AS SELECT DeviceId, Timestamp, EventId, Parameter FROM evd")
+    if hsql.OPTIONS["preempt_holds"]:   # the preemptions, for the health only (never a classifier input)
+        pre = ",".join(str(c) for c in hsql.PREEMPT["codes"])
+        con.execute(f"""CREATE OR REPLACE TEMP TABLE evpre AS
+            SELECT DISTINCT m.dev, e.DeviceId, e.Timestamp, CAST(e.EventId AS USMALLINT) AS EventId,
+                            CAST(e.Parameter AS USMALLINT) AS Parameter
+            FROM (SELECT * FROM ({typed}) WHERE EventId IN ({pre}){''.join(' AND ' + c for c in where[1:])}) e
+            JOIN devmap m USING (DeviceId) WHERE NOT {bad}""")
     w0, w1, info = _window(con)
     info["n_invalid"] = n_bad
     return w0, w1, info
@@ -825,7 +832,7 @@ def _health(con, W: pd.DataFrame, d: pd.DataFrame, notes: dict) -> tuple:
         con.register("hq_in_win", win[win.DeviceId.isin(ids)])
         try:
             return hsql.health(con, "evd", "hq_in_det", windows_table="hq_in_win", max_events=None, distinct=False,
-                               periods=True)
+                               periods=True, preempt_table="evpre" if hsql.OPTIONS["preempt_holds"] else None)
         finally:
             con.unregister("hq_in_det")
             con.unregister("hq_in_win")

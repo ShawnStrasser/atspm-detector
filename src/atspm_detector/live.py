@@ -9,7 +9,8 @@ hl_state goes to the next run as state.  hl_rows are added to history, which onl
 Every signal is tracked on its own, as the other performance measures are: nothing a signal gets depends on any other signal.
   state       per signal: the end of its last written bin (9602), the midnight of its last whole-day check (9603), the quarter-hour
               of its first event (9604), the runs whose rows it has in history (9605), its events past its last bin (9700), the
-              version (9606), and the carry, limits and open ped ONs as before.  Every state row has a DeviceId.
+              version (9606), the preempt events of the horizon (9240: a hold during a preemption is not stuck on), and the carry,
+              limits and open ped ONs as before.  Every state row has a DeviceId.
   bins        a signal's bin is written by the run its own data reach the end of: its last event within a second of the bin's end,
               or complete_through (the caller: this signal's events are all in up to then).  Its events after its last bin wait in
               the state (9700), so each bin is judged whole, in one run, with the rows it would have had on time.  A bin with no
@@ -43,6 +44,7 @@ import pandas as pd
 
 from . import bins as B
 from . import findings as F
+from . import health_duckdb as H
 from . import incremental as I
 from .hq import render as _render
 
@@ -56,6 +58,7 @@ LIMIT_CODES = {"lim_stuck": 9501, "bad_stuck": 9502, "lim_rapid": 9505, "bad_rap
 TRIMMED, BINS_THROUGH, LAST_CHECK, FIRST_DAY, RUN_ID, VERSION, PEND = 9601, 9602, 9603, 9604, 9605, 9606, 9700
 MARKS = {BINS_THROUGH: "b", LAST_CHECK: "c", FIRST_DAY: "f"}
 PON_WALKS, PON_GREENS, INPUT_PHASE, INPUT_FLAGS = 9233, 9234, 9520, 9521
+PRE_EVENT = 9240               # a preempt event of the horizon (Parameter: preempt number, Value: its code), for the stuck-on rule's preemptions
 PED_HISTORY_DAYS = 28           # ped_stop.HIST_DAYS: the look-back of the sudden stop against the button's own weeks
 TS9, I4, I8, I2, F8, TXT = "TIMESTAMP_NS", "INTEGER", "BIGINT", "SMALLINT", "DOUBLE", "VARCHAR"
 ROW_COLUMNS = {"Tbl": TXT, "DeviceId": None, "TimeStamp": TS9, "Events": I4, "First_Event": TS9, "Last_Event": TS9, "Detector": I8, "Chain_Tag": TS9, "Piece_Phase": I4, "Piece_Tag": TS9, "Piece_Kind": I2,
@@ -142,6 +145,7 @@ def _load_state(con, state, device_type):
     con.execute(f"CREATE OR REPLACE TEMP TABLE hl_limits AS SELECT DeviceId, Parameter AS det, {wide} FROM hl_s WHERE EventId BETWEEN 9501 AND 9508 GROUP BY DeviceId, Parameter")
     con.execute(f"""CREATE OR REPLACE TEMP TABLE hl_pon AS SELECT DeviceId, Parameter AS ch, TimeStamp AS t_on, max(Value) FILTER (EventId = {PON_WALKS}) AS walks, max(Value) FILTER (EventId = {PON_GREENS}) AS greens
                     FROM hl_s WHERE EventId IN ({PON_WALKS}, {PON_GREENS}) GROUP BY ALL""")
+    con.execute(f"CREATE OR REPLACE TEMP TABLE hl_prelog AS SELECT DeviceId, TimeStamp, Value::INT AS EventId, Parameter FROM hl_s WHERE EventId = {PRE_EVENT}")
     con.execute(f"""CREATE OR REPLACE TEMP TABLE hl_inputs AS SELECT DeviceId, Parameter AS ch, max(Value) FILTER (EventId = {INPUT_PHASE}) AS ph, max(Value) FILTER (EventId = {INPUT_FLAGS}) AS flags
                     FROM hl_s WHERE EventId IN ({INPUT_PHASE}, {INPUT_FLAGS}) GROUP BY ALL""")
     # the runs each signal has rows of in history; Legacy: listed by a state from before 2.2.0 for all its signals, checked by run alone
@@ -151,16 +155,50 @@ def _load_state(con, state, device_type):
                            FROM hl_s GROUP BY DeviceId""").df()
 
 
-def _live_step(con, T, detectors):
-    """the rows of the bin ending at T of the signals in hl_due, from the rules that can answer now, and the open ped ONs for the next bin."""
+def _pre_log(s):
+    """the preempt events a step sees: this run's (the store's ped log) and the earlier runs' (the state, PRE_EVENT)"""
+    codes = ", ".join(str(c) for c in H.PREEMPT["codes"])
+    return (f"(SELECT DeviceId, TimeStamp::TIMESTAMP AS TimeStamp, EventId::INT AS EventId, Parameter FROM {s}health_ped_events WHERE EventId IN ({codes}) "
+            "UNION SELECT DeviceId, TimeStamp, EventId, Parameter FROM hl_prelog)")
+
+
+def _preemptions(s, T, horizon):
+    """each signal's preemptions before Z from the preempt events of the horizon before it, merged (DeviceId, a, z): health_duckdb.PREEMPT, the
+    batch rule (hq/sql/adapters.sql hpre) on timestamps; an end with no start before it: on from any time before."""
+    P = H.PREEMPT
+    return f"""SELECT DeviceId, min(a) AS a, max(z) AS z FROM (
+        SELECT *, sum(nw::INT) OVER (PARTITION BY DeviceId ORDER BY a, z) AS grp FROM (
+          SELECT *, coalesce(a > max(z) OVER (PARTITION BY DeviceId ORDER BY a, z ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), true) AS nw
+          FROM (SELECT DeviceId, CASE WHEN ev IN (102, 105) THEN t ELSE TIMESTAMP '1970-01-01' END AS a,
+                       CASE WHEN ev IN (102, 105) THEN least(coalesce(en, t + INTERVAL {P["cap_s"]} SECOND), t + INTERVAL {P["cap_s"]} SECOND) ELSE t END
+                       + INTERVAL {P["recovery_s"]} SECOND AS z
+                FROM (SELECT DeviceId, TimeStamp::TIMESTAMP AS t, EventId AS ev,
+                             min(CASE WHEN EventId IN (104, 110, 111) THEN TimeStamp::TIMESTAMP END) OVER f AS en,
+                             count(*) FILTER (EventId IN (102, 105)) OVER b AS nb
+                      FROM {_pre_log(s)} WHERE TimeStamp < {_ts(T)} AND TimeStamp >= {_ts(T - horizon)} AND DeviceId IN (SELECT DeviceId FROM hl_due)
+                      WINDOW f AS (PARTITION BY DeviceId, Parameter ORDER BY TimeStamp, EventId ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING),
+                             b AS (PARTITION BY DeviceId, Parameter ORDER BY TimeStamp, EventId ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING))
+                WHERE ev IN (102, 105) OR (ev IN (104, 110, 111) AND nb = 0))))
+      GROUP BY DeviceId, grp"""
+
+
+def _live_step(con, T, detectors, preempt=True, horizon=pd.Timedelta(days=3)):
+    """the rows of the bin ending at T of the signals in hl_due, from the rules that can answer now, and the open ped ONs for the next bin.
+    preempt: the time a hold lies inside a preemption does not count as stuck on (option preempt_holds; the preempt events of the horizon)."""
     a = T - Q
     A, Z = _ts(a), _ts(T)
     s = f"{STORE}."
     has = con.execute("SELECT count(*) FROM hl_limits").fetchall()[0][0] > 0
     parts = []
     if has:
-        # stuck on: a chain still open at the bin's end, or closed in it, held for its limit so far.  Not over a comms gap, and the signal logged in the bin.
+        # stuck on: a chain still open at the bin's end, or closed in it, held for its limit so far (less any time inside a preemption).  Not over a comms gap,
+        # and the signal logged in the bin.
+        if preempt:
+            con.execute(f"CREATE OR REPLACE TEMP TABLE hl_pre AS {_preemptions(s, T, horizon)}")
         x = f"(epoch(least(h.f, {Z})) - epoch(h.s))"
+        if preempt:
+            x = (f"({x} - coalesce((SELECT sum(epoch(least(h.f, {Z}, p.z)) - epoch(greatest(h.s, p.a))) FROM hl_pre p "
+                 f"WHERE p.DeviceId = h.DeviceId AND p.a < least(h.f, {Z}) AND p.z > h.s), 0))")
         c = _conf(x, "l.lim_stuck", "l.bad_stuck")
         parts.append(f"""SELECT h.DeviceId, 'Vehicle' AS DetectorType, h.det::BIGINT AS Detector, 'stuck on' AS Label,
                least(1.0, sum((epoch(least(h.f, {Z})) - epoch(greatest(h.s, {A}))) / 900.0 * least(1.0, {c} / 0.65))) AS Score
@@ -471,7 +509,7 @@ def _live_run(con, raw, detectors, state, history, ped_history, params, clock_ah
         stepping = [d for d, v in plan.items() if stop in v["steps"]]
         if stepping:        # every signal with events in the bin steps its open ped ONs; only those whose bin it is get rows
             due_table([d for d in stepping if stop in plan[d]["due"]])
-            write(_live_step(con, stop, detectors))
+            write(_live_step(con, stop, detectors, H._options(options)["preempt_holds"], horizon))
         checked = [d for d, v in plan.items() if stop in v["checks"]]
         if checked:
             late, f = _whole_day(con, stop, detectors, history, ped_history, params, temp_dir, checked)
@@ -503,6 +541,8 @@ def _live_run(con, raw, detectors, state, history, ped_history, params, clock_ah
         UNION ALL SELECT * FROM ({long_lim})
         UNION ALL SELECT t_on, DeviceId, {PON_WALKS}, ch, walks FROM hl_pon
         UNION ALL SELECT t_on, DeviceId, {PON_GREENS}, ch, greens FROM hl_pon
+        UNION ALL SELECT p.TimeStamp, p.DeviceId, {PRE_EVENT}, p.Parameter, p.EventId::DOUBLE FROM {_pre_log(s)} p
+                  LEFT JOIN hl_mk m USING (DeviceId) WHERE m.b IS NULL OR p.TimeStamp >= m.b - INTERVAL ({horizon_days}) DAY
         UNION ALL SELECT NULL::TIMESTAMP, DeviceId, {INPUT_PHASE}, ch, ph FROM hl_inputs
         UNION ALL SELECT NULL::TIMESTAMP, DeviceId, {INPUT_FLAGS}, ch, flags FROM hl_inputs
         UNION ALL SELECT TimeStamp, DeviceId, {RUN_ID}, Legacy::INTEGER, Run::DOUBLE FROM hl_runs

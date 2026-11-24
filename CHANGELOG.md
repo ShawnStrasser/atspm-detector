@@ -2,7 +2,7 @@
 
 ## 2.2.0 - live health tracked per signal, ped history for the sudden stop
 
-Phase, function, lanes, setback and night speed are unchanged, and so is every health rule but one (below). `atspm_detector.live` now tracks every signal on its own.
+Phase, function, lanes, setback and night speed are unchanged, and so is every health rule but two (below). `atspm_detector.live` now tracks every signal on its own.
 
 **Health: no "counts too high" when the phase mates died with the detector**
 
@@ -10,6 +10,18 @@ Phase, function, lanes, setback and night speed are unchanged, and so is every h
   (10 % or less of that day's 06-22 h count) and its phase mates nearly stopped with it (25 % or less of theirs): the
   time-of-day yardstick was then two dead detectors, so a normal day read as a rise. New option `rise_dead_mates` (on),
   with `rise_dead_days`.
+
+**Health: no "stuck on" for a queue behind a train**
+
+- Time a detector is held ON while the signal is in preemption no longer counts toward stuck on: a queue waiting for a
+  train is traffic, not a fault. A preemption runs from its call (102) or entry (105) to the first input off (104), max
+  presence (110) or exit (111) of that preempt number, at most 6 h, plus 2 minutes of recovery; the same rule as the ped
+  health. Only the held time outside every preemption is judged, so a detector stuck for hours is still flagged when a
+  short preemption falls inside its hold; a hold cleared this way is not reported as a silence instead. New option
+  `preempt_holds` (on). Batch runs, `predict`, incremental stores and `live` all apply it; a store reads the preempt events
+  from its ped log, so a store attached with `ped=False` judges as before. The preempt events are used by the health only,
+  never by the phase or function model. On one network day (194 signals with preemptions) 7 detectors went from suspect
+  to ok and 11 stuck-on periods were removed; nothing was added.
 
 **Breaking (`live`)**
 

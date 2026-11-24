@@ -70,7 +70,7 @@ misses vehicles at night, busy at night, too fast / too many, spiky counts, no d
 Ped push buttons are judged the same way. Not field-verified.
 
 Nothing a signal logs while it is in flash is used, by any check or model: those hours read as a signal that logged
-nothing. To judge ped buttons against a saved configuration instead of the phase their presses show in the window, pass
+nothing. Time a detector is held ON during a preemption (a queue behind a train) does not count as stuck on. To judge ped buttons against a saved configuration instead of the phase their presses show in the window, pass
 `health(..., ped_config="table")` (DeviceId, Detector = the ped input, phase, function `Ped` / `Ped_Overlap`,
 in_recall), for example the answers of `ped_detectors` kept from an earlier run.
 

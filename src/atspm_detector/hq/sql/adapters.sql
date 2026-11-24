@@ -24,8 +24,35 @@ SELECT dev, det, b, non AS n FROM d5 WHERE non > 0
 {# continuous ONs held >= 5 min, not over a comms gap: closed holds, and the open chain held to the window end
    (open_end); s, f, dur in seconds as today (the same doubles) #}
 {% macro hold() %}
+{% set pre = opt['preempt_holds'] %}
+{% if pre %}
+{# option preempt_holds: each signal's preemptions (PREEMPT) in seconds from its window start, + recovery, overlapping ones
+   merged; an end with no start before it: on from any time before.  A batch run reads the preempt events of its window
+   from @PREEMPT@; a store reads its ped log (health_ped_events keeps them; none with ped=False) from before the window
+   too, as it knows an ON held from before the window (the carry) #}
+-- @step hpre mat
+SELECT dev, min(a) AS a, max(z) AS z FROM (
+  SELECT *, sum(nw::INT) OVER (PARTITION BY dev ORDER BY a, z) AS grp FROM (
+    SELECT *, coalesce(a > max(z) OVER (PARTITION BY dev ORDER BY a, z ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), true) AS nw
+    FROM (SELECT dev, CASE WHEN ev IN (102, 105) THEN t ELSE '-infinity'::DOUBLE END AS a,
+                 CASE WHEN ev IN (102, 105) THEN least(coalesce(en, t + {{ PREEMPT['cap_s'] }}), t + {{ PREEMPT['cap_s'] }}) ELSE t END
+                 + {{ PREEMPT['recovery_s'] }} AS z
+          FROM (SELECT w.dev, (epoch_ns(e.Timestamp) - w.s_ns) / 1e9 AS t, e.EventId AS ev,
+                       min(CASE WHEN e.EventId IN (104, 110, 111) THEN (epoch_ns(e.Timestamp) - w.s_ns) / 1e9 END) OVER f AS en,
+                       count(*) FILTER (e.EventId IN (102, 105)) OVER b AS nb
+                FROM {{ (store ~ 'health_ped_events') if store else '@PREEMPT@' }} e JOIN win w ON e.DeviceId = w.DeviceId
+                WHERE e.EventId IN {{ PREEMPT['codes']|intlist }} AND e.Timestamp <= w.hi AND epoch_ns(e.Timestamp) < w.e_ns
+                  {% if not store %}AND e.Timestamp >= w.lo AND epoch_ns(e.Timestamp) >= w.s_ns{% endif %}
+                WINDOW f AS (PARTITION BY w.dev, e.Parameter ORDER BY e.Timestamp, e.EventId ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING),
+                       b AS (PARTITION BY w.dev, e.Parameter ORDER BY e.Timestamp, e.EventId ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING))
+          WHERE ev IN (102, 105) OR (ev IN (104, 110, 111) AND nb = 0))))
+GROUP BY dev, grp
+{% endif %}
+{# span: the hold's length; dur: the part of it that counts as stuck on (preempt_holds: outside every preemption) #}
 -- @step hold mat
-SELECT h.*, row_number() OVER (ORDER BY h.dev, h.det, h.s) AS hid FROM (
+SELECT h.*{% if pre %} REPLACE (h.dur - coalesce((SELECT sum(greatest(least(h.f, p.z) - greatest(h.s, p.a), 0.0)) FROM hpre p
+                                    WHERE p.dev = h.dev AND p.a < h.f AND p.z > h.s), 0.0) AS dur){% endif %},
+       h.dur AS span, row_number() OVER (ORDER BY h.dev, h.det, h.s) AS hid FROM (
   SELECT dev, det, s / 1e9 AS s, f / 1e9 AS f, false AS open_end, f / 1e9 - s / 1e9 AS dur FROM rhold
   UNION ALL
   SELECT c.dev, c.det, c.s / 1e9, w.T, true, c.dur FROM fch c JOIN win w USING (dev) WHERE NOT c.gap AND c.dur >= 300) h

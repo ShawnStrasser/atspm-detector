@@ -70,7 +70,7 @@ FROM mo_runs GROUP BY dev, det
    (hib bins), a mostly-ON run.  A held detector sends no new actuations, so its silence and
    its count drop leave this time out: one fault, not two #}
 -- @step hiv mat
-SELECT dev, det, s, f FROM hold WHERE dur >= 900
+SELECT dev, det, s, f FROM hold WHERE span >= 900
 UNION ALL SELECT h.dev, h.det, h.k * w.bs, (h.k + 1) * w.bs FROM hib h JOIN win w USING (dev)
 {% if opt['mostly_on'] %}UNION ALL SELECT dev, det, a * 600.0, z * 600.0 FROM mo_runs
 {% endif %}

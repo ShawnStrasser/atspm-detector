@@ -556,14 +556,33 @@ SELECT dev, det, min(a) AS a, max(z) AS z FROM (
     WINDOW w AS (PARTITION BY r.dev, r.det ORDER BY r.a)))
 GROUP BY dev, det, grp
 ),
+hq_hpre AS MATERIALIZED (
+SELECT dev, min(a) AS a, max(z) AS z FROM (
+  SELECT *, sum(nw::INT) OVER (PARTITION BY dev ORDER BY a, z) AS grp FROM (
+    SELECT *, coalesce(a > max(z) OVER (PARTITION BY dev ORDER BY a, z ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), true) AS nw
+    FROM (SELECT dev, CASE WHEN ev IN (102, 105) THEN t ELSE '-infinity'::DOUBLE END AS a,
+                 CASE WHEN ev IN (102, 105) THEN least(coalesce(en, t + 21600), t + 21600) ELSE t END
+                 + 120 AS z
+          FROM (SELECT w.dev, (epoch_ns(e.Timestamp) - w.s_ns) / 1e9 AS t, e.EventId AS ev,
+                       min(CASE WHEN e.EventId IN (104, 110, 111) THEN (epoch_ns(e.Timestamp) - w.s_ns) / 1e9 END) OVER f AS en,
+                       count(*) FILTER (e.EventId IN (102, 105)) OVER b AS nb
+                FROM events e JOIN hq_win w ON e.DeviceId = w.DeviceId
+                WHERE e.EventId IN (102, 104, 105, 110, 111) AND e.Timestamp <= w.hi AND epoch_ns(e.Timestamp) < w.e_ns
+AND e.Timestamp >= w.lo AND epoch_ns(e.Timestamp) >= w.s_ns                WINDOW f AS (PARTITION BY w.dev, e.Parameter ORDER BY e.Timestamp, e.EventId ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING),
+                       b AS (PARTITION BY w.dev, e.Parameter ORDER BY e.Timestamp, e.EventId ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING))
+          WHERE ev IN (102, 105) OR (ev IN (104, 110, 111) AND nb = 0))))
+GROUP BY dev, grp
+),
 hq_hold AS MATERIALIZED (
-SELECT h.*, row_number() OVER (ORDER BY h.dev, h.det, h.s) AS hid FROM (
+SELECT h.* REPLACE (h.dur - coalesce((SELECT sum(greatest(least(h.f, p.z) - greatest(h.s, p.a), 0.0)) FROM hq_hpre p
+                                    WHERE p.dev = h.dev AND p.a < h.f AND p.z > h.s), 0.0) AS dur),
+       h.dur AS span, row_number() OVER (ORDER BY h.dev, h.det, h.s) AS hid FROM (
   SELECT dev, det, s / 1e9 AS s, f / 1e9 AS f, false AS open_end, f / 1e9 - s / 1e9 AS dur FROM hq_rhold
   UNION ALL
   SELECT c.dev, c.det, c.s / 1e9, w.T, true, c.dur FROM hq_fch c JOIN hq_win w USING (dev) WHERE NOT c.gap AND c.dur >= 300) h
 ),
 hq_hold_co AS MATERIALIZED (
-SELECT a.hid, count(DISTINCT b.det) FILTER (least(a.f, b.f) - greatest(a.s, b.s) >= 0.5 * a.dur) AS co
+SELECT a.hid, count(DISTINCT b.det) FILTER (least(a.f, b.f) - greatest(a.s, b.s) >= 0.5 * a.span) AS co
 FROM hq_hold a LEFT JOIN hq_hold b ON a.dev = b.dev AND a.det <> b.det GROUP BY a.hid
 ),
 hq_lvl0 AS (
@@ -571,7 +590,7 @@ SELECT dev, det, k, n15, S15, c15,
        sum(n15) OVER w AS cx, sum(S15) OVER w AS cs, row_number() OVER w AS pos,
        count(*) OVER (PARTITION BY dev, det) AS nl, sum(n15) OVER (PARTITION BY dev, det) AS X,
        sum(S15) OVER (PARTITION BY dev, det) AS SS
-FROM (SELECT dev, det, k, n15, sum(n15) OVER (PARTITION BY dev, k) - n15 AS S15, c15 FROM hq_a15) a WHERE c15 AND NOT EXISTS (SELECT 1 FROM hq_hold h WHERE h.dev = a.dev AND h.det = a.det AND h.dur >= 900 AND h.f > a.k * 900.0 AND h.s < (a.k + 1) * 900.0)
+FROM (SELECT dev, det, k, n15, sum(n15) OVER (PARTITION BY dev, k) - n15 AS S15, c15 FROM hq_a15) a WHERE c15 AND NOT EXISTS (SELECT 1 FROM hq_hold h WHERE h.dev = a.dev AND h.det = a.det AND h.span >= 900 AND h.f > a.k * 900.0 AND h.s < (a.k + 1) * 900.0)
 WINDOW w AS (PARTITION BY dev, det ORDER BY k ROWS UNBOUNDED PRECEDING)
 ),
 hq_lvlshift AS (
@@ -679,7 +698,7 @@ WHERE n_on > 0 AND drop_lam >= 30 AND drop_b1 > drop_b0
 hq_p1rc AS (
 SELECT r.kind, r.id, c.c FROM hq_p1rq r JOIN hq_p1pc c ON c.dev = r.dev AND c.det = r.det
 WHERE r.kind <> 'e' OR NOT EXISTS (
-  SELECT 1 FROM hq_hold e JOIN hq_hold o ON o.dev = e.dev AND o.det = c.c AND o.dur >= 900 AND o.s < e.f AND o.f > e.s
+  SELECT 1 FROM hq_hold e JOIN hq_hold o ON o.dev = e.dev AND o.det = c.c AND o.span >= 900 AND o.s < e.f AND o.f > e.s
   WHERE e.hid = r.id)
 ),
 hq_p1pxy AS (
@@ -736,7 +755,7 @@ hq_p1dis AS (
 SELECT d.dev, d.det, coalesce(sum(greatest(least(h.f, d.drop_b1 * 300.0) - greatest(h.s, d.drop_b0 * 300.0), 0.0))
          FILTER (h.hid IS NOT NULL), 0)
        >= 0.5 * (d.drop_b1 - d.drop_b0) * 300.0 AS drop_in_stuck
-FROM hq_p1drx d LEFT JOIN hq_hold h ON h.dev = d.dev AND h.det = d.det AND h.dur >= 900
+FROM hq_p1drx d LEFT JOIN hq_hold h ON h.dev = d.dev AND h.det = d.det AND h.span >= 900
 WHERE d.n_on > 0 AND d.drop_lam >= 30 AND d.drop_b1 > d.drop_b0 GROUP BY d.dev, d.det, d.drop_b0, d.drop_b1
 ),
 hq_p1nkd AS MATERIALIZED (
@@ -871,7 +890,7 @@ WHERE n_on > 0 AND drop_lam >= 30 AND drop_b1 > drop_b0
 hq_p2rc AS (
 SELECT r.kind, r.id, c.c FROM hq_p2rq r JOIN hq_p2pc c ON c.dev = r.dev AND c.det = r.det
 WHERE r.kind <> 'e' OR NOT EXISTS (
-  SELECT 1 FROM hq_hold e JOIN hq_hold o ON o.dev = e.dev AND o.det = c.c AND o.dur >= 900 AND o.s < e.f AND o.f > e.s
+  SELECT 1 FROM hq_hold e JOIN hq_hold o ON o.dev = e.dev AND o.det = c.c AND o.span >= 900 AND o.s < e.f AND o.f > e.s
   WHERE e.hid = r.id)
 ),
 hq_p2pxy AS (
@@ -928,7 +947,7 @@ hq_p2dis AS (
 SELECT d.dev, d.det, coalesce(sum(greatest(least(h.f, d.drop_b1 * 300.0) - greatest(h.s, d.drop_b0 * 300.0), 0.0))
          FILTER (h.hid IS NOT NULL), 0)
        >= 0.5 * (d.drop_b1 - d.drop_b0) * 300.0 AS drop_in_stuck
-FROM hq_p2drx d LEFT JOIN hq_hold h ON h.dev = d.dev AND h.det = d.det AND h.dur >= 900
+FROM hq_p2drx d LEFT JOIN hq_hold h ON h.dev = d.dev AND h.det = d.det AND h.span >= 900
 WHERE d.n_on > 0 AND d.drop_lam >= 30 AND d.drop_b1 > d.drop_b0 GROUP BY d.dev, d.det, d.drop_b0, d.drop_b1
 ),
 hq_p2nkd AS MATERIALIZED (
@@ -1211,7 +1230,7 @@ SELECT dev, det, 10.0 * sum(z - a) AS mo_min, 10.0 * max(z - a) AS mo_long, arg_
 FROM hq_mo_runs GROUP BY dev, det
 ),
 hq_hiv AS MATERIALIZED (
-SELECT dev, det, s, f FROM hq_hold WHERE dur >= 900
+SELECT dev, det, s, f FROM hq_hold WHERE span >= 900
 UNION ALL SELECT h.dev, h.det, h.k * w.bs, (h.k + 1) * w.bs FROM hq_hib h JOIN hq_win w USING (dev)
 UNION ALL SELECT dev, det, a * 600.0, z * 600.0 FROM hq_mo_runs
 ),
@@ -3248,14 +3267,33 @@ SELECT dev, det, min(a) AS a, max(z) AS z FROM (
     WINDOW w AS (PARTITION BY r.dev, r.det ORDER BY r.a)))
 GROUP BY dev, det, grp
 ),
+hq_hpre AS MATERIALIZED (
+SELECT dev, min(a) AS a, max(z) AS z FROM (
+  SELECT *, sum(nw::INT) OVER (PARTITION BY dev ORDER BY a, z) AS grp FROM (
+    SELECT *, coalesce(a > max(z) OVER (PARTITION BY dev ORDER BY a, z ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), true) AS nw
+    FROM (SELECT dev, CASE WHEN ev IN (102, 105) THEN t ELSE '-infinity'::DOUBLE END AS a,
+                 CASE WHEN ev IN (102, 105) THEN least(coalesce(en, t + 21600), t + 21600) ELSE t END
+                 + 120 AS z
+          FROM (SELECT w.dev, (epoch_ns(e.Timestamp) - w.s_ns) / 1e9 AS t, e.EventId AS ev,
+                       min(CASE WHEN e.EventId IN (104, 110, 111) THEN (epoch_ns(e.Timestamp) - w.s_ns) / 1e9 END) OVER f AS en,
+                       count(*) FILTER (e.EventId IN (102, 105)) OVER b AS nb
+                FROM events e JOIN hq_win w ON e.DeviceId = w.DeviceId
+                WHERE e.EventId IN (102, 104, 105, 110, 111) AND e.Timestamp <= w.hi AND epoch_ns(e.Timestamp) < w.e_ns
+AND e.Timestamp >= w.lo AND epoch_ns(e.Timestamp) >= w.s_ns                WINDOW f AS (PARTITION BY w.dev, e.Parameter ORDER BY e.Timestamp, e.EventId ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING),
+                       b AS (PARTITION BY w.dev, e.Parameter ORDER BY e.Timestamp, e.EventId ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING))
+          WHERE ev IN (102, 105) OR (ev IN (104, 110, 111) AND nb = 0))))
+GROUP BY dev, grp
+),
 hq_hold AS MATERIALIZED (
-SELECT h.*, row_number() OVER (ORDER BY h.dev, h.det, h.s) AS hid FROM (
+SELECT h.* REPLACE (h.dur - coalesce((SELECT sum(greatest(least(h.f, p.z) - greatest(h.s, p.a), 0.0)) FROM hq_hpre p
+                                    WHERE p.dev = h.dev AND p.a < h.f AND p.z > h.s), 0.0) AS dur),
+       h.dur AS span, row_number() OVER (ORDER BY h.dev, h.det, h.s) AS hid FROM (
   SELECT dev, det, s / 1e9 AS s, f / 1e9 AS f, false AS open_end, f / 1e9 - s / 1e9 AS dur FROM hq_rhold
   UNION ALL
   SELECT c.dev, c.det, c.s / 1e9, w.T, true, c.dur FROM hq_fch c JOIN hq_win w USING (dev) WHERE NOT c.gap AND c.dur >= 300) h
 ),
 hq_hold_co AS MATERIALIZED (
-SELECT a.hid, count(DISTINCT b.det) FILTER (least(a.f, b.f) - greatest(a.s, b.s) >= 0.5 * a.dur) AS co
+SELECT a.hid, count(DISTINCT b.det) FILTER (least(a.f, b.f) - greatest(a.s, b.s) >= 0.5 * a.span) AS co
 FROM hq_hold a LEFT JOIN hq_hold b ON a.dev = b.dev AND a.det <> b.det GROUP BY a.hid
 ),
 hq_lvl0 AS (
@@ -3263,7 +3301,7 @@ SELECT dev, det, k, n15, S15, c15,
        sum(n15) OVER w AS cx, sum(S15) OVER w AS cs, row_number() OVER w AS pos,
        count(*) OVER (PARTITION BY dev, det) AS nl, sum(n15) OVER (PARTITION BY dev, det) AS X,
        sum(S15) OVER (PARTITION BY dev, det) AS SS
-FROM (SELECT dev, det, k, n15, sum(n15) OVER (PARTITION BY dev, k) - n15 AS S15, c15 FROM hq_a15) a WHERE c15 AND NOT EXISTS (SELECT 1 FROM hq_hold h WHERE h.dev = a.dev AND h.det = a.det AND h.dur >= 900 AND h.f > a.k * 900.0 AND h.s < (a.k + 1) * 900.0)
+FROM (SELECT dev, det, k, n15, sum(n15) OVER (PARTITION BY dev, k) - n15 AS S15, c15 FROM hq_a15) a WHERE c15 AND NOT EXISTS (SELECT 1 FROM hq_hold h WHERE h.dev = a.dev AND h.det = a.det AND h.span >= 900 AND h.f > a.k * 900.0 AND h.s < (a.k + 1) * 900.0)
 WINDOW w AS (PARTITION BY dev, det ORDER BY k ROWS UNBOUNDED PRECEDING)
 ),
 hq_lvlshift AS (
@@ -3371,7 +3409,7 @@ WHERE n_on > 0 AND drop_lam >= 30 AND drop_b1 > drop_b0
 hq_p1rc AS (
 SELECT r.kind, r.id, c.c FROM hq_p1rq r JOIN hq_p1pc c ON c.dev = r.dev AND c.det = r.det
 WHERE r.kind <> 'e' OR NOT EXISTS (
-  SELECT 1 FROM hq_hold e JOIN hq_hold o ON o.dev = e.dev AND o.det = c.c AND o.dur >= 900 AND o.s < e.f AND o.f > e.s
+  SELECT 1 FROM hq_hold e JOIN hq_hold o ON o.dev = e.dev AND o.det = c.c AND o.span >= 900 AND o.s < e.f AND o.f > e.s
   WHERE e.hid = r.id)
 ),
 hq_p1pxy AS (
@@ -3428,7 +3466,7 @@ hq_p1dis AS (
 SELECT d.dev, d.det, coalesce(sum(greatest(least(h.f, d.drop_b1 * 300.0) - greatest(h.s, d.drop_b0 * 300.0), 0.0))
          FILTER (h.hid IS NOT NULL), 0)
        >= 0.5 * (d.drop_b1 - d.drop_b0) * 300.0 AS drop_in_stuck
-FROM hq_p1drx d LEFT JOIN hq_hold h ON h.dev = d.dev AND h.det = d.det AND h.dur >= 900
+FROM hq_p1drx d LEFT JOIN hq_hold h ON h.dev = d.dev AND h.det = d.det AND h.span >= 900
 WHERE d.n_on > 0 AND d.drop_lam >= 30 AND d.drop_b1 > d.drop_b0 GROUP BY d.dev, d.det, d.drop_b0, d.drop_b1
 ),
 hq_p1nkd AS MATERIALIZED (
@@ -3563,7 +3601,7 @@ WHERE n_on > 0 AND drop_lam >= 30 AND drop_b1 > drop_b0
 hq_p2rc AS (
 SELECT r.kind, r.id, c.c FROM hq_p2rq r JOIN hq_p2pc c ON c.dev = r.dev AND c.det = r.det
 WHERE r.kind <> 'e' OR NOT EXISTS (
-  SELECT 1 FROM hq_hold e JOIN hq_hold o ON o.dev = e.dev AND o.det = c.c AND o.dur >= 900 AND o.s < e.f AND o.f > e.s
+  SELECT 1 FROM hq_hold e JOIN hq_hold o ON o.dev = e.dev AND o.det = c.c AND o.span >= 900 AND o.s < e.f AND o.f > e.s
   WHERE e.hid = r.id)
 ),
 hq_p2pxy AS (
@@ -3620,7 +3658,7 @@ hq_p2dis AS (
 SELECT d.dev, d.det, coalesce(sum(greatest(least(h.f, d.drop_b1 * 300.0) - greatest(h.s, d.drop_b0 * 300.0), 0.0))
          FILTER (h.hid IS NOT NULL), 0)
        >= 0.5 * (d.drop_b1 - d.drop_b0) * 300.0 AS drop_in_stuck
-FROM hq_p2drx d LEFT JOIN hq_hold h ON h.dev = d.dev AND h.det = d.det AND h.dur >= 900
+FROM hq_p2drx d LEFT JOIN hq_hold h ON h.dev = d.dev AND h.det = d.det AND h.span >= 900
 WHERE d.n_on > 0 AND d.drop_lam >= 30 AND d.drop_b1 > d.drop_b0 GROUP BY d.dev, d.det, d.drop_b0, d.drop_b1
 ),
 hq_p2nkd AS MATERIALIZED (
@@ -3903,7 +3941,7 @@ SELECT dev, det, 10.0 * sum(z - a) AS mo_min, 10.0 * max(z - a) AS mo_long, arg_
 FROM hq_mo_runs GROUP BY dev, det
 ),
 hq_hiv AS MATERIALIZED (
-SELECT dev, det, s, f FROM hq_hold WHERE dur >= 900
+SELECT dev, det, s, f FROM hq_hold WHERE span >= 900
 UNION ALL SELECT h.dev, h.det, h.k * w.bs, (h.k + 1) * w.bs FROM hq_hib h JOIN hq_win w USING (dev)
 UNION ALL SELECT dev, det, a * 600.0, z * 600.0 FROM hq_mo_runs
 ),

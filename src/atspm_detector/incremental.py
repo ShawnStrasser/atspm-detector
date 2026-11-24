@@ -535,7 +535,8 @@ def judge_rows(con, detectors_table: str, *, store: str = "health_store", end=No
         stmts, drops = q.script(finals)
         nf = len(finals)
         if job and len(groups) > 1:
-            res = _run.parallel(con, groups, None, detectors_table, (stmts, drops), nf, workers, store=store, store_tables=JUDGE_TABLES)
+            res = _run.parallel(con, groups, None, detectors_table, (stmts, drops), nf, workers, store=store,
+                                store_tables=JUDGE_TABLES + (("health_ped_events",) if opt["preempt_holds"] else ()))
         else:
             if job:     # one group: this process, on the store's own rows
                 q, groups = _judge_plan(con, detectors_table, store, start, end, opt, periods, max_events)

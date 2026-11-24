@@ -113,9 +113,17 @@ OPTIONS = {"silent_limits": True, "silent_merge": True, "no_recovery_cap": True,
            # mostly ON): one fault, not two
            "silent_not_held": True,
            # note 158 (2.1.0): a count drop leaves out the hours the detector is held ON (no low hours; they end a run)
-           "drop_not_held": True}
+           "drop_not_held": True,
+           # 2026-11-24 (user, notes 162 / 163: a detector held ON 19 min behind a train): the time a hold lies inside a
+           # preemption (any preempt number, PREEMPT: as the ped health's) does not count as stuck on; the hold is still the
+           # detector's (a silence over it is no silence).  A store reads the preemptions from its ped log (none with ped=False)
+           "preempt_holds": True}
 OPTIONS_OFF = {k: (None if k == "lane_pairs" else k == "occ_strict") for k in OPTIONS}   # 1.2.0, time ON not imputed
 NEMA_PAIRS = ((2, 5), (1, 6), (3, 8), (4, 7))
+# option preempt_holds: a preemption runs from its call input on (102) or entry (105) to the first input off (104), max
+# presence (110) or exit (111) of that preempt number after it; none logged: still on, at most cap_s; + recovery_s after
+# it (the ped health's rule, ped_health_duckdb.PRE).  Health input only: never a classifier input (AGENTS.md)
+PREEMPT = {"codes": (102, 104, 105, 110, 111), "cap_s": 21600, "recovery_s": 120}
 # note 154n: hour-by-hour drop / rise against each phase mate (options mate_drop, count_rise)
 MATE_HOURS = {"low": 0.5, "high": 2.0, "own_low": 0.75, "own_high": 1.5, "min_exp": 8.0, "min_extra": 15.0,
               "min_mate": 10.0, "high_share": 0.6, "hours": 3, "geh": (15.0, 20.0), "occ": 0.8, "z": 2.5, "phi": 1.5}
@@ -239,7 +247,7 @@ def _context(opt: dict, periods: bool, windows: bool, start, end, probabilities:
                 TFC=math.ceil(max(tf["gap_s_stopbar"], tf["gap_s_other"]) * 10), LJ=LJ, T=_tables(LJ, R), D=D, NS5=NS5, NSH=NSH, NSQ=NSQ, DAYNS=DAYNS,
                 ALLOWED=ALLOWED, FNS=FNS, PROB=PROB, PROBCOLS=list(PROB.values()), C7=C7, KEYS=KEYS, STAT=STAT,
                 FAMS=groups(FAMILY), EVS=groups(EVID), CATEGORY=CATEGORY, NO_SHARED=NO_SHARED, WHOLE=WHOLE,
-                NEMA_PAIRS=NEMA_PAIRS, M=MATE_HOURS, CY=CLEAN_YARD, PULSE=PULSE, LCF=LC_FAULT_DAY)
+                NEMA_PAIRS=NEMA_PAIRS, PREEMPT=PREEMPT, M=MATE_HOURS, CY=CLEAN_YARD, PULSE=PULSE, LCF=LC_FAULT_DAY)
 
 
 FINAL, PERIODS_FINAL = (s for _, s, _ in _plan.steps(_render.render("outputs/tables.sql")))
@@ -251,7 +259,8 @@ NO_CARRY = (f"(SELECT DeviceId, NULL::TIMESTAMP_NS AS TimeStamp, NULL::INTEGER A
 
 
 def _subs(events: str, detectors: str, windows: str | None, distinct: bool = True) -> dict:
-    s = {"@EVENTS@": events, "@DETECTORS@": detectors, "@DISTINCT@": "DISTINCT" if distinct else "", "@CARRY@": NO_CARRY}
+    s = {"@EVENTS@": events, "@DETECTORS@": detectors, "@DISTINCT@": "DISTINCT" if distinct else "", "@CARRY@": NO_CARRY,
+         "@PREEMPT@": events}
     if windows is not None:
         s["@WINDOWS@"] = windows
     return s
@@ -259,13 +268,17 @@ def _subs(events: str, detectors: str, windows: str | None, distinct: bool = Tru
 
 def build(events: str = "events", detectors: str = "detectors", windows: str | None = None, start=None, end=None,
           upto: str | None = None, probabilities: bool = True, distinct: bool = True, options: dict | None = None,
-          periods: bool = False, configured: bool = False, bin_origin: str = "window") -> _plan.Plan:
+          periods: bool = False, configured: bool = False, bin_origin: str = "window",
+          preempt: str | None = None) -> _plan.Plan:
     """the health steps; `windows` (optional): a table DeviceId, s_ns, e_ns (epoch ns) of the sample windows (predict
     passes its own); `upto`: stop after that step (testing); `options`: OPTIONS overrides; `periods`: also the steps
     of the periods table (PERIODS_FINAL); `configured`: the detectors table has a configured_function column;
-    `bin_origin`: "window" (each signal's window start, default) or "clock" (the quarter-hour at or before it)."""
+    `bin_origin`: "window" (each signal's window start, default) or "clock" (the quarter-hour at or before it);
+    `preempt`: the table option preempt_holds reads the preempt events from (default: the events table)."""
     q = _plan.Plan(PREFIX, _options(options))
     q.subs.update(_subs(events, detectors, windows, distinct))
+    if preempt is not None:
+        q.subs["@PREEMPT@"] = preempt
     q.render("health.sql", **_context(q.opt, periods, windows is not None, start, end, probabilities, configured,
                                       bin_origin))
     if upto is not None:
@@ -301,9 +314,9 @@ def health_sql(events_table: str = "events", detectors_table: str = "detectors",
 
 @lru_cache(maxsize=8)
 def _script(events_table: str, detectors_table: str, probs: bool, distinct: bool, opt: tuple = (), periods: bool = False,
-            configured: bool = False, bin_origin: str = "window"):
+            configured: bool = False, bin_origin: str = "window", preempt: str | None = None):
     q = build(events_table, detectors_table, f"{PREFIX}wpart", probabilities=probs, distinct=distinct,
-              options=dict(opt), periods=periods, configured=configured, bin_origin=bin_origin)
+              options=dict(opt), periods=periods, configured=configured, bin_origin=bin_origin, preempt=preempt)
     stmts, drops = q.script([FINAL, PERIODS_FINAL] if periods else [FINAL])
     return q, stmts, drops
 
@@ -315,7 +328,7 @@ def _cols(con, table: str) -> set:
 def health(con, events_table: str = "events", detectors_table: str = "detectors", start=None, end=None,
            windows_table: str | None = None, max_events: int | None = 4_000_000,
            distinct: bool = True, options: dict | None = None, periods: bool = False, workers: int = 1,
-           bin_origin: str = "window"):
+           bin_origin: str = "window", preempt_table: str | None = None):
     """Run the detector health on an existing DuckDB connection (the tables stay where they are) and return a DataFrame
     (columns OUT_COLS, one row per detector), or with periods=True the tuple (detectors, periods): periods has one row
     per period (PERIOD_COLS) -- DeviceId, Detector, start, end (local), condition ('stuck on', 'silent', 'counts
@@ -341,7 +354,9 @@ def health(con, events_table: str = "events", detectors_table: str = "detectors"
     30-minute samples) to MAX_DAYS days.
     `bin_origin`: "window" (default) bins each signal's window from its start, as before 2.0.0; "clock" starts the
     window on the quarter-hour at or before it, so bins, quarter-hours and hours lie on the clock, and times count from
-    the epoch (the bins and the time axis of the incremental store: its answers equal this run's)."""
+    the epoch (the bins and the time axis of the incremental store: its answers equal this run's).
+    `preempt_table` (option preempt_holds): a table holding the preempt events (DeviceId, Timestamp, EventId,
+    Parameter) when `events_table` does not (predict keeps them out of its classifier events); default: `events_table`."""
     opt = tuple(sorted(_options(options).items()))
     if bin_origin not in BIN_ORIGINS:
         raise ValueError(f"bin_origin must be one of {BIN_ORIGINS}")
@@ -371,9 +386,14 @@ def health(con, events_table: str = "events", detectors_table: str = "detectors"
     try:
         if workers > 1 and len(groups) > 1:
             _, stmts, drops = _script(f"{PREFIX}events", f"{PREFIX}job.detectors", *job)
-            res = _run.parallel(con, groups, events_table, detectors_table, (stmts, drops), nf, workers, ALLOWED)
+            pre = dict(opt)["preempt_holds"]
+            src = events_table if not (pre and preempt_table) else (
+                f"(SELECT DeviceId, Timestamp, EventId, Parameter FROM {events_table} UNION ALL "
+                f"SELECT DeviceId, Timestamp, EventId, Parameter FROM {preempt_table})")
+            res = _run.parallel(con, groups, src, detectors_table, (stmts, drops), nf, workers,
+                                ALLOWED + (PREEMPT["codes"] if pre else ()))
         else:
-            q, stmts, drops = _script(events_table, detectors_table, *job)
+            q, stmts, drops = _script(events_table, detectors_table, *job, preempt=preempt_table)
             res = _run_groups(con, q, stmts, drops, groups, nf)
     finally:
         con.execute(f"DROP TABLE IF EXISTS {PREFIX}wall")
